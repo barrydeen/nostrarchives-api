@@ -38,7 +38,7 @@ impl Default for CrawlerConfig {
         Self {
             relay_urls: vec![],
             batch_size: 10,
-            events_per_author: 200,
+            events_per_author: 500,
             request_delay_ms: 500,
             poll_interval_secs: 30,
             sync_interval_secs: 3600,

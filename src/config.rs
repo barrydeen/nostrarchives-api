@@ -92,7 +92,7 @@ impl Config {
         let crawler_events_per_author = env::var("CRAWLER_EVENTS_PER_AUTHOR")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(200);
+            .unwrap_or(500);
 
         let crawler_request_delay_ms = env::var("CRAWLER_REQUEST_DELAY_MS")
             .ok()
