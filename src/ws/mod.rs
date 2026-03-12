@@ -179,6 +179,9 @@ async fn handle_search_req(sub_id: &str, filters: &[Value], _state: &AppState) -
 
 /// Trending today feed: return top trending notes from the last 24h.
 ///
+/// Uses the same Redis-cached path as the HTTP `/v1/notes/top` endpoint to avoid
+/// expensive uncached queries that can take 15-30 seconds.
+///
 /// Any REQ on this endpoint returns the trending feed regardless of the filter contents.
 /// The filter's `limit` field is respected (capped at 200, default 50).
 async fn handle_trending_today_req(
@@ -186,7 +189,6 @@ async fn handle_trending_today_req(
     filters: &[Value],
     state: &AppState,
 ) -> Vec<String> {
-    // Extract limit from the first filter (if provided)
     let limit = filters
         .first()
         .and_then(|f| f.get("limit"))
@@ -196,22 +198,83 @@ async fn handle_trending_today_req(
 
     tracing::info!(sub_id = %sub_id, limit = limit, "trending/today feed request");
 
-    match state.repo.trending_notes(limit, 0).await {
-        Ok(notes) => {
-            let mut messages = Vec::with_capacity(notes.len() + 1);
+    let metric = "reactions";
+    let range = "today";
+    let since = Some(chrono::Utc::now().timestamp() - 86_400);
 
-            for note in &notes {
-                // Send the raw original Nostr event as stored
-                let event_msg =
-                    serde_json::to_string(&serde_json::json!(["EVENT", sub_id, note.event.raw.0]))
-                        .expect("json serialization cannot fail");
+    // Try Redis cache first (same cache as the HTTP trending endpoint)
+    if let Some(cached) = state.cache.get_trending(metric, range, limit, 0).await {
+        if let Ok(val) = serde_json::from_str::<Value>(&cached) {
+            let messages = extract_events_from_cached(&val, sub_id);
+            tracing::info!(
+                sub_id = %sub_id,
+                events = messages.len() - 1, // minus EOSE
+                "trending/today feed served (cache hit)"
+            );
+            return messages;
+        }
+    }
+
+    // Cache miss — query DB via the same path as the HTTP endpoint
+    match state.repo.top_notes_unified("reaction", since, limit, 0).await {
+        Ok((ranked, profile_rows)) => {
+            let mut messages = Vec::with_capacity(ranked.len() + 1);
+
+            // Build the same JSON structure as the HTTP handler for caching
+            let profiles: std::collections::HashMap<String, Value> = profile_rows
+                .into_iter()
+                .filter_map(|row| {
+                    serde_json::from_str::<Value>(&row.content).ok().map(|v| {
+                        let entry = serde_json::json!({
+                            "name": v.get("name").and_then(|n| n.as_str()).filter(|s| !s.trim().is_empty()),
+                            "display_name": v.get("display_name").or_else(|| v.get("displayName")).and_then(|n| n.as_str()).filter(|s| !s.trim().is_empty()),
+                            "picture": v.get("picture").or_else(|| v.get("image")).and_then(|n| n.as_str()).filter(|s| !s.trim().is_empty()),
+                            "nip05": v.get("nip05").and_then(|n| n.as_str()).filter(|s| !s.trim().is_empty()),
+                        });
+                        (row.pubkey.clone(), entry)
+                    })
+                })
+                .collect();
+
+            let notes: Vec<Value> = ranked
+                .iter()
+                .map(|entry| {
+                    serde_json::json!({
+                        "count": entry.count,
+                        "total_sats": entry.total_sats,
+                        "reactions": entry.reactions,
+                        "replies": entry.replies,
+                        "reposts": entry.reposts,
+                        "zap_sats": entry.zap_sats,
+                        "event": entry.event,
+                    })
+                })
+                .collect();
+
+            // Cache the response (same format as HTTP handler)
+            let response = serde_json::json!({
+                "metric": metric,
+                "range": range,
+                "notes": notes,
+                "profiles": profiles,
+            });
+            if let Ok(json_str) = serde_json::to_string(&response) {
+                state.cache.set_trending(metric, range, limit, 0, &json_str).await;
+            }
+
+            // Send raw Nostr events
+            for entry in &ranked {
+                let event_msg = serde_json::to_string(
+                    &serde_json::json!(["EVENT", sub_id, entry.event.raw.0]),
+                )
+                .expect("json serialization cannot fail");
                 messages.push(event_msg);
             }
 
             tracing::info!(
                 sub_id = %sub_id,
-                events = notes.len(),
-                "trending/today feed served"
+                events = ranked.len(),
+                "trending/today feed served (cache miss)"
             );
 
             messages.push(eose(sub_id));
@@ -220,11 +283,32 @@ async fn handle_trending_today_req(
         Err(e) => {
             tracing::error!(error = %e, "failed to fetch trending notes for feed");
             vec![
-                notice(&format!("error: failed to fetch trending notes")),
+                notice("error: failed to fetch trending notes"),
                 eose(sub_id),
             ]
         }
     }
+}
+
+/// Extract raw Nostr events from a cached trending response JSON.
+fn extract_events_from_cached(val: &Value, sub_id: &str) -> Vec<String> {
+    let mut messages = Vec::new();
+
+    if let Some(notes) = val.get("notes").and_then(|n| n.as_array()) {
+        for note in notes {
+            // The cached event has a `raw` field containing the original Nostr event
+            if let Some(raw) = note.get("event").and_then(|e| e.get("raw")) {
+                let event_msg = serde_json::to_string(
+                    &serde_json::json!(["EVENT", sub_id, raw]),
+                )
+                .expect("json serialization cannot fail");
+                messages.push(event_msg);
+            }
+        }
+    }
+
+    messages.push(eose(sub_id));
+    messages
 }
 
 fn handle_close(arr: &[Value]) -> Vec<String> {
