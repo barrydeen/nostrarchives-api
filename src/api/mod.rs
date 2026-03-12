@@ -1,12 +1,15 @@
 pub mod handlers;
 
+use axum::middleware;
 use axum::routing::{get, post};
 use axum::Router;
+use std::time::Duration;
 use tower_http::cors::CorsLayer;
 
 use crate::cache::StatsCache;
 use crate::crawler::queue::CrawlQueue;
 use crate::db::repository::EventRepository;
+use crate::ratelimit::{rate_limit_middleware, RateLimiter};
 
 /// Shared state available to all handlers.
 #[derive(Clone)]
@@ -18,8 +21,11 @@ pub struct AppState {
 
 /// Build the axum router with all routes.
 pub fn router(state: AppState) -> Router {
-    Router::new()
-        .route("/health", get(handlers::health))
+    // 30 requests per minute per IP
+    let limiter = RateLimiter::new(30, Duration::from_secs(60));
+
+    // Rate-limited API routes
+    let api_routes = Router::new()
         .route("/v1/stats", get(handlers::get_stats))
         .route("/v1/events", get(handlers::get_events))
         .route("/v1/events/{id}", get(handlers::get_event_by_id))
@@ -58,6 +64,15 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/search", get(handlers::search))
         .route("/v1/search/suggest", get(handlers::search_suggest))
         .route("/v1/crawler/stats", get(handlers::get_crawler_stats))
+        .route_layer(middleware::from_fn_with_state(
+            limiter,
+            rate_limit_middleware,
+        ));
+
+    // Health check is NOT rate-limited (monitoring/uptime checks)
+    Router::new()
+        .route("/health", get(handlers::health))
+        .merge(api_routes)
         .layer(CorsLayer::permissive())
         .with_state(state)
 }
