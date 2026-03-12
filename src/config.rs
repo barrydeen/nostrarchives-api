@@ -11,6 +11,7 @@ pub struct Config {
     pub relay_discovery_enabled: bool,
     pub relay_target_count: usize,
     pub social_graph_bootstrap: bool,
+    pub ws_listen_addr: String,
 }
 
 impl Config {
@@ -66,6 +67,8 @@ impl Config {
 
         let listen_addr = env::var("LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:8000".into());
 
+        let ws_listen_addr = env::var("WS_LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:8001".into());
+
         let ingestion_since = env::var("INGESTION_SINCE")
             .ok()
             .and_then(|v| v.parse::<i64>().ok());
@@ -80,6 +83,7 @@ impl Config {
             relay_discovery_enabled,
             relay_target_count,
             social_graph_bootstrap,
+            ws_listen_addr,
         }
     }
 }

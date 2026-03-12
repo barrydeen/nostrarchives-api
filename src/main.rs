@@ -6,6 +6,7 @@ mod error;
 mod nip19;
 mod relay;
 mod social;
+mod ws;
 
 use std::collections::HashSet;
 use std::net::SocketAddr;
@@ -139,6 +140,14 @@ async fn main() {
         repo,
         cache: stats_cache,
     };
+
+    // WebSocket relay (NIP-50 search endpoint)
+    let ws_addr: SocketAddr = cfg
+        .ws_listen_addr
+        .parse()
+        .expect("invalid ws listen address");
+    let ws_shutdown_rx = shutdown_tx.subscribe();
+    tokio::spawn(ws::serve(state.clone(), ws_addr, ws_shutdown_rx));
 
     let app = api::router(state);
     let addr: SocketAddr = cfg.listen_addr.parse().expect("invalid listen address");
