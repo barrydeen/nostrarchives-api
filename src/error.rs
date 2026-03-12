@@ -6,6 +6,7 @@ use std::fmt;
 pub enum AppError {
     Database(sqlx::Error),
     Redis(redis::RedisError),
+    BadRequest(String),
     Internal(String),
 }
 
@@ -14,6 +15,7 @@ impl fmt::Display for AppError {
         match self {
             AppError::Database(e) => write!(f, "database error: {e}"),
             AppError::Redis(e) => write!(f, "redis error: {e}"),
+            AppError::BadRequest(msg) => write!(f, "bad request: {msg}"),
             AppError::Internal(msg) => write!(f, "internal error: {msg}"),
         }
     }
@@ -27,6 +29,7 @@ impl IntoResponse for AppError {
         let (status, message) = match &self {
             AppError::Database(_) => (StatusCode::INTERNAL_SERVER_ERROR, "database error"),
             AppError::Redis(_) => (StatusCode::INTERNAL_SERVER_ERROR, "cache error"),
+            AppError::BadRequest(_) => (StatusCode::BAD_REQUEST, "bad request"),
             AppError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal error"),
         };
         (status, message).into_response()

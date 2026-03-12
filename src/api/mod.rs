@@ -1,6 +1,6 @@
 pub mod handlers;
 
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::Router;
 use tower_http::cors::CorsLayer;
 
@@ -31,6 +31,10 @@ pub fn router(state: AppState) -> Router {
             get(handlers::get_event_refs),
         )
         .route("/v1/social/{pubkey}", get(handlers::get_social_graph))
+        .route(
+            "/v1/profiles/metadata",
+            post(handlers::get_profiles_metadata),
+        )
         .route("/v1/notes/likes/top", get(handlers::get_top_likes))
         .route(
             "/v1/notes/likes/top/today",

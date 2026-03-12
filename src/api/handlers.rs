@@ -1,9 +1,14 @@
+use std::collections::{HashMap, HashSet};
+
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
+use bech32::{self, FromBase32};
 use chrono::{Duration, Utc};
-use serde::Serialize;
+use hex;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use tracing::warn;
 
 use super::AppState;
 use crate::db::models::{EventQuery, StoredEvent};
@@ -122,6 +127,60 @@ pub async fn get_social_graph(
     }))
 }
 
+pub async fn get_profiles_metadata(
+    State(state): State<AppState>,
+    Json(payload): Json<ProfilesMetadataRequest>,
+) -> Result<Json<ProfilesMetadataResponse>, AppError> {
+    if payload.pubkeys.is_empty() {
+        return Ok(Json(ProfilesMetadataResponse { profiles: vec![] }));
+    }
+    if payload.pubkeys.len() > 500 {
+        return Err(AppError::BadRequest(
+            "maximum of 500 pubkeys are allowed per request".into(),
+        ));
+    }
+
+    let mut ordered_pubkeys = Vec::with_capacity(payload.pubkeys.len());
+    let mut unique_pubkeys = Vec::new();
+    let mut seen = HashSet::new();
+
+    for raw in payload.pubkeys.iter() {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let normalized = normalize_pubkey(trimmed)?;
+        ordered_pubkeys.push(normalized.clone());
+        if seen.insert(normalized.clone()) {
+            unique_pubkeys.push(normalized);
+        }
+    }
+
+    if ordered_pubkeys.is_empty() {
+        return Err(AppError::BadRequest("no valid pubkeys provided".into()));
+    }
+
+    let rows = state.repo.latest_profile_metadata(&unique_pubkeys).await?;
+    let mut metadata_map: HashMap<String, Value> = HashMap::new();
+    for row in rows {
+        match serde_json::from_str::<Value>(&row.content) {
+            Ok(value) => {
+                metadata_map.insert(row.pubkey.clone(), value);
+            }
+            Err(error) => {
+                warn!(pubkey = %row.pubkey, %error, "failed to parse metadata content");
+            }
+        }
+    }
+
+    let profiles = ordered_pubkeys
+        .into_iter()
+        .map(|pubkey| build_profile_entry(&pubkey, metadata_map.get(&pubkey)))
+        .collect();
+
+    Ok(Json(ProfilesMetadataResponse { profiles }))
+}
+
 pub async fn get_top_likes(
     State(state): State<AppState>,
     Query(q): Query<ListingQuery>,
@@ -221,6 +280,25 @@ pub struct RankedNotesResponse {
     pub notes: Vec<RankedNoteResponse>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct ProfilesMetadataRequest {
+    pub pubkeys: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ProfileMetadataEntry {
+    pub pubkey: String,
+    pub display_name: Option<String>,
+    pub name: Option<String>,
+    pub preferred_name: Option<String>,
+    pub picture: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ProfilesMetadataResponse {
+    pub profiles: Vec<ProfileMetadataEntry>,
+}
+
 fn clamp_limit(value: Option<i64>) -> i64 {
     value.unwrap_or(100).clamp(1, 500)
 }
@@ -261,4 +339,64 @@ async fn ranked_notes(
         range: range.into(),
         notes,
     }))
+}
+
+fn build_profile_entry(pubkey: &str, metadata: Option<&Value>) -> ProfileMetadataEntry {
+    let display_name =
+        metadata.and_then(|value| get_string(value, &["display_name", "displayName"]));
+    let name = metadata.and_then(|value| get_string(value, &["name", "username"]));
+    let picture = metadata.and_then(|value| get_string(value, &["picture", "image"]));
+
+    let preferred_name = display_name.clone().or_else(|| name.clone());
+
+    ProfileMetadataEntry {
+        pubkey: pubkey.to_string(),
+        display_name,
+        name,
+        preferred_name,
+        picture,
+    }
+}
+
+fn get_string(value: &Value, keys: &[&str]) -> Option<String> {
+    for key in keys {
+        if let Some(raw) = value.get(key).and_then(|v| v.as_str()) {
+            let trimmed = raw.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn normalize_pubkey(input: &str) -> Result<String, AppError> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err(AppError::BadRequest("empty pubkey".into()));
+    }
+
+    if trimmed.to_ascii_lowercase().starts_with("npub") {
+        decode_npub(trimmed)
+    } else if trimmed.len() == 64 && trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
+        Ok(trimmed.to_ascii_lowercase())
+    } else {
+        Err(AppError::BadRequest(format!("invalid pubkey: {trimmed}")))
+    }
+}
+
+fn decode_npub(npub: &str) -> Result<String, AppError> {
+    let (hrp, data, _) =
+        bech32::decode(npub).map_err(|_| AppError::BadRequest(format!("invalid npub: {npub}")))?;
+    if hrp != "npub" {
+        return Err(AppError::BadRequest(format!("invalid npub: {npub}")));
+    }
+
+    let bytes = Vec::<u8>::from_base32(&data)
+        .map_err(|_| AppError::BadRequest(format!("invalid npub: {npub}")))?;
+    if bytes.len() != 32 {
+        return Err(AppError::BadRequest(format!("invalid npub: {npub}")));
+    }
+
+    Ok(hex::encode(bytes))
 }
