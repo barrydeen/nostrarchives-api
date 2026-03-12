@@ -32,12 +32,12 @@ cargo run
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/health` | Health check |
-| GET | `/api/v1/stats` | Global stats (cached) |
-| GET | `/api/v1/events` | Query events with filters |
-| GET | `/api/v1/events/{id}` | Get event by ID |
-| GET | `/api/v1/social/{pubkey}` | Follow/follower counts + lists for a pubkey |
+| GET | `/v1/stats` | Global stats (cached) |
+| GET | `/v1/events` | Query events with filters |
+| GET | `/v1/events/{id}` | Get event by ID |
+| GET | `/v1/social/{pubkey}` | Follow/follower counts + lists for a pubkey |
 
-### Query Parameters (`/api/v1/events`)
+### Query Parameters (`/v1/events`)
 
 | Param | Type | Description |
 |-------|------|-------------|
@@ -49,7 +49,7 @@ cargo run
 | `limit` | int | Max results (default 50, max 500) |
 | `offset` | int | Pagination offset |
 
-### Query Parameters (`/api/v1/social/{pubkey}`)
+### Query Parameters (`/v1/social/{pubkey}`)
 
 | Param | Type | Description |
 |-------|------|-------------|
