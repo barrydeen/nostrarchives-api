@@ -62,5 +62,12 @@ cargo run
 | `REDIS_URL` | `redis://127.0.0.1:6379` | Redis connection string |
 | `LISTEN_ADDR` | `0.0.0.0:8000` | API server bind address |
 | `RELAY_URLS` | 5 popular relays | Comma-separated relay WebSocket URLs |
+| `RELAY_INDEXERS` | damus/primal/coracle/nos | Indexer relays queried for kind-10002 relay lists |
+| `ENABLE_RELAY_DISCOVERY` | `true` | Toggle dynamic relay discovery on startup |
+| `RELAY_DISCOVERY_TARGET` | `25` | Number of relays to keep from discovery before falling back to `RELAY_URLS` |
 | `INGESTION_SINCE` | current time | Only ingest events after this unix timestamp |
 | `RUST_LOG` | `nostr_api=info` | Log level filter |
+
+### Relay discovery
+
+When `ENABLE_RELAY_DISCOVERY` is true, the ingester queries each `RELAY_INDEXERS` endpoint for kind-10002 relay lists (NIP-65), counts how often every relay appears, and keeps the top `RELAY_DISCOVERY_TARGET` entries. Those relays are merged with `RELAY_URLS` to ensure we always fall back to the configured baseline.

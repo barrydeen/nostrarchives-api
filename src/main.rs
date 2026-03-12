@@ -5,6 +5,7 @@ mod db;
 mod error;
 mod relay;
 
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use tokio::signal;
 use tokio::sync::broadcast;
@@ -21,9 +22,50 @@ async fn main() {
         .init();
 
     let cfg = config::Config::from_env();
+    let mut relay_urls = cfg.relay_urls.clone();
+
+    if cfg.relay_discovery_enabled && !cfg.relay_indexers.is_empty() {
+        let discovery =
+            relay::discovery::discover_relays(&cfg.relay_indexers, cfg.relay_target_count).await;
+
+        if !discovery.relays.is_empty() {
+            let mut dedup = HashSet::new();
+            let mut combined = Vec::new();
+
+            for url in &discovery.relays {
+                if dedup.insert(url.clone()) {
+                    combined.push(url.clone());
+                }
+            }
+
+            for url in &cfg.relay_urls {
+                if dedup.insert(url.clone()) {
+                    combined.push(url.clone());
+                }
+            }
+
+            tracing::info!(
+                discovered = discovery.relays.len(),
+                relay_lists = discovery.relay_lists_processed,
+                candidates = discovery.candidates_seen,
+                active_relays = combined.len(),
+                "relay discovery completed"
+            );
+
+            relay_urls = combined;
+        } else {
+            tracing::warn!(
+                indexers = cfg.relay_indexers.len(),
+                "relay discovery produced no relays; using configured RELAY_URLS"
+            );
+        }
+    } else if !cfg.relay_discovery_enabled {
+        tracing::info!("relay discovery disabled; using configured RELAY_URLS");
+    }
+
     tracing::info!(
         listen = %cfg.listen_addr,
-        relays = cfg.relay_urls.len(),
+        relays = relay_urls.len(),
         "starting nostr-api"
     );
 
@@ -36,8 +78,7 @@ async fn main() {
     let repo = db::repository::EventRepository::new(pool);
 
     // Redis
-    let redis_client =
-        redis::Client::open(cfg.redis_url.as_str()).expect("invalid redis url");
+    let redis_client = redis::Client::open(cfg.redis_url.as_str()).expect("invalid redis url");
     // Verify connectivity
     redis_client
         .get_multiplexed_async_connection()
@@ -52,7 +93,7 @@ async fn main() {
 
     // Start relay ingestion
     let ingester = relay::ingester::RelayIngester::new(
-        cfg.relay_urls.clone(),
+        relay_urls.clone(),
         repo.clone(),
         stats_cache.clone(),
         cfg.ingestion_since,
@@ -69,7 +110,9 @@ async fn main() {
 
     tracing::info!(addr = %addr, "api server listening");
 
-    let listener = tokio::net::TcpListener::bind(addr).await.expect("failed to bind");
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .expect("failed to bind");
 
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal(shutdown_tx))
