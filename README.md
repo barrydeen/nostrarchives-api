@@ -65,9 +65,14 @@ cargo run
 | `RELAY_INDEXERS` | damus/primal/coracle/nos | Indexer relays queried for kind-10002 relay lists |
 | `ENABLE_RELAY_DISCOVERY` | `true` | Toggle dynamic relay discovery on startup |
 | `RELAY_DISCOVERY_TARGET` | `25` | Number of relays to keep from discovery before falling back to `RELAY_URLS` |
+| `ENABLE_SOCIAL_GRAPH_BOOTSTRAP` | `true` | Query follow lists at boot and hydrate the social graph |
 | `INGESTION_SINCE` | current time | Only ingest events after this unix timestamp |
 | `RUST_LOG` | `nostr_api=info` | Log level filter |
 
 ### Relay discovery
 
 When `ENABLE_RELAY_DISCOVERY` is true, the ingester queries each `RELAY_INDEXERS` endpoint for kind-10002 relay lists (NIP-65), counts how often every relay appears, and keeps the top `RELAY_DISCOVERY_TARGET` entries. Those relays are merged with `RELAY_URLS` to ensure we always fall back to the configured baseline.
+
+### Social graph bootstrap
+
+With `ENABLE_SOCIAL_GRAPH_BOOTSTRAP` enabled, startup runs a best-effort crawl across the discovered relays for kind-3 contact lists, normalizes the `p` tags into `follows` rows, and keeps the graph in sync by replaying newer lists through the same path when new events arrive.

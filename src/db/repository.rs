@@ -1,6 +1,10 @@
+use std::collections::HashSet;
+
 use sqlx::PgPool;
 
-use super::models::{EventInteractions, EventQuery, EventRef, EventThread, KindCount, NostrEvent, StoredEvent};
+use super::models::{
+    EventInteractions, EventQuery, EventRef, EventThread, KindCount, NostrEvent, StoredEvent,
+};
 use crate::error::AppError;
 
 #[derive(Clone)]
@@ -14,7 +18,11 @@ impl EventRepository {
     }
 
     /// Insert a new event. Returns true if the event was inserted (not a duplicate).
-    pub async fn insert_event(&self, event: &NostrEvent, relay_url: &str) -> Result<bool, AppError> {
+    pub async fn insert_event(
+        &self,
+        event: &NostrEvent,
+        relay_url: &str,
+    ) -> Result<bool, AppError> {
         let raw = serde_json::to_value(event).unwrap_or_default();
         let tags_json = serde_json::to_value(&event.tags).unwrap_or_default();
 
@@ -43,6 +51,74 @@ impl EventRepository {
         }
 
         Ok(inserted)
+    }
+
+    /// Upsert the social graph edges for a follow list (kind 3) event.
+    pub async fn upsert_follow_list(&self, event: &NostrEvent) -> Result<Option<usize>, AppError> {
+        if event.kind != 3 {
+            return Ok(None);
+        }
+
+        let mut seen = HashSet::new();
+        let mut followees: Vec<(String, Option<String>)> = Vec::new();
+        for tag in &event.tags {
+            if tag.first().map(|v| v == "p").unwrap_or(false) {
+                if let Some(target) = tag.get(1).filter(|v| !v.is_empty()) {
+                    if seen.insert(target.clone()) {
+                        let relay_hint = tag.get(2).filter(|s| !s.is_empty()).cloned();
+                        followees.push((target.clone(), relay_hint));
+                    }
+                }
+            }
+        }
+
+        let existing: Option<(i64,)> =
+            sqlx::query_as("SELECT created_at FROM follow_lists WHERE pubkey = $1")
+                .bind(&event.pubkey)
+                .fetch_optional(&self.pool)
+                .await?;
+
+        if let Some((created_at,)) = existing {
+            if created_at >= event.created_at {
+                return Ok(None);
+            }
+        }
+
+        let mut tx = self.pool.begin().await?;
+
+        sqlx::query("DELETE FROM follows WHERE follower_pubkey = $1")
+            .bind(&event.pubkey)
+            .execute(&mut *tx)
+            .await?;
+
+        for (followed, relay_hint) in &followees {
+            sqlx::query(
+                "INSERT INTO follows (follower_pubkey, followed_pubkey, source_event_id, relay_hint, created_at)
+                 VALUES ($1, $2, $3, $4, $5)",
+            )
+            .bind(&event.pubkey)
+            .bind(followed)
+            .bind(&event.id)
+            .bind(relay_hint)
+            .bind(event.created_at)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        sqlx::query(
+            "INSERT INTO follow_lists (pubkey, event_id, created_at)
+             VALUES ($1, $2, $3)
+             ON CONFLICT (pubkey) DO UPDATE SET event_id = EXCLUDED.event_id, created_at = EXCLUDED.created_at, updated_at = NOW()",
+        )
+        .bind(&event.pubkey)
+        .bind(&event.id)
+        .bind(event.created_at)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+
+        Ok(Some(followees.len()))
     }
 
     /// Extract and insert normalized tags for fast querying.
@@ -80,7 +156,9 @@ impl EventRepository {
     /// - Kind 9735 (zap receipt): `e` tags become zap refs
     /// - Other kinds: `e` tags become mention refs
     async fn insert_refs(&self, event: &NostrEvent) -> Result<(), AppError> {
-        let e_tags: Vec<&Vec<String>> = event.tags.iter()
+        let e_tags: Vec<&Vec<String>> = event
+            .tags
+            .iter()
             .filter(|t| t.len() >= 2 && t[0] == "e")
             .collect();
 
@@ -190,7 +268,9 @@ impl EventRepository {
             param_idx += 1;
         }
         if let Some(ref search) = q.search {
-            conditions.push(format!("content_tsv @@ plainto_tsquery('english', ${param_idx})"));
+            conditions.push(format!(
+                "content_tsv @@ plainto_tsquery('english', ${param_idx})"
+            ));
             bind_search = Some(search.clone());
             param_idx += 1;
         }
@@ -303,7 +383,11 @@ impl EventRepository {
     }
 
     /// Get the full thread context for an event: parent chain, interactions, and related events.
-    pub async fn get_thread(&self, event_id: &str, limit: i64) -> Result<Option<EventThread>, AppError> {
+    pub async fn get_thread(
+        &self,
+        event_id: &str,
+        limit: i64,
+    ) -> Result<Option<EventThread>, AppError> {
         let event = match self.get_event_by_id(event_id).await? {
             Some(e) => e,
             None => return Ok(None),
@@ -319,13 +403,25 @@ impl EventRepository {
         .fetch_all(&self.pool)
         .await?;
 
-        let root_id = refs.iter().find(|r| r.ref_type == "root").map(|r| r.target_event_id.clone());
-        let parent_id = refs.iter().find(|r| r.ref_type == "reply").map(|r| r.target_event_id.clone());
+        let root_id = refs
+            .iter()
+            .find(|r| r.ref_type == "root")
+            .map(|r| r.target_event_id.clone());
+        let parent_id = refs
+            .iter()
+            .find(|r| r.ref_type == "reply")
+            .map(|r| r.target_event_id.clone());
 
         let interactions = self.get_interactions(event_id).await?;
-        let replies = self.get_referencing_events(event_id, "reply", limit).await?;
-        let reactions = self.get_referencing_events(event_id, "reaction", limit).await?;
-        let reposts = self.get_referencing_events(event_id, "repost", limit).await?;
+        let replies = self
+            .get_referencing_events(event_id, "reply", limit)
+            .await?;
+        let reactions = self
+            .get_referencing_events(event_id, "reaction", limit)
+            .await?;
+        let reposts = self
+            .get_referencing_events(event_id, "repost", limit)
+            .await?;
         let zaps = self.get_referencing_events(event_id, "zap", limit).await?;
 
         Ok(Some(EventThread {

@@ -4,6 +4,7 @@ mod config;
 mod db;
 mod error;
 mod relay;
+mod social;
 
 use std::collections::HashSet;
 use std::net::SocketAddr;
@@ -76,6 +77,16 @@ async fn main() {
     tracing::info!("database connected, migrations applied");
 
     let repo = db::repository::EventRepository::new(pool);
+
+    if cfg.social_graph_bootstrap {
+        let builder_repo = repo.clone();
+        let builder_relays = relay_urls.clone();
+        tokio::spawn(async move {
+            social::builder::bootstrap_social_graph(builder_repo, builder_relays).await;
+        });
+    } else {
+        tracing::info!("social graph bootstrap disabled");
+    }
 
     // Redis
     let redis_client = redis::Client::open(cfg.redis_url.as_str()).expect("invalid redis url");

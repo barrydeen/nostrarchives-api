@@ -35,9 +35,7 @@ struct IngestedEvent {
 /// - 30002: Relay sets (NIP-51)
 /// - 30003: Bookmark sets (NIP-51)
 const ALLOWED_KINDS: &[i64] = &[
-    0, 1, 6, 7, 16, 9735,
-    10000, 10002, 10003, 10063,
-    30000, 30001, 30002, 30003,
+    0, 1, 3, 6, 7, 16, 9735, 10000, 10002, 10003, 10063, 30000, 30001, 30002, 30003,
 ];
 
 /// Manages connections to multiple relays and ingests events into the database.
@@ -222,6 +220,11 @@ impl RelayIngester {
                         Ok(true) => {
                             let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
                             cache.on_event_ingested(&ingested.event.pubkey, ingested.event.kind).await;
+                            if ingested.event.kind == 3 {
+                                if let Err(e) = repo.upsert_follow_list(&ingested.event).await {
+                                    tracing::error!(error = %e, event_id = %ingested.event.id, "failed to upsert follow list");
+                                }
+                            }
                             if count % 1000 == 0 {
                                 tracing::info!(total = count, "events ingested");
                             }

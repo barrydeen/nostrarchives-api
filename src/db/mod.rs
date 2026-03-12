@@ -28,16 +28,30 @@ async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
     .await?;
 
     let migrations = vec![
-        ("001_create_events", include_str!("../../migrations/001_create_events.sql")),
-        ("002_create_event_tags", include_str!("../../migrations/002_create_event_tags.sql")),
-        ("003_create_event_refs", include_str!("../../migrations/003_create_event_refs.sql")),
+        (
+            "001_create_events",
+            include_str!("../../migrations/001_create_events.sql"),
+        ),
+        (
+            "002_create_event_tags",
+            include_str!("../../migrations/002_create_event_tags.sql"),
+        ),
+        (
+            "003_create_event_refs",
+            include_str!("../../migrations/003_create_event_refs.sql"),
+        ),
+        (
+            "004_create_follows",
+            include_str!("../../migrations/004_create_follows.sql"),
+        ),
     ];
 
     for (name, sql) in migrations {
-        let applied: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM _migrations WHERE name = $1)")
-            .bind(name)
-            .fetch_one(pool)
-            .await?;
+        let applied: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM _migrations WHERE name = $1)")
+                .bind(name)
+                .fetch_one(pool)
+                .await?;
 
         if !applied {
             tracing::info!("applying migration: {name}");
