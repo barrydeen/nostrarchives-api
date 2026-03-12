@@ -24,6 +24,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/events", get(handlers::get_events))
         .route("/v1/events/{id}", get(handlers::get_event_by_id))
         .route("/v1/events/{id}/thread", get(handlers::get_event_thread))
+        .route("/v1/pages/note/{id}", get(handlers::get_note_detail))
         .route(
             "/v1/events/{id}/interactions",
             get(handlers::get_event_interactions),

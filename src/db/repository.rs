@@ -1321,6 +1321,107 @@ impl EventRepository {
         Ok(None)
     }
 
+    /// Fetch everything the note detail page needs in a single SQL round-trip.
+    ///
+    /// Returns a JSON object with: event, root_id, parent_id, stats, replies, profiles.
+    /// Uses CTEs so Postgres does all the heavy lifting in one query plan.
+    pub async fn get_note_detail(
+        &self,
+        event_id: &str,
+        reply_limit: i64,
+    ) -> Result<Option<serde_json::Value>, AppError> {
+        let row: (serde_json::Value,) = sqlx::query_as(
+            r#"
+            WITH target AS (
+                SELECT id, pubkey, created_at, kind, content, sig, tags,
+                       relay_url, received_at
+                FROM events
+                WHERE id = $1
+            ),
+            thread_refs AS (
+                SELECT
+                    MAX(CASE WHEN ref_type = 'root'  THEN target_event_id END) AS root_id,
+                    MAX(CASE WHEN ref_type = 'reply'  THEN target_event_id END) AS parent_id
+                FROM event_refs
+                WHERE source_event_id = $1
+                  AND ref_type IN ('root', 'reply')
+            ),
+            stats AS (
+                SELECT
+                    COUNT(*) FILTER (WHERE ref_type = 'reply')    AS replies,
+                    COUNT(*) FILTER (WHERE ref_type = 'reaction') AS reactions,
+                    COUNT(*) FILTER (WHERE ref_type = 'repost')   AS reposts,
+                    COUNT(*) FILTER (WHERE ref_type = 'zap')      AS zaps
+                FROM event_refs
+                WHERE target_event_id = $1
+            ),
+            reply_events AS (
+                SELECT e.id, e.pubkey, e.created_at, e.kind, e.content,
+                       e.sig, e.tags, e.relay_url, e.received_at
+                FROM events e
+                INNER JOIN event_refs r ON r.source_event_id = e.id
+                WHERE r.target_event_id = $1 AND r.ref_type = 'reply'
+                ORDER BY e.created_at DESC
+                LIMIT $2
+            ),
+            all_pubkeys AS (
+                SELECT pubkey FROM target
+                UNION
+                SELECT pubkey FROM reply_events
+            ),
+            profiles AS (
+                SELECT DISTINCT ON (e.pubkey) e.pubkey,
+                    CASE WHEN e.content ~ '^\s*\{'
+                        THEN json_build_object(
+                            'name',         (e.content::jsonb)->>'name',
+                            'display_name', (e.content::jsonb)->>'display_name',
+                            'picture',      (e.content::jsonb)->>'picture',
+                            'nip05',        (e.content::jsonb)->>'nip05'
+                        )
+                        ELSE json_build_object(
+                            'name', NULL, 'display_name', NULL,
+                            'picture', NULL, 'nip05', NULL
+                        )
+                    END AS metadata
+                FROM events e
+                INNER JOIN all_pubkeys ap ON e.pubkey = ap.pubkey
+                WHERE e.kind = 0
+                ORDER BY e.pubkey, e.created_at DESC
+            )
+            SELECT json_build_object(
+                'event',     (SELECT row_to_json(t)   FROM target t),
+                'root_id',   (SELECT root_id          FROM thread_refs),
+                'parent_id', (SELECT parent_id        FROM thread_refs),
+                'stats',     (SELECT json_build_object(
+                                 'replies',   replies,
+                                 'reactions', reactions,
+                                 'reposts',  reposts,
+                                 'zaps',     zaps
+                             ) FROM stats),
+                'replies',   COALESCE(
+                    (SELECT json_agg(row_to_json(re) ORDER BY re.created_at DESC)
+                     FROM reply_events re), '[]'::json
+                ),
+                'profiles',  COALESCE(
+                    (SELECT json_object_agg(p.pubkey, p.metadata)
+                     FROM profiles p), '{}'::json
+                )
+            ) AS result
+            "#,
+        )
+        .bind(event_id)
+        .bind(reply_limit)
+        .fetch_one(&self.pool)
+        .await?;
+
+        // If the event doesn't exist, the 'event' field will be JSON null
+        if row.0.get("event").map_or(true, |v| v.is_null()) {
+            return Ok(None);
+        }
+
+        Ok(Some(row.0))
+    }
+
     /// Refresh the profile_search materialized view (CONCURRENTLY to avoid blocking reads).
     pub async fn refresh_profile_search(&self) -> Result<(), AppError> {
         sqlx::query("REFRESH MATERIALIZED VIEW CONCURRENTLY profile_search")
