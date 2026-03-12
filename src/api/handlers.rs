@@ -79,6 +79,20 @@ pub async fn get_event_by_id(
     }
 }
 
+/// Frontend-optimized note detail: single SQL round-trip returns event, thread refs,
+/// interaction stats, replies, and profile metadata for all involved pubkeys.
+pub async fn get_note_detail(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(q): Query<ThreadQuery>,
+) -> Result<Json<Value>, AppError> {
+    let limit = q.limit.unwrap_or(50).min(200);
+    match state.repo.get_note_detail(&id, limit).await? {
+        Some(detail) => Ok(Json(detail)),
+        None => Err(AppError::NotFound("event not found".into())),
+    }
+}
+
 /// Get full thread context for an event: parent/root refs, replies, reactions, reposts, zaps.
 pub async fn get_event_thread(
     State(state): State<AppState>,
