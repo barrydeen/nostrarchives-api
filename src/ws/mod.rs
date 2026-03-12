@@ -2,18 +2,38 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use axum::extract::ws::{Message, WebSocket};
-use axum::extract::{State, WebSocketUpgrade};
+use axum::extract::{Path, State, WebSocketUpgrade};
 use axum::response::IntoResponse;
 use axum::routing::any;
 use axum::Router;
 use futures_util::{SinkExt, StreamExt};
+use serde_json::Value;
 use tokio::sync::broadcast;
 
 use crate::api::AppState;
 
+/// Feed type determines which query backs a feed endpoint.
+#[derive(Debug, Clone)]
+enum FeedKind {
+    /// NIP-50 search relay (existing behavior).
+    Search,
+    /// Trending notes by metric and time range.
+    /// metric: "reactions" | "replies" | "reposts" | "zaps"
+    /// range:  "today" | "7d" | "30d" | "1y" | "all"
+    Trending { metric: String, range: String },
+}
+
 /// Build the WebSocket relay router.
 pub fn router(state: AppState) -> Router {
-    Router::new().route("/", any(ws_handler)).with_state(state)
+    Router::new()
+        // Existing search relay on root path
+        .route("/", any(ws_search_handler))
+        // Feed endpoints: /notes/trending/{metric}/{range}
+        .route(
+            "/notes/trending/{metric}/{range}",
+            any(ws_trending_handler),
+        )
+        .with_state(state)
 }
 
 /// Start the WebSocket relay listener on a separate port.
@@ -33,23 +53,42 @@ pub async fn serve(state: AppState, addr: SocketAddr, mut shutdown_rx: broadcast
         .expect("ws server error");
 }
 
-async fn ws_handler(ws: WebSocketUpgrade, State(_state): State<AppState>) -> impl IntoResponse {
-    ws.on_upgrade(handle_connection)
+// ---------------------------------------------------------------------------
+// Handlers
+// ---------------------------------------------------------------------------
+
+async fn ws_search_handler(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| handle_connection(socket, state, FeedKind::Search))
 }
 
-async fn handle_connection(socket: WebSocket) {
+async fn ws_trending_handler(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+    Path((metric, range)): Path<(String, String)>,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| {
+        handle_connection(socket, state, FeedKind::Trending { metric, range })
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Connection handler
+// ---------------------------------------------------------------------------
+
+async fn handle_connection(socket: WebSocket, state: AppState, feed_kind: FeedKind) {
     let (mut sink, mut stream) = socket.split();
 
     // Spawn a ping task to keep the connection alive.
     let (close_tx, mut close_rx) = tokio::sync::oneshot::channel::<()>();
-    let ping_handle = tokio::spawn({
-        async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(30));
-            loop {
-                tokio::select! {
-                    _ = interval.tick() => {}
-                    _ = &mut close_rx => break,
-                }
+    let ping_handle = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(30));
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {}
+                _ = &mut close_rx => break,
             }
         }
     });
@@ -65,11 +104,10 @@ async fn handle_connection(socket: WebSocket) {
 
         match msg {
             Message::Text(text) => {
-                if let Some(response) = handle_nostr_message(&text) {
-                    for r in response {
-                        if sink.send(Message::Text(r.into())).await.is_err() {
-                            break;
-                        }
+                let responses = handle_nostr_message(&text, &state, &feed_kind).await;
+                for r in responses {
+                    if sink.send(Message::Text(r.into())).await.is_err() {
+                        break;
                     }
                 }
             }
@@ -88,79 +126,274 @@ async fn handle_connection(socket: WebSocket) {
     tracing::debug!("ws connection closed");
 }
 
+// ---------------------------------------------------------------------------
+// Nostr protocol handling
+// ---------------------------------------------------------------------------
+
 /// Parse and handle a Nostr protocol message. Returns response messages to send.
-fn handle_nostr_message(text: &str) -> Option<Vec<String>> {
-    let parsed: serde_json::Value = match serde_json::from_str(text) {
+async fn handle_nostr_message(text: &str, state: &AppState, feed_kind: &FeedKind) -> Vec<String> {
+    let parsed: Value = match serde_json::from_str(text) {
         Ok(v) => v,
-        Err(_) => {
-            return Some(vec![notice("invalid JSON")]);
-        }
+        Err(_) => return vec![notice("invalid JSON")],
     };
 
     let arr = match parsed.as_array() {
         Some(a) if !a.is_empty() => a,
-        _ => {
-            return Some(vec![notice("message must be a JSON array")]);
-        }
+        _ => return vec![notice("message must be a JSON array")],
     };
 
     let msg_type = match arr[0].as_str() {
         Some(t) => t,
-        None => {
-            return Some(vec![notice("first element must be a string")]);
-        }
+        None => return vec![notice("first element must be a string")],
     };
 
     match msg_type {
-        "REQ" => handle_req(arr),
+        "REQ" => handle_req(arr, state, feed_kind).await,
         "CLOSE" => handle_close(arr),
-        _ => Some(vec![notice(&format!("unknown message type: {msg_type}"))]),
+        "EVENT" => vec![notice("EVENT publishing is not supported on this relay")],
+        _ => vec![notice(&format!("unknown message type: {msg_type}"))],
     }
 }
 
-fn handle_req(arr: &[serde_json::Value]) -> Option<Vec<String>> {
-    // ["REQ", subscription_id, filter, ...]
+async fn handle_req(arr: &[Value], state: &AppState, feed_kind: &FeedKind) -> Vec<String> {
     if arr.len() < 3 {
-        return Some(vec![notice(
-            "REQ requires subscription_id and at least one filter",
-        )]);
+        return vec![notice("REQ requires subscription_id and at least one filter")];
     }
 
     let sub_id = match arr[1].as_str() {
         Some(s) => s.to_string(),
-        None => {
-            return Some(vec![notice("subscription_id must be a string")]);
-        }
+        None => return vec![notice("subscription_id must be a string")],
     };
 
-    // Process each filter
-    for filter in &arr[2..] {
+    match feed_kind {
+        FeedKind::Search => handle_search_req(&sub_id, &arr[2..], state).await,
+        FeedKind::Trending { metric, range } => {
+            handle_trending_req(&sub_id, &arr[2..], state, metric, range).await
+        }
+    }
+}
+
+/// Search relay: existing NIP-50 behavior (stub — returns EOSE for now).
+async fn handle_search_req(sub_id: &str, filters: &[Value], _state: &AppState) -> Vec<String> {
+    for filter in filters {
         if let Some(search_term) = filter.get("search").and_then(|v| v.as_str()) {
-            tracing::info!(
-                sub_id = %sub_id,
-                search = %search_term,
-                "NIP-50 search request"
-            );
+            tracing::info!(sub_id = %sub_id, search = %search_term, "NIP-50 search request");
         } else {
             tracing::debug!(sub_id = %sub_id, "REQ with non-search filter (not yet supported)");
         }
     }
 
-    // For now, just return EOSE — actual search results come later
-    Some(vec![eose(&sub_id)])
+    vec![eose(sub_id)]
 }
 
-fn handle_close(arr: &[serde_json::Value]) -> Option<Vec<String>> {
-    // ["CLOSE", subscription_id]
+// ---------------------------------------------------------------------------
+// Trending feed handler
+// ---------------------------------------------------------------------------
+
+/// Validate metric string → ref_type for the DB query.
+fn validate_metric(metric: &str) -> Option<&'static str> {
+    match metric {
+        "reactions" => Some("reaction"),
+        "replies" => Some("reply"),
+        "reposts" => Some("repost"),
+        "zaps" => Some("zap"),
+        _ => None,
+    }
+}
+
+/// Validate range string → since timestamp.
+fn validate_range(range: &str) -> Option<Option<i64>> {
+    let now = chrono::Utc::now().timestamp();
+    match range {
+        "today" => Some(Some(now - 86_400)),
+        "7d" => Some(Some(now - 7 * 86_400)),
+        "30d" => Some(Some(now - 30 * 86_400)),
+        "1y" => Some(Some(now - 365 * 86_400)),
+        "all" => Some(None),
+        _ => None,
+    }
+}
+
+/// Trending feed: return top notes by metric and time range.
+///
+/// Uses the same Redis-cached path as the HTTP `/v1/notes/top` endpoint.
+/// On cache hit, responses are instant. On cache miss, computes and caches.
+async fn handle_trending_req(
+    sub_id: &str,
+    filters: &[Value],
+    state: &AppState,
+    metric: &str,
+    range: &str,
+) -> Vec<String> {
+    // Validate metric
+    let ref_type = match validate_metric(metric) {
+        Some(rt) => rt,
+        None => {
+            return vec![
+                notice(&format!(
+                    "invalid metric: {metric}. Use: reactions, replies, reposts, zaps"
+                )),
+                eose(sub_id),
+            ];
+        }
+    };
+
+    // Validate range
+    let since = match validate_range(range) {
+        Some(s) => s,
+        None => {
+            return vec![
+                notice(&format!(
+                    "invalid range: {range}. Use: today, 7d, 30d, 1y, all"
+                )),
+                eose(sub_id),
+            ];
+        }
+    };
+
+    let limit = filters
+        .first()
+        .and_then(|f| f.get("limit"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(50)
+        .clamp(1, 200);
+
+    tracing::info!(
+        sub_id = %sub_id,
+        metric = %metric,
+        range = %range,
+        limit = limit,
+        "feed request"
+    );
+
+    // Try Redis cache first (same cache key as the HTTP trending endpoint)
+    if let Some(cached) = state.cache.get_trending(metric, range, limit, 0).await {
+        if let Ok(val) = serde_json::from_str::<Value>(&cached) {
+            let messages = extract_events_from_cached(&val, sub_id);
+            tracing::info!(
+                sub_id = %sub_id,
+                metric = %metric,
+                range = %range,
+                events = messages.len() - 1,
+                "feed served (cache hit)"
+            );
+            return messages;
+        }
+    }
+
+    // Cache miss — compute via DB
+    match state.repo.top_notes_unified(ref_type, since, limit, 0).await {
+        Ok((ranked, profile_rows)) => {
+            let mut messages = Vec::with_capacity(ranked.len() + 1);
+
+            // Build the same JSON structure as the HTTP handler for caching
+            let profiles: std::collections::HashMap<String, Value> = profile_rows
+                .into_iter()
+                .filter_map(|row| {
+                    serde_json::from_str::<Value>(&row.content).ok().map(|v| {
+                        let entry = serde_json::json!({
+                            "name": v.get("name").and_then(|n| n.as_str()).filter(|s| !s.trim().is_empty()),
+                            "display_name": v.get("display_name").or_else(|| v.get("displayName")).and_then(|n| n.as_str()).filter(|s| !s.trim().is_empty()),
+                            "picture": v.get("picture").or_else(|| v.get("image")).and_then(|n| n.as_str()).filter(|s| !s.trim().is_empty()),
+                            "nip05": v.get("nip05").and_then(|n| n.as_str()).filter(|s| !s.trim().is_empty()),
+                        });
+                        (row.pubkey.clone(), entry)
+                    })
+                })
+                .collect();
+
+            let notes: Vec<Value> = ranked
+                .iter()
+                .map(|entry| {
+                    serde_json::json!({
+                        "count": entry.count,
+                        "total_sats": entry.total_sats,
+                        "reactions": entry.reactions,
+                        "replies": entry.replies,
+                        "reposts": entry.reposts,
+                        "zap_sats": entry.zap_sats,
+                        "event": entry.event,
+                    })
+                })
+                .collect();
+
+            // Cache the response (same format as HTTP handler)
+            let response = serde_json::json!({
+                "metric": metric,
+                "range": range,
+                "notes": notes,
+                "profiles": profiles,
+            });
+            if let Ok(json_str) = serde_json::to_string(&response) {
+                state
+                    .cache
+                    .set_trending(metric, range, limit, 0, &json_str)
+                    .await;
+            }
+
+            // Send raw Nostr events
+            for entry in &ranked {
+                let event_msg = serde_json::to_string(
+                    &serde_json::json!(["EVENT", sub_id, entry.event.raw.0]),
+                )
+                .expect("json serialization cannot fail");
+                messages.push(event_msg);
+            }
+
+            tracing::info!(
+                sub_id = %sub_id,
+                metric = %metric,
+                range = %range,
+                events = ranked.len(),
+                "feed served (cache miss)"
+            );
+
+            messages.push(eose(sub_id));
+            messages
+        }
+        Err(e) => {
+            tracing::error!(
+                metric = %metric,
+                range = %range,
+                error = %e,
+                "failed to fetch trending notes for feed"
+            );
+            vec![
+                notice("error: failed to fetch trending notes"),
+                eose(sub_id),
+            ]
+        }
+    }
+}
+
+/// Extract raw Nostr events from a cached trending response JSON.
+fn extract_events_from_cached(val: &Value, sub_id: &str) -> Vec<String> {
+    let mut messages = Vec::new();
+
+    if let Some(notes) = val.get("notes").and_then(|n| n.as_array()) {
+        for note in notes {
+            if let Some(raw) = note.get("event").and_then(|e| e.get("raw")) {
+                let event_msg =
+                    serde_json::to_string(&serde_json::json!(["EVENT", sub_id, raw]))
+                        .expect("json serialization cannot fail");
+                messages.push(event_msg);
+            }
+        }
+    }
+
+    messages.push(eose(sub_id));
+    messages
+}
+
+fn handle_close(arr: &[Value]) -> Vec<String> {
     if arr.len() < 2 {
-        return Some(vec![notice("CLOSE requires subscription_id")]);
+        return vec![notice("CLOSE requires subscription_id")];
     }
 
     let sub_id = arr[1].as_str().unwrap_or("unknown");
     tracing::debug!(sub_id = %sub_id, "subscription closed");
 
-    // NIP-01: relay sends CLOSED message
-    Some(vec![closed(sub_id, "")])
+    vec![closed(sub_id, "")]
 }
 
 /// Format a NOTICE message.
