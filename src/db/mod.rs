@@ -30,6 +30,7 @@ async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
     let migrations = vec![
         ("001_create_events", include_str!("../../migrations/001_create_events.sql")),
         ("002_create_event_tags", include_str!("../../migrations/002_create_event_tags.sql")),
+        ("003_create_event_refs", include_str!("../../migrations/003_create_event_refs.sql")),
     ];
 
     for (name, sql) in migrations {
