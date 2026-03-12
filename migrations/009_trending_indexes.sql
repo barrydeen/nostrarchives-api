@@ -4,5 +4,5 @@
 -- This composite index allows efficient index scans instead of seq scans
 -- on large time ranges.
 
-CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_event_refs_reftype_created
+CREATE INDEX IF NOT EXISTS idx_event_refs_reftype_created
     ON event_refs (ref_type, created_at DESC);
