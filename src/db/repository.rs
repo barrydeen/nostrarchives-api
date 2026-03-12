@@ -70,6 +70,9 @@ impl EventRepository {
         for tag in &event.tags {
             if tag.first().map(|v| v == "p").unwrap_or(false) {
                 if let Some(target) = tag.get(1).filter(|v| !v.is_empty()) {
+                    if !is_hex_pubkey(target) {
+                        continue;
+                    }
                     if seen.insert(target.clone()) {
                         let relay_hint = tag.get(2).filter(|s| !s.is_empty()).cloned();
                         followees.push((target.clone(), relay_hint));
@@ -572,4 +575,8 @@ impl EventRepository {
 
         Ok(events)
     }
+}
+
+fn is_hex_pubkey(value: &str) -> bool {
+    value.len() == 64 && value.chars().all(|c| c.is_ascii_hexdigit())
 }
