@@ -18,6 +18,12 @@ pub struct RankedEvent {
     pub count: i64,
 }
 
+#[derive(Debug, sqlx::FromRow, Clone)]
+pub struct ProfileRow {
+    pub pubkey: String,
+    pub content: String,
+}
+
 impl EventRepository {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
@@ -224,6 +230,28 @@ impl EventRepository {
         }
 
         Ok(())
+    }
+
+    /// Fetch the most recent kind-0 metadata event for each requested pubkey.
+    pub async fn latest_profile_metadata(
+        &self,
+        pubkeys: &[String],
+    ) -> Result<Vec<ProfileRow>, AppError> {
+        if pubkeys.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let rows = sqlx::query_as::<_, ProfileRow>(
+            "SELECT DISTINCT ON (pubkey) pubkey, content
+             FROM events
+             WHERE kind = 0 AND pubkey = ANY($1)
+             ORDER BY pubkey, created_at DESC",
+        )
+        .bind(pubkeys)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows)
     }
 
     /// Get a single event by ID.
