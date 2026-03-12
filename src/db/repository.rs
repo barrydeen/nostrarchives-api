@@ -770,7 +770,13 @@ impl EventRepository {
 
         let rows = sqlx::query(
             r#"
-            WITH zap_amounts AS (
+            WITH credible_actors AS (
+                SELECT followed_pubkey AS pubkey
+                FROM follows
+                GROUP BY followed_pubkey
+                HAVING COUNT(*) >= 10
+            ),
+            zap_amounts AS (
                 SELECT
                     event_id,
                     MAX(
@@ -792,6 +798,8 @@ impl EventRepository {
                     COUNT(*) FILTER (WHERE r.ref_type = 'reply') AS replies,
                     COUNT(*) FILTER (WHERE r.ref_type = 'repost') AS reposts
                 FROM event_refs r
+                JOIN events src ON src.id = r.source_event_id
+                JOIN credible_actors ca ON ca.pubkey = src.pubkey
                 LEFT JOIN zap_amounts za ON za.event_id = r.source_event_id
                 WHERE ($2::bigint IS NULL OR r.created_at >= $2)
                 GROUP BY r.target_event_id
@@ -886,7 +894,13 @@ impl EventRepository {
 
         let rows = sqlx::query(
             r#"
-            WITH zap_amounts AS (
+            WITH credible_actors AS (
+                SELECT followed_pubkey AS pubkey
+                FROM follows
+                GROUP BY followed_pubkey
+                HAVING COUNT(*) >= 10
+            ),
+            zap_amounts AS (
                 SELECT
                     event_id,
                     MAX(
@@ -905,6 +919,8 @@ impl EventRepository {
                     COUNT(*) FILTER (WHERE r.ref_type = 'reply')    AS reply_count,
                     COUNT(*) FILTER (WHERE r.ref_type = 'reaction') AS reaction_count
                 FROM event_refs r
+                JOIN events src ON src.id = r.source_event_id
+                JOIN credible_actors ca ON ca.pubkey = src.pubkey
                 LEFT JOIN zap_amounts za ON za.event_id = r.source_event_id
                 WHERE r.created_at >= $1
                 GROUP BY r.target_event_id
