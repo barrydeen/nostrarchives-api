@@ -102,9 +102,10 @@ async fn main() {
     // Shutdown signal
     let (shutdown_tx, _) = broadcast::channel::<()>(1);
 
-    // Start metadata resolver (fetches kind-0 for discovered pubkeys)
+    // Start metadata resolver (fetches kind-0 for discovered pubkeys).
+    // Use the configured relay_urls (reliable indexers), not the full discovered list.
     let metadata_resolver =
-        relay::metadata::MetadataResolver::new(repo.clone(), relay_urls.clone());
+        relay::metadata::MetadataResolver::new(repo.clone(), cfg.relay_urls.clone());
     let metadata_tx = metadata_resolver.start(shutdown_tx.clone());
 
     // Start relay ingestion (with metadata resolver attached)

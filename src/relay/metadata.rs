@@ -184,8 +184,12 @@ impl MetadataResolver {
     }
 }
 
+/// Max relays to try for metadata fetching (use the first N, which are the
+/// configured/indexer relays rather than long-tail discovered ones).
+const MAX_METADATA_RELAYS: usize = 5;
+
 /// Fetch kind-0 metadata for specific pubkeys from relay(s).
-/// Tries each relay until we get results or exhaust the list.
+/// Tries up to MAX_METADATA_RELAYS until we get results or exhaust the list.
 /// Returns how many profiles were stored.
 async fn fetch_metadata_from_relays(
     pubkeys: &[String],
@@ -195,7 +199,7 @@ async fn fetch_metadata_from_relays(
     let mut stored = 0usize;
     let mut remaining: HashSet<String> = pubkeys.iter().cloned().collect();
 
-    for relay_url in relay_urls {
+    for relay_url in relay_urls.iter().take(MAX_METADATA_RELAYS) {
         if remaining.is_empty() {
             break;
         }
