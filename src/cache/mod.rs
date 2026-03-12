@@ -8,6 +8,18 @@ const PREFIX: &str = "nostr";
 const STATS_TTL: u64 = 60; // seconds
 const SEARCH_SUGGEST_TTL: u64 = 60; // seconds
 
+/// TTL for trending/top-notes cache, keyed by range.
+fn trending_ttl(range: &str) -> u64 {
+    match range {
+        "today" => 90, // 1.5 min — data shifts frequently
+        "7d" => 300,   // 5 min
+        "30d" => 900,  // 15 min
+        "1y" => 1800,  // 30 min
+        "all" => 3600, // 1 hour — rarely changes
+        _ => 120,
+    }
+}
+
 fn key(suffix: &str) -> String {
     format!("{PREFIX}:{suffix}")
 }
@@ -108,6 +120,38 @@ impl StatsCache {
         };
         let cache_key = key(&format!("search:suggest:{}", query.to_lowercase()));
         let _: Result<(), _> = conn.set_ex(&cache_key, json, SEARCH_SUGGEST_TTL).await;
+    }
+
+    /// Get cached trending results for a metric+range+limit+offset combo.
+    pub async fn get_trending(
+        &self,
+        metric: &str,
+        range: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Option<String> {
+        let Ok(mut conn) = self.redis.get_multiplexed_async_connection().await else {
+            return None;
+        };
+        let cache_key = key(&format!("trending:{metric}:{range}:{limit}:{offset}"));
+        conn.get(&cache_key).await.ok()
+    }
+
+    /// Cache trending results.
+    pub async fn set_trending(
+        &self,
+        metric: &str,
+        range: &str,
+        limit: i64,
+        offset: i64,
+        json: &str,
+    ) {
+        let Ok(mut conn) = self.redis.get_multiplexed_async_connection().await else {
+            return;
+        };
+        let cache_key = key(&format!("trending:{metric}:{range}:{limit}:{offset}"));
+        let ttl = trending_ttl(range);
+        let _: Result<(), _> = conn.set_ex(&cache_key, json, ttl).await;
     }
 
     /// Refresh stats from the database and populate cache.

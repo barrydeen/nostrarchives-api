@@ -223,10 +223,12 @@ pub async fn get_profiles_metadata(
 }
 
 /// Unified trending endpoint: GET /v1/notes/top?metric=reactions|replies|reposts|zaps&range=today|7d|30d|1y|all
+///
+/// Aggressively cached in Redis — TTL scales with range (90s for today, 1h for all-time).
 pub async fn get_top_notes_unified(
     State(state): State<AppState>,
     Query(q): Query<TopNotesQuery>,
-) -> Result<Json<TopNotesUnifiedResponse>, AppError> {
+) -> Result<Json<Value>, AppError> {
     let ref_type = match q.metric.as_deref().unwrap_or("reactions") {
         "reactions" => "reaction",
         "replies" => "reply",
@@ -242,6 +244,21 @@ pub async fn get_top_notes_unified(
     let metric = q.metric.as_deref().unwrap_or("reactions").to_string();
     let range = q.range.as_deref().unwrap_or("today").to_string();
 
+    let limit = clamp_listing_limit(q.limit);
+    let offset = clamp_offset(q.offset);
+
+    // ── Redis cache check ──────────────────────────────────────────
+    if let Some(cached) = state
+        .cache
+        .get_trending(&metric, &range, limit, offset)
+        .await
+    {
+        if let Ok(val) = serde_json::from_str::<Value>(&cached) {
+            return Ok(Json(val));
+        }
+    }
+
+    // ── Cache miss — compute ───────────────────────────────────────
     let since: Option<i64> = match range.as_str() {
         "today" => Some(Utc::now().timestamp() - 86_400),
         "7d" => Some(Utc::now().timestamp() - 7 * 86_400),
@@ -254,9 +271,6 @@ pub async fn get_top_notes_unified(
             )))
         }
     };
-
-    let limit = clamp_listing_limit(q.limit);
-    let offset = clamp_offset(q.offset);
 
     let (ranked, profile_rows) = state
         .repo
@@ -278,25 +292,37 @@ pub async fn get_top_notes_unified(
         })
         .collect();
 
-    let notes = ranked
+    let notes: Vec<Value> = ranked
         .into_iter()
-        .map(|entry| RankedNoteResponse {
-            count: entry.count,
-            total_sats: entry.total_sats,
-            reactions: entry.reactions,
-            replies: entry.replies,
-            reposts: entry.reposts,
-            zap_sats: entry.zap_sats,
-            event: entry.event,
+        .map(|entry| {
+            json!({
+                "count": entry.count,
+                "total_sats": entry.total_sats,
+                "reactions": entry.reactions,
+                "replies": entry.replies,
+                "reposts": entry.reposts,
+                "zap_sats": entry.zap_sats,
+                "event": entry.event,
+            })
         })
         .collect();
 
-    Ok(Json(TopNotesUnifiedResponse {
-        metric,
-        range,
-        notes,
-        profiles,
-    }))
+    let response = json!({
+        "metric": metric,
+        "range": range,
+        "notes": notes,
+        "profiles": profiles,
+    });
+
+    // ── Write to Redis cache ───────────────────────────────────────
+    if let Ok(json_str) = serde_json::to_string(&response) {
+        state
+            .cache
+            .set_trending(&metric, &range, limit, offset, &json_str)
+            .await;
+    }
+
+    Ok(Json(response))
 }
 
 /// Get trending notes with composite engagement score.
@@ -400,14 +426,6 @@ pub struct TopNotesQuery {
     pub range: Option<String>,
     pub limit: Option<i64>,
     pub offset: Option<i64>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct TopNotesUnifiedResponse {
-    pub metric: String,
-    pub range: String,
-    pub notes: Vec<RankedNoteResponse>,
-    pub profiles: HashMap<String, Value>,
 }
 
 #[derive(Debug, serde::Deserialize)]

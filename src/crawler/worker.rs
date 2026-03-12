@@ -215,9 +215,7 @@ impl Crawler {
         // Phase 2: Historical backfill (before crawl_cursor) OR initial crawl
         if target.crawl_cursor.is_some() || target.newest_seen_at.is_none() {
             let until = target.crawl_cursor; // Fetch older than what we've already gotten
-            let result = self
-                .fetch_author_notes(&target.pubkey, None, until)
-                .await;
+            let result = self.fetch_author_notes(&target.pubkey, None, until).await;
             if let Some((new, oldest, newest_found)) = result {
                 total_new += new;
                 oldest_ts = merge_min(oldest_ts, oldest);
@@ -247,7 +245,10 @@ impl Crawler {
         }
 
         if combined_new > 0 {
-            let global = self.total_crawled.fetch_add(total_new as u64, Ordering::Relaxed) + total_new as u64;
+            let global = self
+                .total_crawled
+                .fetch_add(total_new as u64, Ordering::Relaxed)
+                + total_new as u64;
             tracing::info!(
                 pubkey = %&target.pubkey[..12],
                 followers = target.follower_count,
@@ -263,7 +264,10 @@ impl Crawler {
     /// Fetch engagement events (kinds 6, 7, 9735) that reference this author's notes.
     /// Uses the `#p` tag filter to find reactions/reposts/zaps targeting this pubkey.
     async fn crawl_engagement(&self, pubkey: &str) -> i64 {
-        let max_relays = self.config.max_concurrency.min(self.config.relay_urls.len());
+        let max_relays = self
+            .config
+            .max_concurrency
+            .min(self.config.relay_urls.len());
         let mut total_new = 0i64;
 
         for relay_url in self.config.relay_urls.iter().take(max_relays) {
@@ -357,8 +361,7 @@ impl Crawler {
 
                     match arr[0].as_str() {
                         Some("EVENT") if arr.len() >= 3 => {
-                            if let Ok(event) =
-                                serde_json::from_value::<NostrEvent>(arr[2].clone())
+                            if let Ok(event) = serde_json::from_value::<NostrEvent>(arr[2].clone())
                             {
                                 if allowed.contains(&event.kind) {
                                     events.push(event);
@@ -401,13 +404,13 @@ impl Crawler {
         let mut newest: Option<i64> = None;
 
         // Try relays until we get results or exhaust the list
-        let max_relays = self.config.max_concurrency.min(self.config.relay_urls.len());
+        let max_relays = self
+            .config
+            .max_concurrency
+            .min(self.config.relay_urls.len());
 
         for relay_url in self.config.relay_urls.iter().take(max_relays) {
-            match self
-                .fetch_from_relay(relay_url, pubkey, since, until)
-                .await
-            {
+            match self.fetch_from_relay(relay_url, pubkey, since, until).await {
                 Ok(events) => {
                     for event in &events {
                         oldest = merge_min(oldest, Some(event.created_at));
@@ -511,8 +514,7 @@ impl Crawler {
 
                     match arr[0].as_str() {
                         Some("EVENT") if arr.len() >= 3 => {
-                            if let Ok(event) =
-                                serde_json::from_value::<NostrEvent>(arr[2].clone())
+                            if let Ok(event) = serde_json::from_value::<NostrEvent>(arr[2].clone())
                             {
                                 if event.kind == 1 {
                                     events.push(event);
