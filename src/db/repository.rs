@@ -254,6 +254,32 @@ impl EventRepository {
         Ok(rows)
     }
 
+    /// Given a list of pubkeys, return those that have NO kind-0 event stored.
+    pub async fn pubkeys_missing_metadata(
+        &self,
+        pubkeys: &[String],
+    ) -> Result<Vec<String>, AppError> {
+        if pubkeys.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let existing: Vec<String> = sqlx::query_scalar(
+            "SELECT DISTINCT pubkey FROM events WHERE kind = 0 AND pubkey = ANY($1)",
+        )
+        .bind(pubkeys)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let existing_set: std::collections::HashSet<&str> =
+            existing.iter().map(|s| s.as_str()).collect();
+
+        Ok(pubkeys
+            .iter()
+            .filter(|pk| !existing_set.contains(pk.as_str()))
+            .cloned()
+            .collect())
+    }
+
     /// Get a single event by ID.
     pub async fn get_event_by_id(&self, id: &str) -> Result<Option<StoredEvent>, AppError> {
         let event = sqlx::query_as::<_, StoredEvent>(

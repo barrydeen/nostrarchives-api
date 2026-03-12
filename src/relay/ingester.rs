@@ -45,6 +45,7 @@ pub struct RelayIngester {
     cache: StatsCache,
     since: i64,
     events_ingested: Arc<AtomicU64>,
+    metadata_tx: Option<mpsc::Sender<String>>,
 }
 
 impl RelayIngester {
@@ -61,7 +62,15 @@ impl RelayIngester {
             cache,
             since,
             events_ingested: Arc::new(AtomicU64::new(0)),
+            metadata_tx: None,
         }
+    }
+
+    /// Attach a metadata resolver sender. Discovered pubkeys will be queued for
+    /// kind-0 resolution.
+    pub fn with_metadata_sender(mut self, tx: mpsc::Sender<String>) -> Self {
+        self.metadata_tx = Some(tx);
+        self
     }
 
     /// Start ingestion: one task per relay, one shared processing worker.
@@ -72,9 +81,10 @@ impl RelayIngester {
         let repo = self.repo.clone();
         let cache = self.cache.clone();
         let counter = self.events_ingested.clone();
+        let metadata_tx = self.metadata_tx.clone();
         let mut shutdown_rx = shutdown.subscribe();
         tokio::spawn(async move {
-            Self::process_events(rx, repo, cache, counter, &mut shutdown_rx).await;
+            Self::process_events(rx, repo, cache, counter, metadata_tx, &mut shutdown_rx).await;
         });
 
         // Spawn one task per relay
@@ -206,11 +216,14 @@ impl RelayIngester {
     }
 
     /// Process incoming events: deduplicate, store in DB, update cache.
+    /// Submits author pubkeys (and referenced pubkeys from follow lists) to the
+    /// metadata resolver for kind-0 fetching.
     async fn process_events(
         mut rx: mpsc::Receiver<IngestedEvent>,
         repo: EventRepository,
         cache: StatsCache,
         counter: Arc<AtomicU64>,
+        metadata_tx: Option<mpsc::Sender<String>>,
         shutdown: &mut tokio::sync::broadcast::Receiver<()>,
     ) {
         loop {
@@ -220,11 +233,28 @@ impl RelayIngester {
                         Ok(true) => {
                             let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
                             cache.on_event_ingested(&ingested.event.pubkey, ingested.event.kind).await;
+
+                            // Queue author pubkey for metadata resolution
+                            if let Some(ref tx) = metadata_tx {
+                                let _ = tx.try_send(ingested.event.pubkey.clone());
+                            }
+
                             if ingested.event.kind == 3 {
                                 if let Err(e) = repo.upsert_follow_list(&ingested.event).await {
                                     tracing::error!(error = %e, event_id = %ingested.event.id, "failed to upsert follow list");
                                 }
+                                // Also queue pubkeys from follow lists
+                                if let Some(ref tx) = metadata_tx {
+                                    for tag in &ingested.event.tags {
+                                        if tag.first().map(|v| v == "p").unwrap_or(false) {
+                                            if let Some(target) = tag.get(1).filter(|v| !v.is_empty()) {
+                                                let _ = tx.try_send(target.clone());
+                                            }
+                                        }
+                                    }
+                                }
                             }
+
                             if count % 1000 == 0 {
                                 tracing::info!(total = count, "events ingested");
                             }
