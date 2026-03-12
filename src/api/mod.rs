@@ -5,6 +5,7 @@ use axum::Router;
 use tower_http::cors::CorsLayer;
 
 use crate::cache::StatsCache;
+use crate::crawler::queue::CrawlQueue;
 use crate::db::repository::EventRepository;
 
 /// Shared state available to all handlers.
@@ -12,6 +13,7 @@ use crate::db::repository::EventRepository;
 pub struct AppState {
     pub repo: EventRepository,
     pub cache: StatsCache,
+    pub crawl_queue: Option<CrawlQueue>,
 }
 
 /// Build the axum router with all routes.
@@ -51,6 +53,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/v1/search", get(handlers::search))
         .route("/v1/search/suggest", get(handlers::search_suggest))
+        .route("/v1/crawler/stats", get(handlers::get_crawler_stats))
         .layer(CorsLayer::permissive())
         .with_state(state)
 }

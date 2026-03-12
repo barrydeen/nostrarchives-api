@@ -12,6 +12,13 @@ pub struct Config {
     pub relay_target_count: usize,
     pub social_graph_bootstrap: bool,
     pub ws_listen_addr: String,
+    pub crawler_enabled: bool,
+    pub crawler_batch_size: i64,
+    pub crawler_events_per_author: i64,
+    pub crawler_request_delay_ms: u64,
+    pub crawler_poll_interval_secs: u64,
+    pub crawler_sync_interval_secs: u64,
+    pub crawler_max_concurrency: usize,
 }
 
 impl Config {
@@ -73,6 +80,40 @@ impl Config {
             .ok()
             .and_then(|v| v.parse::<i64>().ok());
 
+        let crawler_enabled = env::var("ENABLE_CRAWLER")
+            .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(true);
+
+        let crawler_batch_size = env::var("CRAWLER_BATCH_SIZE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10);
+
+        let crawler_events_per_author = env::var("CRAWLER_EVENTS_PER_AUTHOR")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(200);
+
+        let crawler_request_delay_ms = env::var("CRAWLER_REQUEST_DELAY_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(500);
+
+        let crawler_poll_interval_secs = env::var("CRAWLER_POLL_INTERVAL_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(30);
+
+        let crawler_sync_interval_secs = env::var("CRAWLER_SYNC_INTERVAL_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(3600);
+
+        let crawler_max_concurrency = env::var("CRAWLER_MAX_CONCURRENCY")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(3);
+
         Self {
             database_url,
             redis_url,
@@ -84,6 +125,13 @@ impl Config {
             relay_target_count,
             social_graph_bootstrap,
             ws_listen_addr,
+            crawler_enabled,
+            crawler_batch_size,
+            crawler_events_per_author,
+            crawler_request_delay_ms,
+            crawler_poll_interval_secs,
+            crawler_sync_interval_secs,
+            crawler_max_concurrency,
         }
     }
 }

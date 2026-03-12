@@ -1,6 +1,7 @@
 mod api;
 mod cache;
 mod config;
+mod crawler;
 mod db;
 mod error;
 mod nip19;
@@ -120,6 +121,37 @@ async fn main() {
     .with_metadata_sender(metadata_tx);
     ingester.run(shutdown_tx.clone()).await;
 
+    // Start intelligent crawler (historical note backfill)
+    let crawl_queue = if cfg.crawler_enabled {
+        let queue = crawler::queue::CrawlQueue::new(repo.pool());
+        let crawler_config = crawler::worker::CrawlerConfig {
+            relay_urls: cfg.relay_urls.clone(),
+            batch_size: cfg.crawler_batch_size,
+            events_per_author: cfg.crawler_events_per_author,
+            request_delay_ms: cfg.crawler_request_delay_ms,
+            poll_interval_secs: cfg.crawler_poll_interval_secs,
+            sync_interval_secs: cfg.crawler_sync_interval_secs,
+            max_concurrency: cfg.crawler_max_concurrency,
+        };
+        let crawler_worker = crawler::worker::Crawler::new(
+            crawler_config,
+            queue.clone(),
+            repo.clone(),
+            stats_cache.clone(),
+        );
+        let crawler_shutdown = shutdown_tx.clone();
+        tokio::spawn(async move {
+            // Small delay to let ingestion start first
+            tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+            crawler_worker.run(crawler_shutdown).await;
+        });
+        tracing::info!("intelligent crawler enabled");
+        Some(queue)
+    } else {
+        tracing::info!("intelligent crawler disabled");
+        None
+    };
+
     // Background: refresh profile_search materialized view every 5 minutes.
     let refresh_repo = repo.clone();
     tokio::spawn(async move {
@@ -139,6 +171,7 @@ async fn main() {
     let state = api::AppState {
         repo,
         cache: stats_cache,
+        crawl_queue,
     };
 
     // WebSocket relay (NIP-50 search endpoint)

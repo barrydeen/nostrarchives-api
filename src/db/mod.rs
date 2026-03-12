@@ -52,6 +52,10 @@ async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
             "006_profile_search",
             include_str!("../../migrations/006_profile_search.sql"),
         ),
+        (
+            "007_crawl_state",
+            include_str!("../../migrations/007_crawl_state.sql"),
+        ),
     ];
 
     for (name, sql) in migrations {

@@ -584,6 +584,19 @@ async fn resolve_entity(input: &str, state: &AppState) -> Result<Option<Value>, 
     Ok(None)
 }
 
+/// GET /v1/crawler/stats — crawler queue statistics.
+pub async fn get_crawler_stats(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    match &state.crawl_queue {
+        Some(queue) => {
+            let stats = queue.stats().await?;
+            Ok(Json(serde_json::to_value(stats).unwrap()))
+        }
+        None => Ok(Json(serde_json::json!({ "enabled": false }))),
+    }
+}
+
 fn normalize_pubkey(input: &str) -> Result<String, AppError> {
     let trimmed = input.trim();
     if trimmed.is_empty() {

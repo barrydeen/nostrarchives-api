@@ -31,6 +31,11 @@ impl EventRepository {
         Self { pool }
     }
 
+    /// Return a clone of the underlying connection pool.
+    pub fn pool(&self) -> PgPool {
+        self.pool.clone()
+    }
+
     /// Insert a new event. Returns true if the event was inserted (not a duplicate).
     pub async fn insert_event(
         &self,
