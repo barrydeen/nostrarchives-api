@@ -45,7 +45,7 @@ pub async fn get_event_by_id(
 ) -> Result<Json<Value>, AppError> {
     match state.repo.get_event_by_id(&id).await? {
         Some(event) => Ok(Json(serde_json::to_value(event).unwrap())),
-        None => Err(AppError::Internal("event not found".into())),
+        None => Err(AppError::NotFound("event not found".into())),
     }
 }
 
@@ -58,7 +58,7 @@ pub async fn get_event_thread(
     let limit = q.limit.unwrap_or(50).min(500);
     match state.repo.get_thread(&id, limit).await? {
         Some(thread) => Ok(Json(serde_json::to_value(thread).unwrap())),
-        None => Err(AppError::Internal("event not found".into())),
+        None => Err(AppError::NotFound("event not found".into())),
     }
 }
 

@@ -7,6 +7,7 @@ pub enum AppError {
     Database(sqlx::Error),
     Redis(redis::RedisError),
     BadRequest(String),
+    NotFound(String),
     Internal(String),
 }
 
@@ -16,6 +17,7 @@ impl fmt::Display for AppError {
             AppError::Database(e) => write!(f, "database error: {e}"),
             AppError::Redis(e) => write!(f, "redis error: {e}"),
             AppError::BadRequest(msg) => write!(f, "bad request: {msg}"),
+            AppError::NotFound(msg) => write!(f, "not found: {msg}"),
             AppError::Internal(msg) => write!(f, "internal error: {msg}"),
         }
     }
@@ -25,11 +27,15 @@ impl std::error::Error for AppError {}
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
-        tracing::error!("{self}");
+        match &self {
+            AppError::NotFound(_) => tracing::debug!("{self}"),
+            _ => tracing::error!("{self}"),
+        }
         let (status, message) = match &self {
             AppError::Database(_) => (StatusCode::INTERNAL_SERVER_ERROR, "database error"),
             AppError::Redis(_) => (StatusCode::INTERNAL_SERVER_ERROR, "cache error"),
             AppError::BadRequest(_) => (StatusCode::BAD_REQUEST, "bad request"),
+            AppError::NotFound(_) => (StatusCode::NOT_FOUND, "not found"),
             AppError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal error"),
         };
         (status, message).into_response()
