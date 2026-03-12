@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use axum::extract::ws::{Message, WebSocket};
-use axum::extract::{State, WebSocketUpgrade};
+use axum::extract::{Path, State, WebSocketUpgrade};
 use axum::response::IntoResponse;
 use axum::routing::any;
 use axum::Router;
@@ -17,8 +17,10 @@ use crate::api::AppState;
 enum FeedKind {
     /// NIP-50 search relay (existing behavior).
     Search,
-    /// Trending notes from the last 24 hours.
-    TrendingToday,
+    /// Trending notes by metric and time range.
+    /// metric: "reactions" | "replies" | "reposts" | "zaps"
+    /// range:  "today" | "7d" | "30d" | "1y" | "all"
+    Trending { metric: String, range: String },
 }
 
 /// Build the WebSocket relay router.
@@ -26,8 +28,11 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         // Existing search relay on root path
         .route("/", any(ws_search_handler))
-        // Feed endpoints: /trending/today
-        .route("/trending/today", any(ws_trending_today_handler))
+        // Feed endpoints: /notes/trending/{metric}/{range}
+        .route(
+            "/notes/trending/{metric}/{range}",
+            any(ws_trending_handler),
+        )
         .with_state(state)
 }
 
@@ -59,11 +64,14 @@ async fn ws_search_handler(
     ws.on_upgrade(move |socket| handle_connection(socket, state, FeedKind::Search))
 }
 
-async fn ws_trending_today_handler(
+async fn ws_trending_handler(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
+    Path((metric, range)): Path<(String, String)>,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_connection(socket, state, FeedKind::TrendingToday))
+    ws.on_upgrade(move |socket| {
+        handle_connection(socket, state, FeedKind::Trending { metric, range })
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -148,7 +156,6 @@ async fn handle_nostr_message(text: &str, state: &AppState, feed_kind: &FeedKind
 }
 
 async fn handle_req(arr: &[Value], state: &AppState, feed_kind: &FeedKind) -> Vec<String> {
-    // ["REQ", subscription_id, filter, ...]
     if arr.len() < 3 {
         return vec![notice("REQ requires subscription_id and at least one filter")];
     }
@@ -160,7 +167,9 @@ async fn handle_req(arr: &[Value], state: &AppState, feed_kind: &FeedKind) -> Ve
 
     match feed_kind {
         FeedKind::Search => handle_search_req(&sub_id, &arr[2..], state).await,
-        FeedKind::TrendingToday => handle_trending_today_req(&sub_id, &arr[2..], state).await,
+        FeedKind::Trending { metric, range } => {
+            handle_trending_req(&sub_id, &arr[2..], state, metric, range).await
+        }
     }
 }
 
@@ -177,18 +186,71 @@ async fn handle_search_req(sub_id: &str, filters: &[Value], _state: &AppState) -
     vec![eose(sub_id)]
 }
 
-/// Trending today feed: return top trending notes from the last 24h.
+// ---------------------------------------------------------------------------
+// Trending feed handler
+// ---------------------------------------------------------------------------
+
+/// Validate metric string → ref_type for the DB query.
+fn validate_metric(metric: &str) -> Option<&'static str> {
+    match metric {
+        "reactions" => Some("reaction"),
+        "replies" => Some("reply"),
+        "reposts" => Some("repost"),
+        "zaps" => Some("zap"),
+        _ => None,
+    }
+}
+
+/// Validate range string → since timestamp.
+fn validate_range(range: &str) -> Option<Option<i64>> {
+    let now = chrono::Utc::now().timestamp();
+    match range {
+        "today" => Some(Some(now - 86_400)),
+        "7d" => Some(Some(now - 7 * 86_400)),
+        "30d" => Some(Some(now - 30 * 86_400)),
+        "1y" => Some(Some(now - 365 * 86_400)),
+        "all" => Some(None),
+        _ => None,
+    }
+}
+
+/// Trending feed: return top notes by metric and time range.
 ///
-/// Uses the same Redis-cached path as the HTTP `/v1/notes/top` endpoint to avoid
-/// expensive uncached queries that can take 15-30 seconds.
-///
-/// Any REQ on this endpoint returns the trending feed regardless of the filter contents.
-/// The filter's `limit` field is respected (capped at 200, default 50).
-async fn handle_trending_today_req(
+/// Uses the same Redis-cached path as the HTTP `/v1/notes/top` endpoint.
+/// On cache hit, responses are instant. On cache miss, computes and caches.
+async fn handle_trending_req(
     sub_id: &str,
     filters: &[Value],
     state: &AppState,
+    metric: &str,
+    range: &str,
 ) -> Vec<String> {
+    // Validate metric
+    let ref_type = match validate_metric(metric) {
+        Some(rt) => rt,
+        None => {
+            return vec![
+                notice(&format!(
+                    "invalid metric: {metric}. Use: reactions, replies, reposts, zaps"
+                )),
+                eose(sub_id),
+            ];
+        }
+    };
+
+    // Validate range
+    let since = match validate_range(range) {
+        Some(s) => s,
+        None => {
+            return vec![
+                notice(&format!(
+                    "invalid range: {range}. Use: today, 7d, 30d, 1y, all"
+                )),
+                eose(sub_id),
+            ];
+        }
+    };
+
     let limit = filters
         .first()
         .and_then(|f| f.get("limit"))
@@ -196,27 +258,31 @@ async fn handle_trending_today_req(
         .unwrap_or(50)
         .clamp(1, 200);
 
-    tracing::info!(sub_id = %sub_id, limit = limit, "trending/today feed request");
+    tracing::info!(
+        sub_id = %sub_id,
+        metric = %metric,
+        range = %range,
+        limit = limit,
+        "feed request"
+    );
 
-    let metric = "reactions";
-    let range = "today";
-    let since = Some(chrono::Utc::now().timestamp() - 86_400);
-
-    // Try Redis cache first (same cache as the HTTP trending endpoint)
+    // Try Redis cache first (same cache key as the HTTP trending endpoint)
     if let Some(cached) = state.cache.get_trending(metric, range, limit, 0).await {
         if let Ok(val) = serde_json::from_str::<Value>(&cached) {
             let messages = extract_events_from_cached(&val, sub_id);
             tracing::info!(
                 sub_id = %sub_id,
-                events = messages.len() - 1, // minus EOSE
-                "trending/today feed served (cache hit)"
+                metric = %metric,
+                range = %range,
+                events = messages.len() - 1,
+                "feed served (cache hit)"
             );
             return messages;
         }
     }
 
-    // Cache miss — query DB via the same path as the HTTP endpoint
-    match state.repo.top_notes_unified("reaction", since, limit, 0).await {
+    // Cache miss — compute via DB
+    match state.repo.top_notes_unified(ref_type, since, limit, 0).await {
         Ok((ranked, profile_rows)) => {
             let mut messages = Vec::with_capacity(ranked.len() + 1);
 
@@ -259,7 +325,10 @@ async fn handle_trending_today_req(
                 "profiles": profiles,
             });
             if let Ok(json_str) = serde_json::to_string(&response) {
-                state.cache.set_trending(metric, range, limit, 0, &json_str).await;
+                state
+                    .cache
+                    .set_trending(metric, range, limit, 0, &json_str)
+                    .await;
             }
 
             // Send raw Nostr events
@@ -273,15 +342,22 @@ async fn handle_trending_today_req(
 
             tracing::info!(
                 sub_id = %sub_id,
+                metric = %metric,
+                range = %range,
                 events = ranked.len(),
-                "trending/today feed served (cache miss)"
+                "feed served (cache miss)"
             );
 
             messages.push(eose(sub_id));
             messages
         }
         Err(e) => {
-            tracing::error!(error = %e, "failed to fetch trending notes for feed");
+            tracing::error!(
+                metric = %metric,
+                range = %range,
+                error = %e,
+                "failed to fetch trending notes for feed"
+            );
             vec![
                 notice("error: failed to fetch trending notes"),
                 eose(sub_id),
@@ -296,12 +372,10 @@ fn extract_events_from_cached(val: &Value, sub_id: &str) -> Vec<String> {
 
     if let Some(notes) = val.get("notes").and_then(|n| n.as_array()) {
         for note in notes {
-            // The cached event has a `raw` field containing the original Nostr event
             if let Some(raw) = note.get("event").and_then(|e| e.get("raw")) {
-                let event_msg = serde_json::to_string(
-                    &serde_json::json!(["EVENT", sub_id, raw]),
-                )
-                .expect("json serialization cannot fail");
+                let event_msg =
+                    serde_json::to_string(&serde_json::json!(["EVENT", sub_id, raw]))
+                        .expect("json serialization cannot fail");
                 messages.push(event_msg);
             }
         }
