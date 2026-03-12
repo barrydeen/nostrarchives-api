@@ -32,10 +32,19 @@ pub async fn get_events(
     State(state): State<AppState>,
     Query(q): Query<EventQuery>,
 ) -> Result<Json<Value>, AppError> {
-    let events = state.repo.query_events(&q).await?;
+    let (events, total) = tokio::try_join!(
+        state.repo.query_events(&q),
+        state.repo.count_events_filtered(
+            q.pubkey.as_deref(),
+            q.kind,
+            q.since,
+            q.until,
+        ),
+    )?;
     Ok(Json(json!({
         "events": events,
         "count": events.len(),
+        "total": total,
     })))
 }
 

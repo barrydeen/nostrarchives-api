@@ -427,6 +427,58 @@ impl EventRepository {
         Ok(events)
     }
 
+    /// Count events matching the same filters as query_events (without limit/offset).
+    pub async fn count_events_filtered(
+        &self,
+        pubkey: Option<&str>,
+        kind: Option<i32>,
+        since: Option<i64>,
+        until: Option<i64>,
+    ) -> Result<i64, AppError> {
+        let mut sql = String::from("SELECT COUNT(*) FROM events WHERE 1=1");
+        let mut param_idx = 1u32;
+
+        let mut conditions = Vec::new();
+
+        if pubkey.is_some() {
+            conditions.push(format!("pubkey = ${param_idx}"));
+            param_idx += 1;
+        }
+        if kind.is_some() {
+            conditions.push(format!("kind = ${param_idx}"));
+            param_idx += 1;
+        }
+        if since.is_some() {
+            conditions.push(format!("created_at >= ${param_idx}"));
+            param_idx += 1;
+        }
+        if until.is_some() {
+            conditions.push(format!("created_at <= ${param_idx}"));
+        }
+
+        for cond in &conditions {
+            sql.push_str(&format!(" AND {cond}"));
+        }
+
+        let mut query = sqlx::query_scalar::<_, i64>(&sql);
+
+        if let Some(v) = pubkey {
+            query = query.bind(v);
+        }
+        if let Some(v) = kind {
+            query = query.bind(v);
+        }
+        if let Some(v) = since {
+            query = query.bind(v);
+        }
+        if let Some(v) = until {
+            query = query.bind(v);
+        }
+
+        let count = query.fetch_one(&self.pool).await?;
+        Ok(count)
+    }
+
     /// Count total events.
     pub async fn count_events(&self) -> Result<i64, AppError> {
         let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM events")
