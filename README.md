@@ -95,7 +95,8 @@ cargo run
   "range": "all_time|today",
   "notes": [
     {
-      "count": <aggregated metric>,
+      "count": <number of reactions/zaps>,
+      "total_sats": <optional total satoshis for zap metrics>,
       "event": { ... StoredEvent payload ... }
     }
   ]

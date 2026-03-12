@@ -270,6 +270,8 @@ pub struct SocialGraphResponse {
 #[derive(Debug, Serialize)]
 pub struct RankedNoteResponse {
     pub count: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_sats: Option<i64>,
     pub event: StoredEvent,
 }
 
@@ -330,6 +332,7 @@ async fn ranked_notes(
         .into_iter()
         .map(|entry| RankedNoteResponse {
             count: entry.count,
+            total_sats: entry.total_sats,
             event: entry.event,
         })
         .collect();
