@@ -35,6 +35,9 @@ cargo run
 | GET | `/v1/stats` | Global stats (cached) |
 | GET | `/v1/events` | Query events with filters |
 | GET | `/v1/events/{id}` | Get event by ID |
+| GET | `/v1/events/{id}/thread` | Thread context (ancestors + replies/reactions/etc.) |
+| GET | `/v1/events/{id}/interactions` | Lightweight interaction counts |
+| GET | `/v1/events/{id}/refs/{ref_type}` | Events referencing the target by type |
 | GET | `/v1/social/{pubkey}` | Follow/follower counts + lists for a pubkey |
 | GET | `/v1/notes/likes/top` | Top liked notes (all time) |
 | GET | `/v1/notes/likes/top/today` | Top liked notes (rolling 24h) |
@@ -53,6 +56,13 @@ cargo run
 | `limit` | int | Max results (default 50, max 500) |
 | `offset` | int | Pagination offset |
 
+### Query Parameters (`/v1/events/{id}/thread` and `/v1/events/{id}/refs/{ref_type}`)
+
+| Param | Type | Description |
+|-------|------|-------------|
+| `limit` | int | Max related events returned (default 50, max 500) |
+| `ref_type` | string | `refs` endpoint only — one of `reply`, `reaction`, `repost`, `zap`, `mention`, `root` |
+
 ### Query Parameters (`/v1/social/{pubkey}`)
 
 | Param | Type | Description |
@@ -62,12 +72,35 @@ cargo run
 | `follows_offset` | int | Offset into the follow list (default 0) |
 | `followers_offset` | int | Offset into the follower list (default 0) |
 
+**Response shape**
+```
+{
+  "pubkey": "<hex>",
+  "follows": { "count": <total>, "pubkeys": [ ... newest first ... ] },
+  "followers": { "count": <total>, "pubkeys": [ ... newest first ... ] }
+}
+```
+
 ### Query Parameters (`/v1/notes/.../top`)
 
 | Param | Type | Description |
 |-------|------|-------------|
 | `limit` | int | Max notes returned (default 100, max 100) |
 | `offset` | int | Pagination offset (default 0) |
+
+**Response shape**
+```
+{
+  "metric": "likes|zaps",
+  "range": "all_time|today",
+  "notes": [
+    {
+      "count": <aggregated metric>,
+      "event": { ... StoredEvent payload ... }
+    }
+  ]
+}
+```
 
 ## Database Schema
 
