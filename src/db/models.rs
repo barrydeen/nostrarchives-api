@@ -101,6 +101,14 @@ pub struct TrendingUser {
     pub new_followers: i64,
 }
 
+/// A top zapper (by sats sent or received in last 24h).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TopZapper {
+    pub pubkey: String,
+    pub total_sats: i64,
+    pub zap_count: i64,
+}
+
 /// Daily network stats.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DailyStats {

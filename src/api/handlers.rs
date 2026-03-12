@@ -358,6 +358,26 @@ pub async fn get_trending_users(
     Ok(Json(json!({ "users": users })))
 }
 
+/// Top zappers by sats sent or received in last 24h.
+pub async fn get_top_zappers(
+    State(state): State<AppState>,
+    Query(q): Query<TopZappersQuery>,
+) -> Result<Json<Value>, AppError> {
+    let direction = q.direction.as_deref().unwrap_or("received");
+    if direction != "sent" && direction != "received" {
+        return Err(AppError::BadRequest(
+            "direction must be 'sent' or 'received'".into(),
+        ));
+    }
+    let limit = clamp_listing_limit(q.limit);
+    let offset = clamp_offset(q.offset);
+    let zappers = state.repo.top_zappers(direction, limit, offset).await?;
+    Ok(Json(json!({
+        "direction": direction,
+        "zappers": zappers,
+    })))
+}
+
 /// Get daily network stats (DAU, total sats, daily posts).
 pub async fn get_daily_stats(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
     let stats = state.repo.daily_stats().await?;
@@ -443,6 +463,13 @@ pub struct SocialQuery {
 
 #[derive(Debug, serde::Deserialize)]
 pub struct ListingQuery {
+    pub limit: Option<i64>,
+    pub offset: Option<i64>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct TopZappersQuery {
+    pub direction: Option<String>,
     pub limit: Option<i64>,
     pub offset: Option<i64>,
 }

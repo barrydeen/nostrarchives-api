@@ -1246,6 +1246,85 @@ impl EventRepository {
         })
     }
 
+    /// Top zappers: users ranked by total sats sent or received in the last 24h.
+    pub async fn top_zappers(
+        &self,
+        direction: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<super::models::TopZapper>, AppError> {
+        let since = chrono::Utc::now().timestamp() - 86400;
+
+        let rows = if direction == "sent" {
+            // Sender pubkey is inside the embedded zap request JSON (description tag)
+            sqlx::query_as::<_, (String, i64, i64)>(
+                r#"
+                WITH zap_data AS (
+                    SELECT
+                        (t_desc.tag_value::jsonb)->>'pubkey' AS sender,
+                        CASE WHEN t_amt.tag_value ~ '^[0-9]+$'
+                             THEN t_amt.tag_value::bigint ELSE 0 END AS amount_msats
+                    FROM events e
+                    JOIN event_tags t_amt ON t_amt.event_id = e.id AND t_amt.tag_name = 'amount'
+                    JOIN event_tags t_desc ON t_desc.event_id = e.id AND t_desc.tag_name = 'description'
+                    WHERE e.kind = 9735 AND e.created_at >= $1
+                )
+                SELECT sender AS pubkey,
+                       (SUM(amount_msats) / 1000)::bigint AS total_sats,
+                       COUNT(*)::bigint AS zap_count
+                FROM zap_data
+                WHERE sender IS NOT NULL AND sender != ''
+                GROUP BY sender
+                ORDER BY total_sats DESC
+                LIMIT $2 OFFSET $3
+                "#,
+            )
+            .bind(since)
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            // Received: recipient is the p tag on the zap receipt
+            sqlx::query_as::<_, (String, i64, i64)>(
+                r#"
+                WITH zap_data AS (
+                    SELECT
+                        t_p.tag_value AS recipient,
+                        CASE WHEN t_amt.tag_value ~ '^[0-9]+$'
+                             THEN t_amt.tag_value::bigint ELSE 0 END AS amount_msats
+                    FROM events e
+                    JOIN event_tags t_amt ON t_amt.event_id = e.id AND t_amt.tag_name = 'amount'
+                    JOIN event_tags t_p ON t_p.event_id = e.id AND t_p.tag_name = 'p'
+                    WHERE e.kind = 9735 AND e.created_at >= $1
+                )
+                SELECT recipient AS pubkey,
+                       (SUM(amount_msats) / 1000)::bigint AS total_sats,
+                       COUNT(*)::bigint AS zap_count
+                FROM zap_data
+                WHERE recipient IS NOT NULL AND recipient != ''
+                GROUP BY recipient
+                ORDER BY total_sats DESC
+                LIMIT $2 OFFSET $3
+                "#,
+            )
+            .bind(since)
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&self.pool)
+            .await?
+        };
+
+        Ok(rows
+            .into_iter()
+            .map(|(pubkey, total_sats, zap_count)| super::models::TopZapper {
+                pubkey,
+                total_sats,
+                zap_count,
+            })
+            .collect())
+    }
+
     /// Search profiles with ranked results.
     ///
     /// Ranking algorithm:
