@@ -72,6 +72,7 @@ pub struct EventInteractions {
     pub reactions: i64,
     pub reposts: i64,
     pub zaps: i64,
+    pub zap_sats: i64,
 }
 
 /// Thread context: the event, its ancestors, and all interactions.

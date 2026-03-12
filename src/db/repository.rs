@@ -16,6 +16,7 @@ pub struct EventRepository {
 pub struct RankedEvent {
     pub event: StoredEvent,
     pub count: i64,
+    pub total_sats: Option<i64>,
 }
 
 #[derive(Debug, sqlx::FromRow, Clone)]
@@ -401,14 +402,39 @@ impl EventRepository {
 
     /// Get interaction counts for an event.
     pub async fn get_interactions(&self, event_id: &str) -> Result<EventInteractions, AppError> {
-        let row = sqlx::query_as::<_, (i64, i64, i64, i64)>(
-            "SELECT
-                COUNT(*) FILTER (WHERE ref_type = 'reply') AS replies,
-                COUNT(*) FILTER (WHERE ref_type = 'reaction') AS reactions,
-                COUNT(*) FILTER (WHERE ref_type = 'repost') AS reposts,
-                COUNT(*) FILTER (WHERE ref_type = 'zap') AS zaps
-             FROM event_refs
-             WHERE target_event_id = $1",
+        let row = sqlx::query_as::<_, (i64, i64, i64, i64, i64)>(
+            r#"
+            SELECT
+                COUNT(*) FILTER (WHERE r.ref_type = 'reply') AS replies,
+                COUNT(*) FILTER (WHERE r.ref_type = 'reaction') AS reactions,
+                COUNT(*) FILTER (WHERE r.ref_type = 'repost') AS reposts,
+                COUNT(*) FILTER (WHERE r.ref_type = 'zap') AS zaps,
+                COALESCE(
+                    SUM(
+                        CASE
+                            WHEN r.ref_type = 'zap' THEN COALESCE(za.amount_msats, 0)
+                            ELSE 0
+                        END
+                    ),
+                    0
+                ) AS zap_total_msats
+            FROM event_refs r
+            LEFT JOIN LATERAL (
+                SELECT
+                    COALESCE(
+                        MAX(
+                            CASE
+                                WHEN tag_value ~ '^[0-9]+$' THEN tag_value::bigint
+                                ELSE 0
+                            END
+                        ),
+                        0
+                    ) AS amount_msats
+                FROM event_tags
+                WHERE event_id = r.source_event_id AND tag_name = 'amount'
+            ) za ON TRUE
+            WHERE r.target_event_id = $1
+            "#,
         )
         .bind(event_id)
         .fetch_one(&self.pool)
@@ -419,6 +445,7 @@ impl EventRepository {
             reactions: row.1,
             reposts: row.2,
             zaps: row.3,
+            zap_sats: row.4 / 1000,
         })
     }
 
@@ -571,8 +598,23 @@ impl EventRepository {
         limit: i64,
         offset: i64,
     ) -> Result<Vec<RankedEvent>, AppError> {
+        let is_zap = ref_type == "zap";
+
         let rows = sqlx::query(
             r#"
+            WITH zap_amounts AS (
+                SELECT
+                    event_id,
+                    MAX(
+                        CASE
+                            WHEN tag_value ~ '^[0-9]+$' THEN tag_value::bigint
+                            ELSE 0
+                        END
+                    ) AS amount_msats
+                FROM event_tags
+                WHERE tag_name = 'amount'
+                GROUP BY event_id
+            )
             SELECT
                 e.id,
                 e.pubkey,
@@ -584,19 +626,31 @@ impl EventRepository {
                 e.raw,
                 e.relay_url,
                 e.received_at,
-                counts.metric_count
+                counts.metric_count,
+                counts.zap_total_msats
             FROM (
-                SELECT target_event_id, COUNT(*) AS metric_count
-                FROM event_refs
-                WHERE ref_type = $1
-                  AND ($2::bigint IS NULL OR created_at >= $2)
-                GROUP BY target_event_id
-                ORDER BY metric_count DESC
+                SELECT
+                    r.target_event_id,
+                    COUNT(*) AS metric_count,
+                    SUM(COALESCE(za.amount_msats, 0)) AS zap_total_msats
+                FROM event_refs r
+                LEFT JOIN zap_amounts za ON za.event_id = r.source_event_id
+                WHERE r.ref_type = $1
+                  AND ($2::bigint IS NULL OR r.created_at >= $2)
+                GROUP BY r.target_event_id
+                ORDER BY
+                    CASE WHEN $1 = 'zap' THEN SUM(COALESCE(za.amount_msats, 0))
+                         ELSE COUNT(*)
+                    END DESC
                 LIMIT $3 OFFSET $4
             ) counts
             JOIN events e ON e.id = counts.target_event_id
             WHERE e.kind = 1
-            ORDER BY counts.metric_count DESC, e.created_at DESC
+            ORDER BY
+                CASE WHEN $1 = 'zap' THEN counts.zap_total_msats
+                     ELSE counts.metric_count
+                END DESC,
+                e.created_at DESC
             "#,
         )
         .bind(ref_type)
@@ -623,7 +677,18 @@ impl EventRepository {
                 };
 
                 let count = row.try_get("metric_count")?;
-                Ok(RankedEvent { event, count })
+                let zap_total_msats: i64 = row.try_get("zap_total_msats")?;
+                let total_sats = if is_zap {
+                    Some(zap_total_msats / 1000)
+                } else {
+                    None
+                };
+
+                Ok(RankedEvent {
+                    event,
+                    count,
+                    total_sats,
+                })
             })
             .collect::<Result<Vec<_>, _>>()?;
 
