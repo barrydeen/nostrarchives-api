@@ -796,6 +796,8 @@ impl EventRepository {
                 WHERE tag_name = 'amount'
                 GROUP BY event_id
             ),
+            -- When metric is zap: count ALL zaps (real money, no credibility filter)
+            -- When metric is anything else: use credible_actors filter
             ranked AS (
                 SELECT
                     r.target_event_id,
@@ -806,9 +808,10 @@ impl EventRepository {
                     COUNT(*) FILTER (WHERE r.ref_type = 'repost') AS reposts
                 FROM event_refs r
                 JOIN events src ON src.id = r.source_event_id
-                JOIN credible_actors ca ON ca.pubkey = src.pubkey
+                LEFT JOIN credible_actors ca ON ca.pubkey = src.pubkey
                 LEFT JOIN zap_amounts za ON za.event_id = r.source_event_id
                 WHERE ($2::bigint IS NULL OR r.created_at >= $2)
+                  AND ($1 = 'zap' OR ca.pubkey IS NOT NULL)
                 GROUP BY r.target_event_id
                 HAVING COUNT(*) FILTER (WHERE r.ref_type = $1) > 0
                 ORDER BY
@@ -910,6 +913,7 @@ impl EventRepository {
                 HAVING COUNT(*) >= 10
             ),
             -- Phase 1: rank by primary metric only (uses idx_event_refs_reftype_created)
+            -- Zap ranking counts ALL senders (real money); other metrics filter to credible actors
             primary_metric AS (
                 SELECT
                     r.target_event_id,
@@ -921,13 +925,14 @@ impl EventRepository {
                     ELSE 0::bigint END AS zap_total_msats
                 FROM event_refs r
                 JOIN events src ON src.id = r.source_event_id
-                JOIN credible_actors ca ON ca.pubkey = src.pubkey
+                LEFT JOIN credible_actors ca ON ca.pubkey = src.pubkey
                 LEFT JOIN event_tags et
                     ON $1 = 'zap'
                     AND et.event_id = r.source_event_id
                     AND et.tag_name = 'amount'
                 WHERE r.ref_type = $1
                   AND ($2::bigint IS NULL OR r.created_at >= $2)
+                  AND ($1 = 'zap' OR ca.pubkey IS NOT NULL)
                 GROUP BY r.target_event_id
                 ORDER BY
                     CASE WHEN $1 = 'zap' THEN
@@ -1053,20 +1058,41 @@ impl EventRepository {
                 WHERE tag_name = 'amount'
                 GROUP BY event_id
             ),
-            note_engagement AS (
+            -- Zap sats counted from ALL senders (real money = legitimate signal)
+            all_zaps AS (
                 SELECT
                     r.target_event_id,
-                    COUNT(*) FILTER (WHERE r.ref_type = 'zap')      AS zap_count,
-                    COALESCE(SUM(CASE WHEN r.ref_type = 'zap' THEN COALESCE(za.amount_msats, 0) / 1000 ELSE 0 END), 0)::bigint AS zap_sats,
+                    COUNT(*)::bigint AS zap_count,
+                    COALESCE(SUM(COALESCE(za.amount_msats, 0) / 1000), 0)::bigint AS zap_sats
+                FROM event_refs r
+                LEFT JOIN zap_amounts za ON za.event_id = r.source_event_id
+                WHERE r.ref_type = 'zap' AND r.created_at >= $1
+                GROUP BY r.target_event_id
+            ),
+            -- Free engagement filtered to credible actors only
+            credible_engagement AS (
+                SELECT
+                    r.target_event_id,
                     COUNT(*) FILTER (WHERE r.ref_type = 'repost')   AS repost_count,
                     COUNT(*) FILTER (WHERE r.ref_type = 'reply')    AS reply_count,
                     COUNT(*) FILTER (WHERE r.ref_type = 'reaction') AS reaction_count
                 FROM event_refs r
                 JOIN events src ON src.id = r.source_event_id
                 JOIN credible_actors ca ON ca.pubkey = src.pubkey
-                LEFT JOIN zap_amounts za ON za.event_id = r.source_event_id
-                WHERE r.created_at >= $1
+                WHERE r.ref_type IN ('repost', 'reply', 'reaction')
+                  AND r.created_at >= $1
                 GROUP BY r.target_event_id
+            ),
+            note_engagement AS (
+                SELECT
+                    COALESCE(az.target_event_id, ce.target_event_id) AS target_event_id,
+                    COALESCE(az.zap_count, 0)      AS zap_count,
+                    COALESCE(az.zap_sats, 0)        AS zap_sats,
+                    COALESCE(ce.repost_count, 0)    AS repost_count,
+                    COALESCE(ce.reply_count, 0)     AS reply_count,
+                    COALESCE(ce.reaction_count, 0)  AS reaction_count
+                FROM all_zaps az
+                FULL OUTER JOIN credible_engagement ce ON ce.target_event_id = az.target_event_id
             )
             SELECT
                 e.id, e.pubkey, e.created_at, e.kind, e.content, e.sig, e.tags, e.raw,
