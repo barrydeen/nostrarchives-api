@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use sqlx::PgPool;
+use sqlx::{PgPool, Row};
 
 use super::models::{
     EventInteractions, EventQuery, EventRef, EventThread, KindCount, NostrEvent, StoredEvent,
@@ -10,6 +10,12 @@ use crate::error::AppError;
 #[derive(Clone)]
 pub struct EventRepository {
     pool: PgPool,
+}
+
+#[derive(Debug, Clone)]
+pub struct RankedEvent {
+    pub event: StoredEvent,
+    pub count: i64,
 }
 
 impl EventRepository {
@@ -498,5 +504,72 @@ impl EventRepository {
                 .await?;
 
         Ok((follows_count, followers_count))
+    }
+
+    /// Return ranked note events by ref_type (reaction/zap) with optional since filter.
+    pub async fn top_notes_by_ref(
+        &self,
+        ref_type: &str,
+        since: Option<i64>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<RankedEvent>, AppError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                e.id,
+                e.pubkey,
+                e.created_at,
+                e.kind,
+                e.content,
+                e.sig,
+                e.tags,
+                e.raw,
+                e.relay_url,
+                e.received_at,
+                counts.metric_count
+            FROM (
+                SELECT target_event_id, COUNT(*) AS metric_count
+                FROM event_refs
+                WHERE ref_type = $1
+                  AND ($2::bigint IS NULL OR created_at >= $2)
+                GROUP BY target_event_id
+                ORDER BY metric_count DESC
+                LIMIT $3 OFFSET $4
+            ) counts
+            JOIN events e ON e.id = counts.target_event_id
+            WHERE e.kind = 1
+            ORDER BY counts.metric_count DESC, e.created_at DESC
+            "#,
+        )
+        .bind(ref_type)
+        .bind(since)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let events = rows
+            .into_iter()
+            .map(|row| -> Result<RankedEvent, sqlx::Error> {
+                let event = StoredEvent {
+                    id: row.try_get("id")?,
+                    pubkey: row.try_get("pubkey")?,
+                    created_at: row.try_get("created_at")?,
+                    kind: row.try_get("kind")?,
+                    content: row.try_get("content")?,
+                    sig: row.try_get("sig")?,
+                    tags: row.try_get("tags")?,
+                    raw: row.try_get("raw")?,
+                    relay_url: row.try_get("relay_url").ok(),
+                    received_at: row.try_get("received_at")?,
+                };
+
+                let count = row.try_get("metric_count")?;
+                Ok(RankedEvent { event, count })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(events)
     }
 }

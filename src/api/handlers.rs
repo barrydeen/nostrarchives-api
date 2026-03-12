@@ -1,11 +1,13 @@
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
+use chrono::{Duration, Utc};
 use serde::Serialize;
 use serde_json::{json, Value};
 
 use super::AppState;
-use crate::db::models::EventQuery;
+use crate::db::models::{EventQuery, StoredEvent};
+use crate::db::repository::EventRepository;
 use crate::error::AppError;
 
 /// Health check endpoint.
@@ -120,6 +122,60 @@ pub async fn get_social_graph(
     }))
 }
 
+pub async fn get_top_likes(
+    State(state): State<AppState>,
+    Query(q): Query<ListingQuery>,
+) -> Result<Json<RankedNotesResponse>, AppError> {
+    ranked_notes(
+        state.repo, "reaction", None, "likes", "all_time", q.limit, q.offset,
+    )
+    .await
+}
+
+pub async fn get_top_likes_today(
+    State(state): State<AppState>,
+    Query(q): Query<ListingQuery>,
+) -> Result<Json<RankedNotesResponse>, AppError> {
+    let since = Utc::now().timestamp() - Duration::hours(24).num_seconds();
+    ranked_notes(
+        state.repo,
+        "reaction",
+        Some(since),
+        "likes",
+        "today",
+        q.limit,
+        q.offset,
+    )
+    .await
+}
+
+pub async fn get_top_zaps(
+    State(state): State<AppState>,
+    Query(q): Query<ListingQuery>,
+) -> Result<Json<RankedNotesResponse>, AppError> {
+    ranked_notes(
+        state.repo, "zap", None, "zaps", "all_time", q.limit, q.offset,
+    )
+    .await
+}
+
+pub async fn get_top_zaps_today(
+    State(state): State<AppState>,
+    Query(q): Query<ListingQuery>,
+) -> Result<Json<RankedNotesResponse>, AppError> {
+    let since = Utc::now().timestamp() - Duration::hours(24).num_seconds();
+    ranked_notes(
+        state.repo,
+        "zap",
+        Some(since),
+        "zaps",
+        "today",
+        q.limit,
+        q.offset,
+    )
+    .await
+}
+
 #[derive(Debug, serde::Deserialize)]
 pub struct ThreadQuery {
     pub limit: Option<i64>,
@@ -131,6 +187,12 @@ pub struct SocialQuery {
     pub followers_limit: Option<i64>,
     pub follows_offset: Option<i64>,
     pub followers_offset: Option<i64>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct ListingQuery {
+    pub limit: Option<i64>,
+    pub offset: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -146,6 +208,57 @@ pub struct SocialGraphResponse {
     pub followers: SocialListResponse,
 }
 
+#[derive(Debug, Serialize)]
+pub struct RankedNoteResponse {
+    pub count: i64,
+    pub event: StoredEvent,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RankedNotesResponse {
+    pub metric: String,
+    pub range: String,
+    pub notes: Vec<RankedNoteResponse>,
+}
+
 fn clamp_limit(value: Option<i64>) -> i64 {
     value.unwrap_or(100).clamp(1, 500)
+}
+
+fn clamp_listing_limit(value: Option<i64>) -> i64 {
+    value.unwrap_or(100).clamp(1, 100)
+}
+
+fn clamp_offset(value: Option<i64>) -> i64 {
+    value.unwrap_or(0).max(0)
+}
+
+async fn ranked_notes(
+    repo: EventRepository,
+    ref_type: &str,
+    since: Option<i64>,
+    metric: &str,
+    range: &str,
+    limit: Option<i64>,
+    offset: Option<i64>,
+) -> Result<Json<RankedNotesResponse>, AppError> {
+    let limit = clamp_listing_limit(limit);
+    let offset = clamp_offset(offset);
+    let ranked = repo
+        .top_notes_by_ref(ref_type, since, limit, offset)
+        .await?;
+
+    let notes = ranked
+        .into_iter()
+        .map(|entry| RankedNoteResponse {
+            count: entry.count,
+            event: entry.event,
+        })
+        .collect();
+
+    Ok(Json(RankedNotesResponse {
+        metric: metric.into(),
+        range: range.into(),
+        notes,
+    }))
 }

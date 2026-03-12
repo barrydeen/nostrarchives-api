@@ -36,6 +36,10 @@ cargo run
 | GET | `/v1/events` | Query events with filters |
 | GET | `/v1/events/{id}` | Get event by ID |
 | GET | `/v1/social/{pubkey}` | Follow/follower counts + lists for a pubkey |
+| GET | `/v1/notes/likes/top` | Top liked notes (all time) |
+| GET | `/v1/notes/likes/top/today` | Top liked notes (rolling 24h) |
+| GET | `/v1/notes/zaps/top` | Top zapped notes (all time) |
+| GET | `/v1/notes/zaps/top/today` | Top zapped notes (rolling 24h) |
 
 ### Query Parameters (`/v1/events`)
 
@@ -57,6 +61,13 @@ cargo run
 | `followers_limit` | int | Max follower entries returned (default 100, max 500) |
 | `follows_offset` | int | Offset into the follow list (default 0) |
 | `followers_offset` | int | Offset into the follower list (default 0) |
+
+### Query Parameters (`/v1/notes/.../top`)
+
+| Param | Type | Description |
+|-------|------|-------------|
+| `limit` | int | Max notes returned (default 100, max 100) |
+| `offset` | int | Pagination offset (default 0) |
 
 ## Database Schema
 
