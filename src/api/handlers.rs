@@ -1,6 +1,7 @@
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
+use serde::Serialize;
 use serde_json::{json, Value};
 
 use super::AppState;
@@ -74,7 +75,10 @@ pub async fn get_event_refs(
         return Err(AppError::Internal(format!("invalid ref_type: {ref_type}")));
     }
     let limit = q.limit.unwrap_or(50).min(500);
-    let events = state.repo.get_referencing_events(&id, &ref_type, limit).await?;
+    let events = state
+        .repo
+        .get_referencing_events(&id, &ref_type, limit)
+        .await?;
     Ok(Json(json!({
         "events": events,
         "count": events.len(),
@@ -82,7 +86,66 @@ pub async fn get_event_refs(
     })))
 }
 
+/// Return follows/followers summary for a pubkey.
+pub async fn get_social_graph(
+    State(state): State<AppState>,
+    Path(pubkey): Path<String>,
+    Query(q): Query<SocialQuery>,
+) -> Result<Json<SocialGraphResponse>, AppError> {
+    let follows_limit = clamp_limit(q.follows_limit);
+    let followers_limit = clamp_limit(q.followers_limit);
+    let follows_offset = q.follows_offset.unwrap_or(0).max(0);
+    let followers_offset = q.followers_offset.unwrap_or(0).max(0);
+
+    let (follows_count, followers_count) = state.repo.follow_counts(&pubkey).await?;
+    let follows = state
+        .repo
+        .list_follows(&pubkey, follows_limit, follows_offset)
+        .await?;
+    let followers = state
+        .repo
+        .list_followers(&pubkey, followers_limit, followers_offset)
+        .await?;
+
+    Ok(Json(SocialGraphResponse {
+        pubkey,
+        follows: SocialListResponse {
+            count: follows_count,
+            pubkeys: follows,
+        },
+        followers: SocialListResponse {
+            count: followers_count,
+            pubkeys: followers,
+        },
+    }))
+}
+
 #[derive(Debug, serde::Deserialize)]
 pub struct ThreadQuery {
     pub limit: Option<i64>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct SocialQuery {
+    pub follows_limit: Option<i64>,
+    pub followers_limit: Option<i64>,
+    pub follows_offset: Option<i64>,
+    pub followers_offset: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SocialListResponse {
+    pub count: i64,
+    pub pubkeys: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SocialGraphResponse {
+    pub pubkey: String,
+    pub follows: SocialListResponse,
+    pub followers: SocialListResponse,
+}
+
+fn clamp_limit(value: Option<i64>) -> i64 {
+    value.unwrap_or(100).clamp(1, 500)
 }

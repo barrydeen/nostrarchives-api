@@ -21,9 +21,19 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/stats", get(handlers::get_stats))
         .route("/api/v1/events", get(handlers::get_events))
         .route("/api/v1/events/{id}", get(handlers::get_event_by_id))
-        .route("/api/v1/events/{id}/thread", get(handlers::get_event_thread))
-        .route("/api/v1/events/{id}/interactions", get(handlers::get_event_interactions))
-        .route("/api/v1/events/{id}/refs/{ref_type}", get(handlers::get_event_refs))
+        .route(
+            "/api/v1/events/{id}/thread",
+            get(handlers::get_event_thread),
+        )
+        .route(
+            "/api/v1/events/{id}/interactions",
+            get(handlers::get_event_interactions),
+        )
+        .route(
+            "/api/v1/events/{id}/refs/{ref_type}",
+            get(handlers::get_event_refs),
+        )
+        .route("/api/v1/social/{pubkey}", get(handlers::get_social_graph))
         .layer(CorsLayer::permissive())
         .with_state(state)
 }
