@@ -5,6 +5,7 @@ mod crawler;
 mod db;
 mod error;
 mod nip19;
+mod ratelimit;
 mod relay;
 mod social;
 mod ws;
@@ -182,7 +183,7 @@ async fn main() {
     let ws_shutdown_rx = shutdown_tx.subscribe();
     tokio::spawn(ws::serve(state.clone(), ws_addr, ws_shutdown_rx));
 
-    let app = api::router(state);
+    let app = api::router(state).into_make_service_with_connect_info::<SocketAddr>();
     let addr: SocketAddr = cfg.listen_addr.parse().expect("invalid listen address");
 
     tracing::info!(addr = %addr, "api server listening");
