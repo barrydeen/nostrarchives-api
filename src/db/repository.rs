@@ -651,7 +651,14 @@ impl EventRepository {
         };
 
         // Run all independent queries in parallel
-        let (refs_result, interactions_result, replies_result, reactions_result, reposts_result, zaps_result) = tokio::join!(
+        let (
+            refs_result,
+            interactions_result,
+            replies_result,
+            reactions_result,
+            reposts_result,
+            zaps_result,
+        ) = tokio::join!(
             // Find root and parent from this event's outgoing refs
             sqlx::query_as::<_, EventRef>(
                 "SELECT source_event_id, target_event_id, ref_type, relay_hint, created_at
@@ -881,6 +888,142 @@ impl EventRepository {
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(events)
+    }
+
+    /// Two-phase optimized trending query:
+    /// Phase 1: Find top target_event_ids by primary metric using (ref_type, created_at) index.
+    /// Phase 2: Fetch full engagement stats only for those top events.
+    /// Returns ranked events with full engagement + author profiles.
+    pub async fn top_notes_unified(
+        &self,
+        ref_type: &str,
+        since: Option<i64>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<RankedEvent>, Vec<ProfileRow>), AppError> {
+        let rows = sqlx::query(
+            r#"
+            WITH credible_actors AS (
+                SELECT followed_pubkey AS pubkey
+                FROM follows
+                GROUP BY followed_pubkey
+                HAVING COUNT(*) >= 10
+            ),
+            -- Phase 1: rank by primary metric only (uses idx_event_refs_reftype_created)
+            primary_metric AS (
+                SELECT
+                    r.target_event_id,
+                    COUNT(*) AS metric_count,
+                    CASE WHEN $1 = 'zap' THEN
+                        COALESCE(SUM(
+                            CASE WHEN et.tag_value ~ '^[0-9]+$' THEN et.tag_value::bigint ELSE 0 END
+                        ), 0)::bigint
+                    ELSE 0::bigint END AS zap_total_msats
+                FROM event_refs r
+                JOIN events src ON src.id = r.source_event_id
+                JOIN credible_actors ca ON ca.pubkey = src.pubkey
+                LEFT JOIN event_tags et
+                    ON $1 = 'zap'
+                    AND et.event_id = r.source_event_id
+                    AND et.tag_name = 'amount'
+                WHERE r.ref_type = $1
+                  AND ($2::bigint IS NULL OR r.created_at >= $2)
+                GROUP BY r.target_event_id
+                ORDER BY
+                    CASE WHEN $1 = 'zap' THEN
+                        COALESCE(SUM(
+                            CASE WHEN et.tag_value ~ '^[0-9]+$' THEN et.tag_value::bigint ELSE 0 END
+                        ), 0)::bigint
+                    ELSE COUNT(*)
+                    END DESC
+                LIMIT $3 OFFSET $4
+            ),
+            -- Phase 2: full engagement only for top N events
+            full_engagement AS (
+                SELECT
+                    r.target_event_id,
+                    COUNT(*) FILTER (WHERE r.ref_type = 'reaction') AS reactions,
+                    COUNT(*) FILTER (WHERE r.ref_type = 'reply')    AS replies,
+                    COUNT(*) FILTER (WHERE r.ref_type = 'repost')   AS reposts,
+                    COALESCE(SUM(
+                        CASE WHEN r.ref_type = 'zap' THEN COALESCE(za.amount_msats, 0) ELSE 0 END
+                    ), 0)::bigint AS zap_total_msats
+                FROM event_refs r
+                LEFT JOIN (
+                    SELECT event_id,
+                           MAX(CASE WHEN tag_value ~ '^[0-9]+$' THEN tag_value::bigint ELSE 0 END) AS amount_msats
+                    FROM event_tags WHERE tag_name = 'amount' GROUP BY event_id
+                ) za ON za.event_id = r.source_event_id
+                WHERE r.target_event_id IN (SELECT target_event_id FROM primary_metric)
+                GROUP BY r.target_event_id
+            )
+            SELECT
+                e.id, e.pubkey, e.created_at, e.kind, e.content, e.sig,
+                e.tags, e.raw, e.relay_url, e.received_at,
+                pm.metric_count,
+                pm.zap_total_msats AS primary_zap_msats,
+                fe.reactions, fe.replies, fe.reposts, fe.zap_total_msats
+            FROM primary_metric pm
+            JOIN events e ON e.id = pm.target_event_id AND e.kind = 1
+            LEFT JOIN full_engagement fe ON fe.target_event_id = pm.target_event_id
+            ORDER BY
+                CASE WHEN $1 = 'zap' THEN pm.zap_total_msats ELSE pm.metric_count END DESC,
+                e.created_at DESC
+            "#,
+        )
+        .bind(ref_type)
+        .bind(since)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let is_zap = ref_type == "zap";
+
+        let mut pubkeys = Vec::new();
+        let events: Vec<RankedEvent> = rows
+            .into_iter()
+            .map(|row| -> Result<RankedEvent, sqlx::Error> {
+                let pubkey: String = row.try_get("pubkey")?;
+                pubkeys.push(pubkey.clone());
+                let event = StoredEvent {
+                    id: row.try_get("id")?,
+                    pubkey,
+                    created_at: row.try_get("created_at")?,
+                    kind: row.try_get("kind")?,
+                    content: row.try_get("content")?,
+                    sig: row.try_get("sig")?,
+                    tags: row.try_get("tags")?,
+                    raw: row.try_get("raw")?,
+                    relay_url: row.try_get("relay_url").ok(),
+                    received_at: row.try_get("received_at")?,
+                };
+                let count: i64 = row.try_get("metric_count")?;
+                let zap_msats: i64 = row.try_get("zap_total_msats")?;
+                let total_sats = if is_zap { Some(zap_msats / 1000) } else { None };
+                Ok(RankedEvent {
+                    event,
+                    count,
+                    total_sats,
+                    reactions: row.try_get::<i64, _>("reactions").unwrap_or(0),
+                    replies: row.try_get::<i64, _>("replies").unwrap_or(0),
+                    reposts: row.try_get::<i64, _>("reposts").unwrap_or(0),
+                    zap_sats: zap_msats / 1000,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        // Batch-fetch profiles for all note authors
+        let unique_pubkeys: Vec<String> = {
+            let mut seen = HashSet::new();
+            pubkeys
+                .into_iter()
+                .filter(|pk| seen.insert(pk.clone()))
+                .collect()
+        };
+        let profiles = self.latest_profile_metadata(&unique_pubkeys).await?;
+
+        Ok((events, profiles))
     }
 
     /// Trending notes: composite score combining zaps (1 point per sat), reposts (1000),

@@ -38,6 +38,7 @@ pub fn router(state: AppState) -> Router {
             "/v1/profiles/metadata",
             post(handlers::get_profiles_metadata),
         )
+        .route("/v1/notes/top", get(handlers::get_top_notes_unified))
         .route("/v1/notes/trending", get(handlers::get_trending_notes))
         .route("/v1/users/new", get(handlers::get_new_users))
         .route("/v1/users/trending", get(handlers::get_trending_users))

@@ -34,12 +34,9 @@ pub async fn get_events(
 ) -> Result<Json<Value>, AppError> {
     let (events, total) = tokio::try_join!(
         state.repo.query_events(&q),
-        state.repo.count_events_filtered(
-            q.pubkey.as_deref(),
-            q.kind,
-            q.since,
-            q.until,
-        ),
+        state
+            .repo
+            .count_events_filtered(q.pubkey.as_deref(), q.kind, q.since, q.until,),
     )?;
 
     // Batch-fetch engagement stats for all returned events
@@ -225,6 +222,83 @@ pub async fn get_profiles_metadata(
     Ok(Json(ProfilesMetadataResponse { profiles }))
 }
 
+/// Unified trending endpoint: GET /v1/notes/top?metric=reactions|replies|reposts|zaps&range=today|7d|30d|1y|all
+pub async fn get_top_notes_unified(
+    State(state): State<AppState>,
+    Query(q): Query<TopNotesQuery>,
+) -> Result<Json<TopNotesUnifiedResponse>, AppError> {
+    let ref_type = match q.metric.as_deref().unwrap_or("reactions") {
+        "reactions" => "reaction",
+        "replies" => "reply",
+        "reposts" => "repost",
+        "zaps" => "zap",
+        other => {
+            return Err(AppError::BadRequest(format!(
+                "invalid metric: {other}. Use: reactions, replies, reposts, zaps"
+            )))
+        }
+    };
+
+    let metric = q.metric.as_deref().unwrap_or("reactions").to_string();
+    let range = q.range.as_deref().unwrap_or("today").to_string();
+
+    let since: Option<i64> = match range.as_str() {
+        "today" => Some(Utc::now().timestamp() - 86_400),
+        "7d" => Some(Utc::now().timestamp() - 7 * 86_400),
+        "30d" => Some(Utc::now().timestamp() - 30 * 86_400),
+        "1y" => Some(Utc::now().timestamp() - 365 * 86_400),
+        "all" => None,
+        other => {
+            return Err(AppError::BadRequest(format!(
+                "invalid range: {other}. Use: today, 7d, 30d, 1y, all"
+            )))
+        }
+    };
+
+    let limit = clamp_listing_limit(q.limit);
+    let offset = clamp_offset(q.offset);
+
+    let (ranked, profile_rows) = state
+        .repo
+        .top_notes_unified(ref_type, since, limit, offset)
+        .await?;
+
+    let profiles: HashMap<String, Value> = profile_rows
+        .into_iter()
+        .filter_map(|row| {
+            serde_json::from_str::<Value>(&row.content).ok().map(|v| {
+                let entry = json!({
+                    "name": v.get("name").and_then(|n| n.as_str()).filter(|s| !s.trim().is_empty()),
+                    "display_name": v.get("display_name").or_else(|| v.get("displayName")).and_then(|n| n.as_str()).filter(|s| !s.trim().is_empty()),
+                    "picture": v.get("picture").or_else(|| v.get("image")).and_then(|n| n.as_str()).filter(|s| !s.trim().is_empty()),
+                    "nip05": v.get("nip05").and_then(|n| n.as_str()).filter(|s| !s.trim().is_empty()),
+                });
+                (row.pubkey.clone(), entry)
+            })
+        })
+        .collect();
+
+    let notes = ranked
+        .into_iter()
+        .map(|entry| RankedNoteResponse {
+            count: entry.count,
+            total_sats: entry.total_sats,
+            reactions: entry.reactions,
+            replies: entry.replies,
+            reposts: entry.reposts,
+            zap_sats: entry.zap_sats,
+            event: entry.event,
+        })
+        .collect();
+
+    Ok(Json(TopNotesUnifiedResponse {
+        metric,
+        range,
+        notes,
+        profiles,
+    }))
+}
+
 /// Get trending notes with composite engagement score.
 pub async fn get_trending_notes(
     State(state): State<AppState>,
@@ -316,6 +390,24 @@ pub async fn get_top_zaps_today(
         q.offset,
     )
     .await
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TopNotesQuery {
+    /// "reactions", "replies", "reposts", "zaps" (default: "reactions")
+    pub metric: Option<String>,
+    /// "today", "7d", "30d", "1y", "all" (default: "today")
+    pub range: Option<String>,
+    pub limit: Option<i64>,
+    pub offset: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TopNotesUnifiedResponse {
+    pub metric: String,
+    pub range: String,
+    pub notes: Vec<RankedNoteResponse>,
+    pub profiles: HashMap<String, Value>,
 }
 
 #[derive(Debug, serde::Deserialize)]
