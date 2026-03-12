@@ -436,4 +436,67 @@ impl EventRepository {
             zaps,
         }))
     }
+
+    /// List pubkeys that the given pubkey follows.
+    pub async fn list_follows(
+        &self,
+        pubkey: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<String>, AppError> {
+        let rows = sqlx::query_scalar::<_, String>(
+            "SELECT followed_pubkey
+             FROM follows
+             WHERE follower_pubkey = $1
+             ORDER BY created_at DESC
+             LIMIT $2 OFFSET $3",
+        )
+        .bind(pubkey)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows)
+    }
+
+    /// List pubkeys that follow the given pubkey.
+    pub async fn list_followers(
+        &self,
+        pubkey: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<String>, AppError> {
+        let rows = sqlx::query_scalar::<_, String>(
+            "SELECT follower_pubkey
+             FROM follows
+             WHERE followed_pubkey = $1
+             ORDER BY created_at DESC
+             LIMIT $2 OFFSET $3",
+        )
+        .bind(pubkey)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows)
+    }
+
+    /// Return (follows_count, followers_count) for a pubkey.
+    pub async fn follow_counts(&self, pubkey: &str) -> Result<(i64, i64), AppError> {
+        let follows_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM follows WHERE follower_pubkey = $1")
+                .bind(pubkey)
+                .fetch_one(&self.pool)
+                .await?;
+
+        let followers_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM follows WHERE followed_pubkey = $1")
+                .bind(pubkey)
+                .fetch_one(&self.pool)
+                .await?;
+
+        Ok((follows_count, followers_count))
+    }
 }

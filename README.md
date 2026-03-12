@@ -35,6 +35,7 @@ cargo run
 | GET | `/api/v1/stats` | Global stats (cached) |
 | GET | `/api/v1/events` | Query events with filters |
 | GET | `/api/v1/events/{id}` | Get event by ID |
+| GET | `/api/v1/social/{pubkey}` | Follow/follower counts + lists for a pubkey |
 
 ### Query Parameters (`/api/v1/events`)
 
@@ -47,6 +48,15 @@ cargo run
 | `search` | string | Full-text search on content |
 | `limit` | int | Max results (default 50, max 500) |
 | `offset` | int | Pagination offset |
+
+### Query Parameters (`/api/v1/social/{pubkey}`)
+
+| Param | Type | Description |
+|-------|------|-------------|
+| `follows_limit` | int | Max follow entries returned (default 100, max 500) |
+| `followers_limit` | int | Max follower entries returned (default 100, max 500) |
+| `follows_offset` | int | Offset into the follow list (default 0) |
+| `followers_offset` | int | Offset into the follower list (default 0) |
 
 ## Database Schema
 
