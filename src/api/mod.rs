@@ -49,6 +49,8 @@ pub fn router(state: AppState) -> Router {
             "/v1/notes/zaps/top/today",
             get(handlers::get_top_zaps_today),
         )
+        .route("/v1/search", get(handlers::search))
+        .route("/v1/search/suggest", get(handlers::search_suggest))
         .layer(CorsLayer::permissive())
         .with_state(state)
 }

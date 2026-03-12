@@ -263,10 +263,7 @@ impl EventRepository {
 
         for tag in tags {
             let Some(arr) = tag.as_array() else { continue };
-            if arr.len() >= 2
-                && arr[0].as_str() == Some("amount")
-                && arr[1].as_str().is_some()
-            {
+            if arr.len() >= 2 && arr[0].as_str() == Some("amount") && arr[1].as_str().is_some() {
                 let amount = arr[1].as_str().unwrap();
                 sqlx::query(
                     "INSERT INTO event_tags (event_id, tag_name, tag_value, extra_values)
@@ -930,6 +927,274 @@ impl EventRepository {
             total_sats_sent: total_sats,
             daily_posts: row.1,
         })
+    }
+
+    /// Search profiles with ranked results.
+    ///
+    /// Ranking algorithm:
+    /// - Exact name match: +100,000
+    /// - Prefix match: +10,000
+    /// - NIP-05 match: +5,000
+    /// - Trigram similarity: 0-100
+    /// - Follower influence: ln(followers + 1) * 50
+    /// - Engagement influence: ln(engagement + 1) * 20
+    /// - Recency bonus: +200 if active in last 7d, +100 if last 30d
+    pub async fn search_profiles(
+        &self,
+        query: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<super::models::ProfileSearchResult>, AppError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                pubkey, name, display_name, nip05, about, picture,
+                follower_count, engagement_score, last_active_at,
+                (
+                    CASE WHEN LOWER(name) = LOWER($1) THEN 100000 ELSE 0 END +
+                    CASE WHEN LOWER(display_name) = LOWER($1) THEN 100000 ELSE 0 END +
+                    CASE WHEN LOWER(nip05) = LOWER($1) THEN 80000 ELSE 0 END +
+                    CASE WHEN name ILIKE $1 || '%' THEN 10000 ELSE 0 END +
+                    CASE WHEN display_name ILIKE $1 || '%' THEN 10000 ELSE 0 END +
+                    CASE WHEN nip05 ILIKE $1 || '%' THEN 5000 ELSE 0 END +
+                    GREATEST(
+                        COALESCE(similarity(name, $1), 0),
+                        COALESCE(similarity(display_name, $1), 0)
+                    ) * 100 +
+                    LN(GREATEST(follower_count, 0) + 1) * 50 +
+                    LN(GREATEST(engagement_score, 0) + 1) * 20 +
+                    CASE
+                        WHEN last_active_at > EXTRACT(EPOCH FROM NOW())::bigint - 604800 THEN 200
+                        WHEN last_active_at > EXTRACT(EPOCH FROM NOW())::bigint - 2592000 THEN 100
+                        ELSE 0
+                    END
+                )::float8 AS rank_score
+            FROM profile_search
+            WHERE
+                name ILIKE '%' || $1 || '%'
+                OR display_name ILIKE '%' || $1 || '%'
+                OR nip05 ILIKE '%' || $1 || '%'
+            ORDER BY rank_score DESC, follower_count DESC
+            LIMIT $2 OFFSET $3
+            "#,
+        )
+        .bind(query)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let results = rows
+            .into_iter()
+            .map(
+                |row| -> Result<super::models::ProfileSearchResult, sqlx::Error> {
+                    Ok(super::models::ProfileSearchResult {
+                        pubkey: row.try_get("pubkey")?,
+                        name: row.try_get("name")?,
+                        display_name: row.try_get("display_name")?,
+                        nip05: row.try_get("nip05")?,
+                        about: row.try_get("about")?,
+                        picture: row.try_get("picture")?,
+                        follower_count: row.try_get("follower_count")?,
+                        engagement_score: row.try_get("engagement_score")?,
+                        last_active_at: row.try_get("last_active_at")?,
+                        rank_score: row.try_get("rank_score")?,
+                    })
+                },
+            )
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(results)
+    }
+
+    /// Lightweight profile suggestion for autocomplete.
+    /// Prioritizes prefix matches, weighted by follower count + engagement.
+    pub async fn suggest_profiles(
+        &self,
+        query: &str,
+        limit: i64,
+    ) -> Result<Vec<super::models::ProfileSearchResult>, AppError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                pubkey, name, display_name, nip05, NULL::text AS about, picture,
+                follower_count, engagement_score, last_active_at,
+                (
+                    CASE
+                        WHEN LOWER(name) = LOWER($1) OR LOWER(display_name) = LOWER($1) THEN 100000
+                        WHEN name ILIKE $1 || '%' OR display_name ILIKE $1 || '%' THEN 10000
+                        WHEN nip05 ILIKE $1 || '%' THEN 5000
+                        ELSE 100
+                    END
+                    + LN(GREATEST(follower_count, 0) + 1) * 50
+                    + LN(GREATEST(engagement_score, 0) + 1) * 20
+                )::float8 AS rank_score
+            FROM profile_search
+            WHERE
+                name ILIKE '%' || $1 || '%'
+                OR display_name ILIKE '%' || $1 || '%'
+                OR nip05 ILIKE '%' || $1 || '%'
+                OR pubkey LIKE $1 || '%'
+            ORDER BY rank_score DESC, follower_count DESC
+            LIMIT $2
+            "#,
+        )
+        .bind(query)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let results = rows
+            .into_iter()
+            .map(
+                |row| -> Result<super::models::ProfileSearchResult, sqlx::Error> {
+                    Ok(super::models::ProfileSearchResult {
+                        pubkey: row.try_get("pubkey")?,
+                        name: row.try_get("name")?,
+                        display_name: row.try_get("display_name")?,
+                        nip05: row.try_get("nip05")?,
+                        about: row.try_get("about")?,
+                        picture: row.try_get("picture")?,
+                        follower_count: row.try_get("follower_count")?,
+                        engagement_score: row.try_get("engagement_score")?,
+                        last_active_at: row.try_get("last_active_at")?,
+                        rank_score: row.try_get("rank_score")?,
+                    })
+                },
+            )
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(results)
+    }
+
+    /// Search notes with full-text search, ranked by relevance and engagement.
+    ///
+    /// Ranking algorithm:
+    /// - FTS relevance (ts_rank): ×1000
+    /// - Engagement score: ln(weighted_engagement + 1) × 10
+    /// - Recency bonus: +50 for <24h, +25 for <7d
+    pub async fn search_notes(
+        &self,
+        query: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<super::models::NoteSearchResult>, AppError> {
+        let rows = sqlx::query(
+            r#"
+            WITH ranked AS (
+                SELECT
+                    e.id, e.pubkey, e.created_at, e.kind, e.content, e.sig,
+                    e.tags, e.raw, e.relay_url, e.received_at,
+                    ts_rank(e.content_tsv, query) AS text_rank
+                FROM events e, plainto_tsquery('english', $1) query
+                WHERE e.kind = 1 AND e.content_tsv @@ query
+                ORDER BY ts_rank(e.content_tsv, query) DESC
+                LIMIT 200
+            )
+            SELECT
+                r.id, r.pubkey, r.created_at, r.kind, r.content, r.sig,
+                r.tags, r.raw, r.relay_url, r.received_at,
+                COALESCE(eng.reaction_count, 0)::bigint AS reactions,
+                COALESCE(eng.reply_count, 0)::bigint AS replies,
+                COALESCE(eng.repost_count, 0)::bigint AS reposts,
+                COALESCE(eng.zap_count, 0)::bigint AS zaps,
+                (
+                    r.text_rank * 1000 +
+                    LN(
+                        COALESCE(eng.reaction_count, 0) * 100 +
+                        COALESCE(eng.reply_count, 0) * 500 +
+                        COALESCE(eng.repost_count, 0) * 1000 +
+                        COALESCE(eng.zap_count, 0) * 2000 + 1
+                    ) * 10 +
+                    CASE
+                        WHEN r.created_at > EXTRACT(EPOCH FROM NOW())::bigint - 86400 THEN 50
+                        WHEN r.created_at > EXTRACT(EPOCH FROM NOW())::bigint - 604800 THEN 25
+                        ELSE 0
+                    END
+                )::float8 AS rank_score
+            FROM ranked r
+            LEFT JOIN LATERAL (
+                SELECT
+                    COUNT(*) FILTER (WHERE ref_type = 'reaction') AS reaction_count,
+                    COUNT(*) FILTER (WHERE ref_type = 'reply') AS reply_count,
+                    COUNT(*) FILTER (WHERE ref_type = 'repost') AS repost_count,
+                    COUNT(*) FILTER (WHERE ref_type = 'zap') AS zap_count
+                FROM event_refs
+                WHERE target_event_id = r.id
+            ) eng ON TRUE
+            ORDER BY rank_score DESC
+            LIMIT $2 OFFSET $3
+            "#,
+        )
+        .bind(query)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let results = rows
+            .into_iter()
+            .map(
+                |row| -> Result<super::models::NoteSearchResult, sqlx::Error> {
+                    let event = StoredEvent {
+                        id: row.try_get("id")?,
+                        pubkey: row.try_get("pubkey")?,
+                        created_at: row.try_get("created_at")?,
+                        kind: row.try_get("kind")?,
+                        content: row.try_get("content")?,
+                        sig: row.try_get("sig")?,
+                        tags: row.try_get("tags")?,
+                        raw: row.try_get("raw")?,
+                        relay_url: row.try_get("relay_url").ok(),
+                        received_at: row.try_get("received_at")?,
+                    };
+                    Ok(super::models::NoteSearchResult {
+                        event,
+                        rank_score: row.try_get("rank_score")?,
+                        reactions: row.try_get("reactions")?,
+                        replies: row.try_get("replies")?,
+                        reposts: row.try_get("reposts")?,
+                        zaps: row.try_get("zaps")?,
+                    })
+                },
+            )
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(results)
+    }
+
+    /// Resolve a 64-char hex string: check if it's a known event id or pubkey.
+    /// Returns ("event", id) or ("profile", pubkey) or None.
+    pub async fn resolve_hex(&self, hex: &str) -> Result<Option<(&'static str, String)>, AppError> {
+        // Check event first (more specific)
+        let event_exists: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM events WHERE id = $1)")
+                .bind(hex)
+                .fetch_one(&self.pool)
+                .await?;
+        if event_exists {
+            return Ok(Some(("event", hex.to_string())));
+        }
+
+        // Check pubkey
+        let pubkey_exists: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM events WHERE pubkey = $1 LIMIT 1)")
+                .bind(hex)
+                .fetch_one(&self.pool)
+                .await?;
+        if pubkey_exists {
+            return Ok(Some(("profile", hex.to_string())));
+        }
+
+        Ok(None)
+    }
+
+    /// Refresh the profile_search materialized view (CONCURRENTLY to avoid blocking reads).
+    pub async fn refresh_profile_search(&self) -> Result<(), AppError> {
+        sqlx::query("REFRESH MATERIALIZED VIEW CONCURRENTLY profile_search")
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 }
 

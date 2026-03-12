@@ -6,6 +6,7 @@ use crate::error::AppError;
 
 const PREFIX: &str = "nostr";
 const STATS_TTL: u64 = 60; // seconds
+const SEARCH_SUGGEST_TTL: u64 = 60; // seconds
 
 fn key(suffix: &str) -> String {
     format!("{PREFIX}:{suffix}")
@@ -89,6 +90,24 @@ impl StatsCache {
             events_by_kind,
             ingestion_rate_per_min,
         })
+    }
+
+    /// Get cached search suggestions for a query.
+    pub async fn get_search_suggest(&self, query: &str) -> Option<String> {
+        let Ok(mut conn) = self.redis.get_multiplexed_async_connection().await else {
+            return None;
+        };
+        let cache_key = key(&format!("search:suggest:{}", query.to_lowercase()));
+        conn.get(&cache_key).await.ok()
+    }
+
+    /// Cache search suggestions for a query.
+    pub async fn set_search_suggest(&self, query: &str, json: &str) {
+        let Ok(mut conn) = self.redis.get_multiplexed_async_connection().await else {
+            return;
+        };
+        let cache_key = key(&format!("search:suggest:{}", query.to_lowercase()));
+        let _: Result<(), _> = conn.set_ex(&cache_key, json, SEARCH_SUGGEST_TTL).await;
     }
 
     /// Refresh stats from the database and populate cache.

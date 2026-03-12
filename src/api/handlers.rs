@@ -11,9 +11,10 @@ use serde_json::{json, Value};
 use tracing::warn;
 
 use super::AppState;
-use crate::db::models::{EventQuery, StoredEvent};
+use crate::db::models::{EventQuery, NoteSearchResult, ProfileSearchResult, StoredEvent};
 use crate::db::repository::EventRepository;
 use crate::error::AppError;
+use crate::nip19;
 
 /// Health check endpoint.
 pub async fn health() -> (StatusCode, Json<Value>) {
@@ -215,9 +216,7 @@ pub async fn get_trending_users(
 }
 
 /// Get daily network stats (DAU, total sats, daily posts).
-pub async fn get_daily_stats(
-    State(state): State<AppState>,
-) -> Result<Json<Value>, AppError> {
+pub async fn get_daily_stats(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
     let stats = state.repo.daily_stats().await?;
     Ok(Json(serde_json::to_value(stats).unwrap()))
 }
@@ -412,6 +411,177 @@ fn get_string(value: &Value, keys: &[&str]) -> Option<String> {
         }
     }
     None
+}
+
+// ---------------------------------------------------------------------------
+// Search
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct SearchQuery {
+    pub q: String,
+    /// "profiles", "notes", or "all" (default "all")
+    #[serde(rename = "type", default = "default_search_type")]
+    pub search_type: String,
+    pub limit: Option<i64>,
+    pub offset: Option<i64>,
+}
+
+fn default_search_type() -> String {
+    "all".into()
+}
+
+#[derive(Debug, Serialize)]
+pub struct SearchResponse {
+    pub query: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolved: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profiles: Option<Vec<ProfileSearchResult>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notes: Option<Vec<NoteSearchResult>>,
+}
+
+/// Full search endpoint: `GET /v1/search?q=<query>&type=profiles|notes|all`
+///
+/// 1. Attempts to decode the query as a Nostr entity (npub, nprofile, nevent, note1, hex).
+///    If successful, returns a `resolved` object for direct navigation.
+/// 2. Otherwise performs ranked search across profiles and/or notes.
+pub async fn search(
+    State(state): State<AppState>,
+    Query(q): Query<SearchQuery>,
+) -> Result<Json<SearchResponse>, AppError> {
+    let query = q.q.trim().to_string();
+    if query.is_empty() {
+        return Err(AppError::BadRequest(
+            "query parameter 'q' is required".into(),
+        ));
+    }
+
+    let limit = q.limit.unwrap_or(20).clamp(1, 100);
+    let offset = q.offset.unwrap_or(0).max(0);
+
+    // Try entity resolution first
+    if let Some(resolved) = resolve_entity(&query, &state).await? {
+        return Ok(Json(SearchResponse {
+            query,
+            resolved: Some(resolved),
+            profiles: None,
+            notes: None,
+        }));
+    }
+
+    let include_profiles = q.search_type == "all" || q.search_type == "profiles";
+    let include_notes = q.search_type == "all" || q.search_type == "notes";
+
+    let profiles = if include_profiles {
+        Some(state.repo.search_profiles(&query, limit, offset).await?)
+    } else {
+        None
+    };
+
+    let notes = if include_notes {
+        Some(state.repo.search_notes(&query, limit, offset).await?)
+    } else {
+        None
+    };
+
+    Ok(Json(SearchResponse {
+        query,
+        resolved: None,
+        profiles,
+        notes,
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SuggestQuery {
+    pub q: String,
+    pub limit: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SuggestResponse {
+    pub query: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolved: Option<Value>,
+    pub suggestions: Vec<ProfileSearchResult>,
+}
+
+/// Autocomplete endpoint: `GET /v1/search/suggest?q=<query>&limit=5`
+///
+/// Lightweight, Redis-cached endpoint for search-as-you-type.
+/// Returns profile suggestions ranked by prefix match quality and follower count.
+/// Also detects and resolves Nostr entities (npub, nprofile, nevent, note1).
+pub async fn search_suggest(
+    State(state): State<AppState>,
+    Query(q): Query<SuggestQuery>,
+) -> Result<Json<SuggestResponse>, AppError> {
+    let query = q.q.trim().to_string();
+    if query.len() < 2 {
+        return Err(AppError::BadRequest(
+            "query must be at least 2 characters".into(),
+        ));
+    }
+
+    let limit = q.limit.unwrap_or(5).clamp(1, 10);
+
+    // For entity-like inputs, try resolution instead of text search
+    if nip19::looks_like_entity(&query) {
+        if let Some(resolved) = resolve_entity(&query, &state).await? {
+            return Ok(Json(SuggestResponse {
+                query,
+                resolved: Some(resolved),
+                suggestions: vec![],
+            }));
+        }
+    }
+
+    // Check Redis cache
+    if let Some(cached) = state.cache.get_search_suggest(&query).await {
+        if let Ok(suggestions) = serde_json::from_str::<Vec<ProfileSearchResult>>(&cached) {
+            return Ok(Json(SuggestResponse {
+                query,
+                resolved: None,
+                suggestions,
+            }));
+        }
+    }
+
+    // Query DB
+    let suggestions = state.repo.suggest_profiles(&query, limit).await?;
+
+    // Cache result
+    if let Ok(json) = serde_json::to_string(&suggestions) {
+        state.cache.set_search_suggest(&query, &json).await;
+    }
+
+    Ok(Json(SuggestResponse {
+        query,
+        resolved: None,
+        suggestions,
+    }))
+}
+
+/// Try to resolve a query string as a Nostr entity.
+async fn resolve_entity(input: &str, state: &AppState) -> Result<Option<Value>, AppError> {
+    // Check for NIP-19 encoded entities
+    if let Some(entity) = nip19::decode(input) {
+        return Ok(Some(serde_json::to_value(entity).unwrap()));
+    }
+
+    // Check for raw 64-char hex
+    if nip19::is_hex64(input) {
+        if let Some((entity_type, id)) = state.repo.resolve_hex(input).await? {
+            let resolved = match entity_type {
+                "event" => json!({ "type": "event", "id": id }),
+                _ => json!({ "type": "profile", "pubkey": id }),
+            };
+            return Ok(Some(resolved));
+        }
+    }
+
+    Ok(None)
 }
 
 fn normalize_pubkey(input: &str) -> Result<String, AppError> {

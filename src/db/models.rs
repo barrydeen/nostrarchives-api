@@ -121,3 +121,29 @@ pub struct EventThread {
     pub reposts: Vec<StoredEvent>,
     pub zaps: Vec<StoredEvent>,
 }
+
+/// A profile search result with ranking metadata.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProfileSearchResult {
+    pub pubkey: String,
+    pub name: Option<String>,
+    pub display_name: Option<String>,
+    pub nip05: Option<String>,
+    pub about: Option<String>,
+    pub picture: Option<String>,
+    pub follower_count: i64,
+    pub engagement_score: i64,
+    pub last_active_at: i64,
+    pub rank_score: f64,
+}
+
+/// A note search result with engagement metadata.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NoteSearchResult {
+    pub event: StoredEvent,
+    pub rank_score: f64,
+    pub reactions: i64,
+    pub replies: i64,
+    pub reposts: i64,
+    pub zaps: i64,
+}

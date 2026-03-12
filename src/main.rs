@@ -3,6 +3,7 @@ mod cache;
 mod config;
 mod db;
 mod error;
+mod nip19;
 mod relay;
 mod social;
 
@@ -118,11 +119,27 @@ async fn main() {
     .with_metadata_sender(metadata_tx);
     ingester.run(shutdown_tx.clone()).await;
 
+    // Background: refresh profile_search materialized view every 5 minutes.
+    let refresh_repo = repo.clone();
+    tokio::spawn(async move {
+        // Initial delay: let the service stabilize before first refresh.
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
+        loop {
+            interval.tick().await;
+            match refresh_repo.refresh_profile_search().await {
+                Ok(()) => tracing::info!("refreshed profile_search materialized view"),
+                Err(e) => tracing::warn!("failed to refresh profile_search: {e}"),
+            }
+        }
+    });
+
     // HTTP API
     let state = api::AppState {
         repo,
         cache: stats_cache,
     };
+
     let app = api::router(state);
     let addr: SocketAddr = cfg.listen_addr.parse().expect("invalid listen address");
 
