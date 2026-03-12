@@ -41,9 +41,29 @@ pub async fn get_events(
             q.until,
         ),
     )?;
+
+    // Batch-fetch engagement stats for all returned events
+    let event_ids: Vec<String> = events.iter().map(|e| e.id.clone()).collect();
+    let interactions = state.repo.batch_get_interactions(&event_ids).await?;
+
+    let enriched: Vec<Value> = events
+        .iter()
+        .map(|e| {
+            let stats = interactions.get(&e.id);
+            let mut obj = serde_json::to_value(e).unwrap();
+            if let Some(map) = obj.as_object_mut() {
+                map.insert("reactions".into(), json!(stats.map_or(0, |s| s.reactions)));
+                map.insert("replies".into(), json!(stats.map_or(0, |s| s.replies)));
+                map.insert("reposts".into(), json!(stats.map_or(0, |s| s.reposts)));
+                map.insert("zap_sats".into(), json!(stats.map_or(0, |s| s.zap_sats)));
+            }
+            obj
+        })
+        .collect();
+
     Ok(Json(json!({
-        "events": events,
-        "count": events.len(),
+        "events": enriched,
+        "count": enriched.len(),
         "total": total,
     })))
 }
@@ -321,6 +341,10 @@ pub struct RankedNoteResponse {
     pub count: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub total_sats: Option<i64>,
+    pub reactions: i64,
+    pub replies: i64,
+    pub reposts: i64,
+    pub zap_sats: i64,
     pub event: StoredEvent,
 }
 
@@ -382,6 +406,10 @@ async fn ranked_notes(
         .map(|entry| RankedNoteResponse {
             count: entry.count,
             total_sats: entry.total_sats,
+            reactions: entry.reactions,
+            replies: entry.replies,
+            reposts: entry.reposts,
+            zap_sats: entry.zap_sats,
             event: entry.event,
         })
         .collect();

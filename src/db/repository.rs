@@ -18,6 +18,10 @@ pub struct RankedEvent {
     pub event: StoredEvent,
     pub count: i64,
     pub total_sats: Option<i64>,
+    pub reactions: i64,
+    pub replies: i64,
+    pub reposts: i64,
+    pub zap_sats: i64,
 }
 
 #[derive(Debug, sqlx::FromRow, Clone)]
@@ -554,6 +558,63 @@ impl EventRepository {
         })
     }
 
+    /// Batch-fetch engagement stats for multiple events by ID.
+    pub async fn batch_get_interactions(
+        &self,
+        event_ids: &[String],
+    ) -> Result<std::collections::HashMap<String, EventInteractions>, AppError> {
+        if event_ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+
+        let rows = sqlx::query(
+            r#"
+            WITH zap_amounts AS (
+                SELECT
+                    event_id,
+                    COALESCE(
+                        MAX(CASE WHEN tag_value ~ '^[0-9]+$' THEN tag_value::bigint ELSE 0 END),
+                        0
+                    ) AS amount_msats
+                FROM event_tags
+                WHERE tag_name = 'amount'
+                GROUP BY event_id
+            )
+            SELECT
+                r.target_event_id AS event_id,
+                COUNT(*) FILTER (WHERE r.ref_type = 'reply') AS replies,
+                COUNT(*) FILTER (WHERE r.ref_type = 'reaction') AS reactions,
+                COUNT(*) FILTER (WHERE r.ref_type = 'repost') AS reposts,
+                COUNT(*) FILTER (WHERE r.ref_type = 'zap') AS zaps,
+                COALESCE(SUM(CASE WHEN r.ref_type = 'zap' THEN COALESCE(za.amount_msats, 0) ELSE 0 END), 0)::bigint AS zap_total_msats
+            FROM event_refs r
+            LEFT JOIN zap_amounts za ON za.event_id = r.source_event_id
+            WHERE r.target_event_id = ANY($1)
+            GROUP BY r.target_event_id
+            "#,
+        )
+        .bind(event_ids)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut map = std::collections::HashMap::new();
+        for row in rows {
+            let eid: String = row.try_get("event_id")?;
+            let zap_msats: i64 = row.try_get("zap_total_msats")?;
+            map.insert(
+                eid,
+                EventInteractions {
+                    replies: row.try_get("replies")?,
+                    reactions: row.try_get("reactions")?,
+                    reposts: row.try_get("reposts")?,
+                    zaps: row.try_get("zaps")?,
+                    zap_sats: zap_msats / 1000,
+                },
+            );
+        }
+        Ok(map)
+    }
+
     /// Get events that reference a target event, filtered by ref_type.
     pub async fn get_referencing_events(
         &self,
@@ -719,6 +780,25 @@ impl EventRepository {
                 FROM event_tags
                 WHERE tag_name = 'amount'
                 GROUP BY event_id
+            ),
+            ranked AS (
+                SELECT
+                    r.target_event_id,
+                    COUNT(*) FILTER (WHERE r.ref_type = $1) AS metric_count,
+                    SUM(CASE WHEN r.ref_type = 'zap' THEN COALESCE(za.amount_msats, 0) ELSE 0 END)::bigint AS zap_total_msats,
+                    COUNT(*) FILTER (WHERE r.ref_type = 'reaction') AS reactions,
+                    COUNT(*) FILTER (WHERE r.ref_type = 'reply') AS replies,
+                    COUNT(*) FILTER (WHERE r.ref_type = 'repost') AS reposts
+                FROM event_refs r
+                LEFT JOIN zap_amounts za ON za.event_id = r.source_event_id
+                WHERE ($2::bigint IS NULL OR r.created_at >= $2)
+                GROUP BY r.target_event_id
+                HAVING COUNT(*) FILTER (WHERE r.ref_type = $1) > 0
+                ORDER BY
+                    CASE WHEN $1 = 'zap' THEN SUM(CASE WHEN r.ref_type = 'zap' THEN COALESCE(za.amount_msats, 0) ELSE 0 END)::bigint
+                         ELSE COUNT(*) FILTER (WHERE r.ref_type = $1)
+                    END DESC
+                LIMIT $3 OFFSET $4
             )
             SELECT
                 e.id,
@@ -731,29 +811,17 @@ impl EventRepository {
                 e.raw,
                 e.relay_url,
                 e.received_at,
-                counts.metric_count,
-                counts.zap_total_msats
-            FROM (
-                SELECT
-                    r.target_event_id,
-                    COUNT(*) AS metric_count,
-                    SUM(COALESCE(za.amount_msats, 0))::bigint AS zap_total_msats
-                FROM event_refs r
-                LEFT JOIN zap_amounts za ON za.event_id = r.source_event_id
-                WHERE r.ref_type = $1
-                  AND ($2::bigint IS NULL OR r.created_at >= $2)
-                GROUP BY r.target_event_id
-                ORDER BY
-                    CASE WHEN $1 = 'zap' THEN SUM(COALESCE(za.amount_msats, 0))::bigint
-                         ELSE COUNT(*)
-                    END DESC
-                LIMIT $3 OFFSET $4
-            ) counts
-            JOIN events e ON e.id = counts.target_event_id
+                ranked.metric_count,
+                ranked.zap_total_msats,
+                ranked.reactions,
+                ranked.replies,
+                ranked.reposts
+            FROM ranked
+            JOIN events e ON e.id = ranked.target_event_id
             WHERE e.kind = 1
             ORDER BY
-                CASE WHEN $1 = 'zap' THEN counts.zap_total_msats
-                     ELSE counts.metric_count
+                CASE WHEN $1 = 'zap' THEN ranked.zap_total_msats
+                     ELSE ranked.metric_count
                 END DESC,
                 e.created_at DESC
             "#,
@@ -788,11 +856,16 @@ impl EventRepository {
                 } else {
                     None
                 };
+                let zap_sats = zap_total_msats / 1000;
 
                 Ok(RankedEvent {
                     event,
                     count,
                     total_sats,
+                    reactions: row.try_get("reactions")?,
+                    replies: row.try_get("replies")?,
+                    reposts: row.try_get("reposts")?,
+                    zap_sats,
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
