@@ -94,7 +94,8 @@ impl EventRepository {
         for (followed, relay_hint) in &followees {
             sqlx::query(
                 "INSERT INTO follows (follower_pubkey, followed_pubkey, source_event_id, relay_hint, created_at)
-                 VALUES ($1, $2, $3, $4, $5)",
+                 VALUES ($1, $2, $3, $4, $5)
+                 ON CONFLICT (follower_pubkey, followed_pubkey) DO NOTHING",
             )
             .bind(&event.pubkey)
             .bind(followed)
