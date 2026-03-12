@@ -10,6 +10,7 @@ pub struct Config {
     pub relay_indexers: Vec<String>,
     pub relay_discovery_enabled: bool,
     pub relay_target_count: usize,
+    pub social_graph_bootstrap: bool,
 }
 
 impl Config {
@@ -59,6 +60,10 @@ impl Config {
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(25);
 
+        let social_graph_bootstrap = env::var("ENABLE_SOCIAL_GRAPH_BOOTSTRAP")
+            .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(true);
+
         let listen_addr = env::var("LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:8000".into());
 
         let ingestion_since = env::var("INGESTION_SINCE")
@@ -74,6 +79,7 @@ impl Config {
             relay_indexers,
             relay_discovery_enabled,
             relay_target_count,
+            social_graph_bootstrap,
         }
     }
 }
