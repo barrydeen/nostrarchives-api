@@ -75,6 +75,40 @@ pub struct EventInteractions {
     pub zap_sats: i64,
 }
 
+/// A trending note with composite engagement score.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrendingNote {
+    pub event: StoredEvent,
+    pub score: i64,
+    pub zap_sats: i64,
+    pub reposts: i64,
+    pub replies: i64,
+    pub reactions: i64,
+}
+
+/// A new user with their first-seen timestamp.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NewUser {
+    pub pubkey: String,
+    pub first_seen: i64,
+    pub event_count: i64,
+}
+
+/// A trending user by new follower gain.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrendingUser {
+    pub pubkey: String,
+    pub new_followers: i64,
+}
+
+/// Daily network stats.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DailyStats {
+    pub daily_active_users: i64,
+    pub total_sats_sent: i64,
+    pub daily_posts: i64,
+}
+
 /// Thread context: the event, its ancestors, and all interactions.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EventThread {

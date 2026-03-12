@@ -181,6 +181,47 @@ pub async fn get_profiles_metadata(
     Ok(Json(ProfilesMetadataResponse { profiles }))
 }
 
+/// Get trending notes with composite engagement score.
+pub async fn get_trending_notes(
+    State(state): State<AppState>,
+    Query(q): Query<ListingQuery>,
+) -> Result<Json<Value>, AppError> {
+    let limit = clamp_listing_limit(q.limit);
+    let offset = clamp_offset(q.offset);
+    let notes = state.repo.trending_notes(limit, offset).await?;
+    Ok(Json(json!({ "notes": notes })))
+}
+
+/// Get new users (first seen in last 24h).
+pub async fn get_new_users(
+    State(state): State<AppState>,
+    Query(q): Query<ListingQuery>,
+) -> Result<Json<Value>, AppError> {
+    let limit = clamp_listing_limit(q.limit);
+    let offset = clamp_offset(q.offset);
+    let users = state.repo.new_users(limit, offset).await?;
+    Ok(Json(json!({ "users": users })))
+}
+
+/// Get trending users by new follower count (last 24h).
+pub async fn get_trending_users(
+    State(state): State<AppState>,
+    Query(q): Query<ListingQuery>,
+) -> Result<Json<Value>, AppError> {
+    let limit = clamp_listing_limit(q.limit);
+    let offset = clamp_offset(q.offset);
+    let users = state.repo.trending_users(limit, offset).await?;
+    Ok(Json(json!({ "users": users })))
+}
+
+/// Get daily network stats (DAU, total sats, daily posts).
+pub async fn get_daily_stats(
+    State(state): State<AppState>,
+) -> Result<Json<Value>, AppError> {
+    let stats = state.repo.daily_stats().await?;
+    Ok(Json(serde_json::to_value(stats).unwrap()))
+}
+
 pub async fn get_top_likes(
     State(state): State<AppState>,
     Query(q): Query<ListingQuery>,

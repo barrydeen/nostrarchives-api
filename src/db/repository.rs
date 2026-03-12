@@ -3,7 +3,8 @@ use std::collections::HashSet;
 use sqlx::{PgPool, Row};
 
 use super::models::{
-    EventInteractions, EventQuery, EventRef, EventThread, KindCount, NostrEvent, StoredEvent,
+    DailyStats, EventInteractions, EventQuery, EventRef, EventThread, KindCount, NewUser,
+    NostrEvent, StoredEvent, TrendingNote, TrendingUser,
 };
 use crate::error::AppError;
 
@@ -693,6 +694,192 @@ impl EventRepository {
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(events)
+    }
+
+    /// Trending notes: composite score combining zaps (1 point per sat), reposts (1000),
+    /// replies (500), and reactions (100). 24h window.
+    pub async fn trending_notes(
+        &self,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<TrendingNote>, AppError> {
+        let since = chrono::Utc::now().timestamp() - 86400;
+
+        let rows = sqlx::query(
+            r#"
+            WITH zap_amounts AS (
+                SELECT
+                    event_id,
+                    MAX(
+                        CASE WHEN tag_value ~ '^[0-9]+$' THEN tag_value::bigint ELSE 0 END
+                    ) AS amount_msats
+                FROM event_tags
+                WHERE tag_name = 'amount'
+                GROUP BY event_id
+            ),
+            note_engagement AS (
+                SELECT
+                    r.target_event_id,
+                    COUNT(*) FILTER (WHERE r.ref_type = 'zap')      AS zap_count,
+                    COALESCE(SUM(CASE WHEN r.ref_type = 'zap' THEN COALESCE(za.amount_msats, 0) / 1000 ELSE 0 END), 0) AS zap_sats,
+                    COUNT(*) FILTER (WHERE r.ref_type = 'repost')   AS repost_count,
+                    COUNT(*) FILTER (WHERE r.ref_type = 'reply')    AS reply_count,
+                    COUNT(*) FILTER (WHERE r.ref_type = 'reaction') AS reaction_count
+                FROM event_refs r
+                LEFT JOIN zap_amounts za ON za.event_id = r.source_event_id
+                WHERE r.created_at >= $1
+                GROUP BY r.target_event_id
+            )
+            SELECT
+                e.id, e.pubkey, e.created_at, e.kind, e.content, e.sig, e.tags, e.raw,
+                e.relay_url, e.received_at,
+                ne.zap_sats,
+                ne.repost_count,
+                ne.reply_count,
+                ne.reaction_count,
+                (ne.zap_sats + ne.repost_count * 1000 + ne.reply_count * 500 + ne.reaction_count * 100) AS score
+            FROM note_engagement ne
+            JOIN events e ON e.id = ne.target_event_id AND e.kind = 1
+            ORDER BY score DESC, e.created_at DESC
+            LIMIT $2 OFFSET $3
+            "#,
+        )
+        .bind(since)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let notes = rows
+            .into_iter()
+            .map(|row| -> Result<TrendingNote, sqlx::Error> {
+                let event = StoredEvent {
+                    id: row.try_get("id")?,
+                    pubkey: row.try_get("pubkey")?,
+                    created_at: row.try_get("created_at")?,
+                    kind: row.try_get("kind")?,
+                    content: row.try_get("content")?,
+                    sig: row.try_get("sig")?,
+                    tags: row.try_get("tags")?,
+                    raw: row.try_get("raw")?,
+                    relay_url: row.try_get("relay_url").ok(),
+                    received_at: row.try_get("received_at")?,
+                };
+                Ok(TrendingNote {
+                    event,
+                    score: row.try_get("score")?,
+                    zap_sats: row.try_get("zap_sats")?,
+                    reposts: row.try_get("repost_count")?,
+                    replies: row.try_get("reply_count")?,
+                    reactions: row.try_get("reaction_count")?,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(notes)
+    }
+
+    /// New users: pubkeys whose earliest event is within the last 24h.
+    pub async fn new_users(&self, limit: i64, offset: i64) -> Result<Vec<NewUser>, AppError> {
+        let since = chrono::Utc::now().timestamp() - 86400;
+
+        let rows = sqlx::query_as::<_, (String, i64, i64)>(
+            r#"
+            SELECT pubkey, MIN(created_at) AS first_seen, COUNT(*) AS event_count
+            FROM events
+            GROUP BY pubkey
+            HAVING MIN(created_at) >= $1
+            ORDER BY first_seen DESC
+            LIMIT $2 OFFSET $3
+            "#,
+        )
+        .bind(since)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|(pubkey, first_seen, event_count)| NewUser {
+                pubkey,
+                first_seen,
+                event_count,
+            })
+            .collect())
+    }
+
+    /// Trending users: pubkeys that gained the most new followers in the last 24h.
+    /// Uses follows.created_at (from the kind-3 contact list event timestamp).
+    pub async fn trending_users(
+        &self,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<TrendingUser>, AppError> {
+        let since = chrono::Utc::now().timestamp() - 86400;
+
+        let rows = sqlx::query_as::<_, (String, i64)>(
+            r#"
+            SELECT followed_pubkey, COUNT(DISTINCT follower_pubkey) AS new_followers
+            FROM follows
+            WHERE created_at >= $1
+            GROUP BY followed_pubkey
+            ORDER BY new_followers DESC
+            LIMIT $2 OFFSET $3
+            "#,
+        )
+        .bind(since)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|(pubkey, new_followers)| TrendingUser {
+                pubkey,
+                new_followers,
+            })
+            .collect())
+    }
+
+    /// Daily stats: DAU, total sats sent, daily posts (last 24h).
+    pub async fn daily_stats(&self) -> Result<DailyStats, AppError> {
+        let since = chrono::Utc::now().timestamp() - 86400;
+
+        let row = sqlx::query_as::<_, (i64, i64)>(
+            r#"
+            SELECT
+                COUNT(DISTINCT pubkey) AS daily_active_users,
+                COUNT(*) FILTER (WHERE kind = 1) AS daily_posts
+            FROM events
+            WHERE created_at >= $1
+            "#,
+        )
+        .bind(since)
+        .fetch_one(&self.pool)
+        .await?;
+
+        // Total sats: sum of zap receipt amounts in last 24h
+        let total_sats: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COALESCE(SUM(
+                CASE WHEN et.tag_value ~ '^[0-9]+$' THEN et.tag_value::bigint ELSE 0 END
+            ) / 1000, 0)
+            FROM events e
+            JOIN event_tags et ON et.event_id = e.id AND et.tag_name = 'amount'
+            WHERE e.kind = 9735 AND e.created_at >= $1
+            "#,
+        )
+        .bind(since)
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(DailyStats {
+            daily_active_users: row.0,
+            total_sats_sent: total_sats,
+            daily_posts: row.1,
+        })
     }
 }
 
