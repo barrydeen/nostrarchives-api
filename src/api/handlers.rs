@@ -785,6 +785,96 @@ pub async fn get_crawler_stats(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Advanced Note Search
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct AdvancedNoteSearchQuery {
+    pub q: Option<String>,
+    pub exclude: Option<String>,
+    pub author: Option<String>,
+    pub reply_to: Option<String>,
+    pub order: Option<String>,
+    pub limit: Option<i64>,
+    pub offset: Option<i64>,
+}
+
+/// Advanced note search: `GET /v1/notes/search?q=bitcoin&exclude=scam&author=npub1...&reply_to=npub1...&order=engagement&limit=20&offset=0`
+pub async fn advanced_note_search(
+    State(state): State<AppState>,
+    Query(q): Query<AdvancedNoteSearchQuery>,
+) -> Result<Json<Value>, AppError> {
+    let limit = q.limit.unwrap_or(20).clamp(1, 100);
+    let offset = q.offset.unwrap_or(0).max(0);
+
+    let order = match q.order.as_deref().unwrap_or("newest") {
+        "newest" | "oldest" | "engagement" => q.order.as_deref().unwrap_or("newest"),
+        other => {
+            return Err(AppError::BadRequest(format!(
+                "invalid order: {other}. Use: newest, oldest, engagement"
+            )))
+        }
+    };
+
+    // Normalize pubkeys
+    let author = match &q.author {
+        Some(a) => Some(normalize_pubkey(a)?),
+        None => None,
+    };
+    let reply_to = match &q.reply_to {
+        Some(r) => Some(normalize_pubkey(r)?),
+        None => None,
+    };
+
+    let (entries, total, profile_rows) = state
+        .repo
+        .advanced_search_notes(
+            q.q.as_deref(),
+            q.exclude.as_deref(),
+            author.as_deref(),
+            reply_to.as_deref(),
+            order,
+            limit,
+            offset,
+        )
+        .await?;
+
+    let profiles: HashMap<String, Value> = profile_rows
+        .into_iter()
+        .filter_map(|row| {
+            serde_json::from_str::<Value>(&row.content).ok().map(|v| {
+                let entry = json!({
+                    "name": v.get("name").and_then(|n| n.as_str()).filter(|s| !s.trim().is_empty()),
+                    "display_name": v.get("display_name").or_else(|| v.get("displayName")).and_then(|n| n.as_str()).filter(|s| !s.trim().is_empty()),
+                    "picture": v.get("picture").or_else(|| v.get("image")).and_then(|n| n.as_str()).filter(|s| !s.trim().is_empty()),
+                    "nip05": v.get("nip05").and_then(|n| n.as_str()).filter(|s| !s.trim().is_empty()),
+                });
+                (row.pubkey.clone(), entry)
+            })
+        })
+        .collect();
+
+    let notes: Vec<Value> = entries
+        .into_iter()
+        .map(|e| {
+            json!({
+                "event": e.event,
+                "reactions": e.reactions,
+                "replies": e.replies,
+                "reposts": e.reposts,
+                "zap_sats": e.zap_sats,
+            })
+        })
+        .collect();
+
+    Ok(Json(json!({
+        "notes": notes,
+        "total": total,
+        "profiles": profiles,
+    })))
+}
+
 fn normalize_pubkey(input: &str) -> Result<String, AppError> {
     let trimmed = input.trim();
     if trimmed.is_empty() {

@@ -54,6 +54,7 @@ pub fn router(state: AppState) -> Router {
             "/v1/notes/zaps/top/today",
             get(handlers::get_top_zaps_today),
         )
+        .route("/v1/notes/search", get(handlers::advanced_note_search))
         .route("/v1/search", get(handlers::search))
         .route("/v1/search/suggest", get(handlers::search_suggest))
         .route("/v1/crawler/stats", get(handlers::get_crawler_stats))

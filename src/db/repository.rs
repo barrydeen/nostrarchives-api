@@ -1686,6 +1686,166 @@ impl EventRepository {
         Ok(Some(row.0))
     }
 
+    /// Advanced note search with full-text search, exclusions, author/reply_to filters,
+    /// and multiple ordering modes (newest, oldest, engagement).
+    ///
+    /// Returns (notes, total_count, profiles).
+    pub async fn advanced_search_notes(
+        &self,
+        q: Option<&str>,
+        exclude: Option<&str>,
+        author: Option<&str>,
+        reply_to: Option<&str>,
+        order: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<super::models::AdvancedNoteSearchEntry>, i64, Vec<ProfileRow>), AppError> {
+        let mut param_idx = 1u32;
+        let mut conditions = Vec::new();
+
+        // Track bind values in order
+        let mut bind_values: Vec<BindValue> = Vec::new();
+
+        // Always filter kind = 1
+        conditions.push("e.kind = 1".to_string());
+
+        // Full-text search (q) — plainto_tsquery safely handles arbitrary user input
+        if let Some(query) = q {
+            let trimmed = query.trim();
+            if !trimmed.is_empty() {
+                conditions.push(format!(
+                    "e.content_tsv @@ plainto_tsquery('english', ${param_idx})"
+                ));
+                bind_values.push(BindValue::Text(trimmed.to_string()));
+                param_idx += 1;
+            }
+        }
+
+        // Exclude words — plainto_tsquery safely handles arbitrary user input
+        if let Some(excl) = exclude {
+            let trimmed = excl.trim();
+            if !trimmed.is_empty() {
+                conditions.push(format!(
+                    "NOT e.content_tsv @@ plainto_tsquery('english', ${param_idx})"
+                ));
+                bind_values.push(BindValue::Text(trimmed.to_string()));
+                param_idx += 1;
+            }
+        }
+
+        // Author filter
+        if let Some(author_pk) = author {
+            conditions.push(format!("e.pubkey = ${param_idx}"));
+            bind_values.push(BindValue::Text(author_pk.to_string()));
+            param_idx += 1;
+        }
+
+        // Reply-to filter
+        if let Some(reply_pk) = reply_to {
+            conditions.push(format!(
+                "EXISTS (SELECT 1 FROM event_refs er JOIN events parent ON parent.id = er.target_event_id WHERE er.source_event_id = e.id AND er.ref_type = 'reply' AND parent.pubkey = ${param_idx})"
+            ));
+            bind_values.push(BindValue::Text(reply_pk.to_string()));
+            param_idx += 1;
+        }
+
+        let where_clause = conditions.join(" AND ");
+
+        // Build count query
+        let count_sql = format!("SELECT COUNT(*) FROM events e WHERE {where_clause}");
+
+        // Build data query — engagement stats always needed for response fields
+        let engagement_join = r#"LEFT JOIN LATERAL (
+                SELECT
+                    COUNT(*) FILTER (WHERE ref_type = 'reaction') AS reaction_count,
+                    COUNT(*) FILTER (WHERE ref_type = 'reply') AS reply_count,
+                    COUNT(*) FILTER (WHERE ref_type = 'repost') AS repost_count,
+                    COUNT(*) FILTER (WHERE ref_type = 'zap') AS zap_count,
+                    COALESCE(SUM(CASE WHEN ref_type = 'zap' THEN COALESCE(za.amount_msats, 0) ELSE 0 END), 0)::bigint AS zap_total_msats
+                FROM event_refs er2
+                LEFT JOIN (
+                    SELECT event_id, MAX(CASE WHEN tag_value ~ '^[0-9]+$' THEN tag_value::bigint ELSE 0 END) AS amount_msats
+                    FROM event_tags WHERE tag_name = 'amount' GROUP BY event_id
+                ) za ON za.event_id = er2.source_event_id
+                WHERE er2.target_event_id = e.id
+            ) eng ON TRUE"#;
+
+        let order_clause = match order {
+            "oldest" => "e.created_at ASC",
+            "engagement" => "(COALESCE(eng.reaction_count, 0) * 1 + COALESCE(eng.reply_count, 0) * 5 + COALESCE(eng.repost_count, 0) * 10 + COALESCE(eng.zap_count, 0) * 20) DESC, e.created_at DESC",
+            _ => "e.created_at DESC", // newest (default)
+        };
+
+        let data_sql = format!(
+            r#"SELECT
+                e.id, e.pubkey, e.created_at, e.kind, e.content, e.sig,
+                e.tags, e.raw, e.relay_url, e.received_at,
+                COALESCE(eng.reaction_count, 0)::bigint AS reactions,
+                COALESCE(eng.reply_count, 0)::bigint AS replies,
+                COALESCE(eng.repost_count, 0)::bigint AS reposts,
+                (COALESCE(eng.zap_total_msats, 0) / 1000)::bigint AS zap_sats
+            FROM events e
+            {engagement_join}
+            WHERE {where_clause}
+            ORDER BY {order_clause}
+            LIMIT ${param_idx} OFFSET ${}"#,
+            param_idx + 1
+        );
+
+        // Execute count query
+        let mut count_query = sqlx::query_scalar::<_, i64>(&count_sql);
+        for val in &bind_values {
+            match val {
+                BindValue::Text(v) => count_query = count_query.bind(v),
+            }
+        }
+        let total = count_query.fetch_one(&self.pool).await?;
+
+        // Execute data query
+        let mut data_query = sqlx::query(&data_sql);
+        for val in &bind_values {
+            match val {
+                BindValue::Text(v) => data_query = data_query.bind(v),
+            }
+        }
+        data_query = data_query.bind(limit).bind(offset);
+
+        let rows = data_query.fetch_all(&self.pool).await?;
+
+        let mut pubkeys_set = HashSet::new();
+        let entries: Vec<super::models::AdvancedNoteSearchEntry> = rows
+            .into_iter()
+            .map(|row| -> Result<super::models::AdvancedNoteSearchEntry, sqlx::Error> {
+                let pubkey: String = row.try_get("pubkey")?;
+                pubkeys_set.insert(pubkey.clone());
+                let event = StoredEvent {
+                    id: row.try_get("id")?,
+                    pubkey,
+                    created_at: row.try_get("created_at")?,
+                    kind: row.try_get("kind")?,
+                    content: row.try_get("content")?,
+                    sig: row.try_get("sig")?,
+                    tags: row.try_get("tags")?,
+                    raw: row.try_get("raw")?,
+                    relay_url: row.try_get("relay_url").ok(),
+                    received_at: row.try_get("received_at")?,
+                };
+                Ok(super::models::AdvancedNoteSearchEntry {
+                    event,
+                    reactions: row.try_get("reactions")?,
+                    replies: row.try_get("replies")?,
+                    reposts: row.try_get("reposts")?,
+                    zap_sats: row.try_get("zap_sats")?,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let unique_pubkeys: Vec<String> = pubkeys_set.into_iter().collect();
+        let profiles = self.latest_profile_metadata(&unique_pubkeys).await?;
+
+        Ok((entries, total, profiles))
+    }
+
     /// Refresh the profile_search materialized view (CONCURRENTLY to avoid blocking reads).
     pub async fn refresh_profile_search(&self) -> Result<(), AppError> {
         sqlx::query("REFRESH MATERIALIZED VIEW CONCURRENTLY profile_search")
@@ -1693,6 +1853,10 @@ impl EventRepository {
             .await?;
         Ok(())
     }
+}
+
+enum BindValue {
+    Text(String),
 }
 
 fn is_hex_pubkey(value: &str) -> bool {

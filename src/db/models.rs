@@ -155,3 +155,13 @@ pub struct NoteSearchResult {
     pub reposts: i64,
     pub zaps: i64,
 }
+
+/// Advanced note search result with engagement stats.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdvancedNoteSearchEntry {
+    pub event: StoredEvent,
+    pub reactions: i64,
+    pub replies: i64,
+    pub reposts: i64,
+    pub zap_sats: i64,
+}
