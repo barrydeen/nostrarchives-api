@@ -44,6 +44,10 @@ async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
             "004_create_follows",
             include_str!("../../migrations/004_create_follows.sql"),
         ),
+        (
+            "005_backfill_zap_amounts",
+            include_str!("../../migrations/005_backfill_zap_amounts.sql"),
+        ),
     ];
 
     for (name, sql) in migrations {

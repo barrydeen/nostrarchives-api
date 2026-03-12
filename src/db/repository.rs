@@ -62,6 +62,11 @@ impl EventRepository {
         if inserted {
             self.insert_tags(&event.id, &event.tags).await?;
             self.insert_refs(event).await?;
+            // For zap receipts (kind 9735), extract the amount from the embedded
+            // zap request in the "description" tag (NIP-57).
+            if event.kind == 9735 {
+                self.extract_zap_amount(event).await?;
+            }
         }
 
         Ok(inserted)
@@ -229,6 +234,51 @@ impl EventRepository {
             .bind(event.created_at)
             .execute(&self.pool)
             .await?;
+        }
+
+        Ok(())
+    }
+
+    /// Extract the zap amount from a kind-9735 zap receipt's embedded zap request.
+    /// The "description" tag contains a JSON-encoded kind-9734 event whose tags
+    /// include ["amount", "<msats>"]. We insert a synthetic amount tag into event_tags.
+    async fn extract_zap_amount(&self, event: &NostrEvent) -> Result<(), AppError> {
+        let description = event
+            .tags
+            .iter()
+            .find(|t| t.len() >= 2 && t[0] == "description")
+            .map(|t| &t[1]);
+
+        let Some(desc_json) = description else {
+            return Ok(());
+        };
+
+        let Ok(zap_request) = serde_json::from_str::<serde_json::Value>(desc_json) else {
+            return Ok(());
+        };
+
+        let Some(tags) = zap_request.get("tags").and_then(|t| t.as_array()) else {
+            return Ok(());
+        };
+
+        for tag in tags {
+            let Some(arr) = tag.as_array() else { continue };
+            if arr.len() >= 2
+                && arr[0].as_str() == Some("amount")
+                && arr[1].as_str().is_some()
+            {
+                let amount = arr[1].as_str().unwrap();
+                sqlx::query(
+                    "INSERT INTO event_tags (event_id, tag_name, tag_value, extra_values)
+                     VALUES ($1, 'amount', $2, '[]')
+                     ON CONFLICT DO NOTHING",
+                )
+                .bind(&event.id)
+                .bind(amount)
+                .execute(&self.pool)
+                .await?;
+                break;
+            }
         }
 
         Ok(())
@@ -418,7 +468,7 @@ impl EventRepository {
                         END
                     ),
                     0
-                ) AS zap_total_msats
+                )::bigint AS zap_total_msats
             FROM event_refs r
             LEFT JOIN LATERAL (
                 SELECT
@@ -633,14 +683,14 @@ impl EventRepository {
                 SELECT
                     r.target_event_id,
                     COUNT(*) AS metric_count,
-                    SUM(COALESCE(za.amount_msats, 0)) AS zap_total_msats
+                    SUM(COALESCE(za.amount_msats, 0))::bigint AS zap_total_msats
                 FROM event_refs r
                 LEFT JOIN zap_amounts za ON za.event_id = r.source_event_id
                 WHERE r.ref_type = $1
                   AND ($2::bigint IS NULL OR r.created_at >= $2)
                 GROUP BY r.target_event_id
                 ORDER BY
-                    CASE WHEN $1 = 'zap' THEN SUM(COALESCE(za.amount_msats, 0))
+                    CASE WHEN $1 = 'zap' THEN SUM(COALESCE(za.amount_msats, 0))::bigint
                          ELSE COUNT(*)
                     END DESC
                 LIMIT $3 OFFSET $4
