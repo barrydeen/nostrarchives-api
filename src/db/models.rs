@@ -54,3 +54,35 @@ pub struct EventQuery {
     pub limit: Option<i64>,
     pub offset: Option<i64>,
 }
+
+/// A reference between two events.
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct EventRef {
+    pub source_event_id: String,
+    pub target_event_id: String,
+    pub ref_type: String,
+    pub relay_hint: Option<String>,
+    pub created_at: i64,
+}
+
+/// Aggregated interaction counts for an event.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EventInteractions {
+    pub replies: i64,
+    pub reactions: i64,
+    pub reposts: i64,
+    pub zaps: i64,
+}
+
+/// Thread context: the event, its ancestors, and all interactions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EventThread {
+    pub event: StoredEvent,
+    pub root_id: Option<String>,
+    pub parent_id: Option<String>,
+    pub interactions: EventInteractions,
+    pub replies: Vec<StoredEvent>,
+    pub reactions: Vec<StoredEvent>,
+    pub reposts: Vec<StoredEvent>,
+    pub zaps: Vec<StoredEvent>,
+}

@@ -1,6 +1,6 @@
 use sqlx::PgPool;
 
-use super::models::{EventQuery, KindCount, NostrEvent, StoredEvent};
+use super::models::{EventInteractions, EventQuery, EventRef, EventThread, KindCount, NostrEvent, StoredEvent};
 use crate::error::AppError;
 
 #[derive(Clone)]
@@ -39,6 +39,7 @@ impl EventRepository {
 
         if inserted {
             self.insert_tags(&event.id, &event.tags).await?;
+            self.insert_refs(event).await?;
         }
 
         Ok(inserted)
@@ -67,6 +68,73 @@ impl EventRepository {
             .execute(&self.pool)
             .await?;
         }
+        Ok(())
+    }
+
+    /// Extract event references from tags and insert into event_refs.
+    ///
+    /// Reference types are determined by a combination of event kind and tag markers:
+    /// - Kind 1 (note): `e` tags become reply/root/mention based on NIP-10 markers
+    /// - Kind 7 (reaction): `e` tags become reaction refs
+    /// - Kind 6 (repost): `e` tags become repost refs
+    /// - Kind 9735 (zap receipt): `e` tags become zap refs
+    /// - Other kinds: `e` tags become mention refs
+    async fn insert_refs(&self, event: &NostrEvent) -> Result<(), AppError> {
+        let e_tags: Vec<&Vec<String>> = event.tags.iter()
+            .filter(|t| t.len() >= 2 && t[0] == "e")
+            .collect();
+
+        if e_tags.is_empty() {
+            return Ok(());
+        }
+
+        for tag in &e_tags {
+            let target_id = &tag[1];
+            let relay_hint = tag.get(2).filter(|s| !s.is_empty()).cloned();
+            let marker = tag.get(3).map(|s| s.as_str());
+
+            let ref_type = match event.kind {
+                7 => "reaction",
+                6 | 16 => "repost",
+                9735 => "zap",
+                1 | 42 => {
+                    // NIP-10 marker-based classification
+                    match marker {
+                        Some("root") => "root",
+                        Some("reply") => "reply",
+                        Some("mention") => "mention",
+                        None => {
+                            // Legacy positional: single e-tag = reply, first of many = root, last = reply
+                            if e_tags.len() == 1 {
+                                "reply"
+                            } else if std::ptr::eq(*tag, *e_tags.first().unwrap()) {
+                                "root"
+                            } else if std::ptr::eq(*tag, *e_tags.last().unwrap()) {
+                                "reply"
+                            } else {
+                                "mention"
+                            }
+                        }
+                        _ => "mention",
+                    }
+                }
+                _ => "mention",
+            };
+
+            sqlx::query(
+                "INSERT INTO event_refs (source_event_id, target_event_id, ref_type, relay_hint, created_at)
+                 VALUES ($1, $2, $3, $4, $5)
+                 ON CONFLICT DO NOTHING",
+            )
+            .bind(&event.id)
+            .bind(target_id)
+            .bind(ref_type)
+            .bind(&relay_hint)
+            .bind(event.created_at)
+            .execute(&self.pool)
+            .await?;
+        }
+
         Ok(())
     }
 
@@ -185,5 +253,90 @@ impl EventRepository {
         .fetch_all(&self.pool)
         .await?;
         Ok(rows)
+    }
+
+    /// Get interaction counts for an event.
+    pub async fn get_interactions(&self, event_id: &str) -> Result<EventInteractions, AppError> {
+        let row = sqlx::query_as::<_, (i64, i64, i64, i64)>(
+            "SELECT
+                COUNT(*) FILTER (WHERE ref_type = 'reply') AS replies,
+                COUNT(*) FILTER (WHERE ref_type = 'reaction') AS reactions,
+                COUNT(*) FILTER (WHERE ref_type = 'repost') AS reposts,
+                COUNT(*) FILTER (WHERE ref_type = 'zap') AS zaps
+             FROM event_refs
+             WHERE target_event_id = $1",
+        )
+        .bind(event_id)
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(EventInteractions {
+            replies: row.0,
+            reactions: row.1,
+            reposts: row.2,
+            zaps: row.3,
+        })
+    }
+
+    /// Get events that reference a target event, filtered by ref_type.
+    pub async fn get_referencing_events(
+        &self,
+        target_event_id: &str,
+        ref_type: &str,
+        limit: i64,
+    ) -> Result<Vec<StoredEvent>, AppError> {
+        let events = sqlx::query_as::<_, StoredEvent>(
+            "SELECT e.id, e.pubkey, e.created_at, e.kind, e.content, e.sig, e.tags, e.raw, e.relay_url, e.received_at
+             FROM events e
+             INNER JOIN event_refs r ON r.source_event_id = e.id
+             WHERE r.target_event_id = $1 AND r.ref_type = $2
+             ORDER BY e.created_at DESC
+             LIMIT $3",
+        )
+        .bind(target_event_id)
+        .bind(ref_type)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(events)
+    }
+
+    /// Get the full thread context for an event: parent chain, interactions, and related events.
+    pub async fn get_thread(&self, event_id: &str, limit: i64) -> Result<Option<EventThread>, AppError> {
+        let event = match self.get_event_by_id(event_id).await? {
+            Some(e) => e,
+            None => return Ok(None),
+        };
+
+        // Find root and parent from this event's outgoing refs
+        let refs = sqlx::query_as::<_, EventRef>(
+            "SELECT source_event_id, target_event_id, ref_type, relay_hint, created_at
+             FROM event_refs
+             WHERE source_event_id = $1 AND ref_type IN ('root', 'reply')",
+        )
+        .bind(event_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let root_id = refs.iter().find(|r| r.ref_type == "root").map(|r| r.target_event_id.clone());
+        let parent_id = refs.iter().find(|r| r.ref_type == "reply").map(|r| r.target_event_id.clone());
+
+        let interactions = self.get_interactions(event_id).await?;
+        let replies = self.get_referencing_events(event_id, "reply", limit).await?;
+        let reactions = self.get_referencing_events(event_id, "reaction", limit).await?;
+        let reposts = self.get_referencing_events(event_id, "repost", limit).await?;
+        let zaps = self.get_referencing_events(event_id, "zap", limit).await?;
+
+        Ok(Some(EventThread {
+            event,
+            root_id,
+            parent_id,
+            interactions,
+            replies,
+            reactions,
+            reposts,
+            zaps,
+        }))
     }
 }

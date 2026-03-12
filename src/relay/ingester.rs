@@ -18,6 +18,28 @@ struct IngestedEvent {
     relay_url: String,
 }
 
+/// Kinds we ingest. Everything else is dropped.
+///
+/// - 0:     Profile metadata (NIP-01)
+/// - 1:     Short text note (NIP-01)
+/// - 6:     Repost (NIP-18)
+/// - 7:     Reaction (NIP-25)
+/// - 16:    Generic repost (NIP-18)
+/// - 9735:  Zap receipt (NIP-57)
+/// - 10000: Mute list (NIP-51)
+/// - 10002: Relay list (NIP-65)
+/// - 10003: Bookmarks (NIP-51)
+/// - 10063: Media server list (Blossom)
+/// - 30000: Follow sets (NIP-51)
+/// - 30001: Generic lists (NIP-51)
+/// - 30002: Relay sets (NIP-51)
+/// - 30003: Bookmark sets (NIP-51)
+const ALLOWED_KINDS: &[i64] = &[
+    0, 1, 6, 7, 16, 9735,
+    10000, 10002, 10003, 10063,
+    30000, 30001, 30002, 30003,
+];
+
 /// Manages connections to multiple relays and ingests events into the database.
 pub struct RelayIngester {
     relay_urls: Vec<String>,
@@ -93,9 +115,12 @@ impl RelayIngester {
                     backoff = Duration::from_secs(1);
                     let (mut write, mut read) = ws_stream.split();
 
-                    // Subscribe: all events since timestamp
+                    // Subscribe: only allowed kinds since timestamp
                     let sub_id = format!("nostr-api-{}", &relay_url[6..relay_url.len().min(20)]);
-                    let req = serde_json::json!(["REQ", &sub_id, {"since": since}]);
+                    let req = serde_json::json!(["REQ", &sub_id, {
+                        "since": since,
+                        "kinds": ALLOWED_KINDS,
+                    }]);
                     if let Err(e) = write.send(Message::Text(req.to_string().into())).await {
                         tracing::warn!(relay = relay_url, error = %e, "failed to send REQ");
                         continue;
@@ -170,6 +195,12 @@ impl RelayIngester {
         }
 
         let event: NostrEvent = serde_json::from_value(arr[2].clone()).ok()?;
+
+        // Server-side filter: drop kinds we don't care about (safety net)
+        if !ALLOWED_KINDS.contains(&event.kind) {
+            return None;
+        }
+
         Some(IngestedEvent {
             event,
             relay_url: relay_url.to_string(),
