@@ -650,15 +650,29 @@ impl EventRepository {
             None => return Ok(None),
         };
 
-        // Find root and parent from this event's outgoing refs
-        let refs = sqlx::query_as::<_, EventRef>(
-            "SELECT source_event_id, target_event_id, ref_type, relay_hint, created_at
-             FROM event_refs
-             WHERE source_event_id = $1 AND ref_type IN ('root', 'reply')",
-        )
-        .bind(event_id)
-        .fetch_all(&self.pool)
-        .await?;
+        // Run all independent queries in parallel
+        let (refs_result, interactions_result, replies_result, reactions_result, reposts_result, zaps_result) = tokio::join!(
+            // Find root and parent from this event's outgoing refs
+            sqlx::query_as::<_, EventRef>(
+                "SELECT source_event_id, target_event_id, ref_type, relay_hint, created_at
+                 FROM event_refs
+                 WHERE source_event_id = $1 AND ref_type IN ('root', 'reply')",
+            )
+            .bind(event_id)
+            .fetch_all(&self.pool),
+            self.get_interactions(event_id),
+            self.get_referencing_events(event_id, "reply", limit),
+            self.get_referencing_events(event_id, "reaction", limit),
+            self.get_referencing_events(event_id, "repost", limit),
+            self.get_referencing_events(event_id, "zap", limit),
+        );
+
+        let refs = refs_result?;
+        let interactions = interactions_result?;
+        let replies = replies_result?;
+        let reactions = reactions_result?;
+        let reposts = reposts_result?;
+        let zaps = zaps_result?;
 
         let root_id = refs
             .iter()
@@ -668,18 +682,6 @@ impl EventRepository {
             .iter()
             .find(|r| r.ref_type == "reply")
             .map(|r| r.target_event_id.clone());
-
-        let interactions = self.get_interactions(event_id).await?;
-        let replies = self
-            .get_referencing_events(event_id, "reply", limit)
-            .await?;
-        let reactions = self
-            .get_referencing_events(event_id, "reaction", limit)
-            .await?;
-        let reposts = self
-            .get_referencing_events(event_id, "repost", limit)
-            .await?;
-        let zaps = self.get_referencing_events(event_id, "zap", limit).await?;
 
         Ok(Some(EventThread {
             event,
