@@ -721,7 +721,7 @@ impl EventRepository {
                 SELECT
                     r.target_event_id,
                     COUNT(*) FILTER (WHERE r.ref_type = 'zap')      AS zap_count,
-                    COALESCE(SUM(CASE WHEN r.ref_type = 'zap' THEN COALESCE(za.amount_msats, 0) / 1000 ELSE 0 END), 0) AS zap_sats,
+                    COALESCE(SUM(CASE WHEN r.ref_type = 'zap' THEN COALESCE(za.amount_msats, 0) / 1000 ELSE 0 END), 0)::bigint AS zap_sats,
                     COUNT(*) FILTER (WHERE r.ref_type = 'repost')   AS repost_count,
                     COUNT(*) FILTER (WHERE r.ref_type = 'reply')    AS reply_count,
                     COUNT(*) FILTER (WHERE r.ref_type = 'reaction') AS reaction_count
@@ -737,7 +737,7 @@ impl EventRepository {
                 ne.repost_count,
                 ne.reply_count,
                 ne.reaction_count,
-                (ne.zap_sats + ne.repost_count * 1000 + ne.reply_count * 500 + ne.reaction_count * 100) AS score
+                (ne.zap_sats + ne.repost_count * 1000 + ne.reply_count * 500 + ne.reaction_count * 100)::bigint AS score
             FROM note_engagement ne
             JOIN events e ON e.id = ne.target_event_id AND e.kind = 1
             ORDER BY score DESC, e.created_at DESC
@@ -865,7 +865,7 @@ impl EventRepository {
             r#"
             SELECT COALESCE(SUM(
                 CASE WHEN et.tag_value ~ '^[0-9]+$' THEN et.tag_value::bigint ELSE 0 END
-            ) / 1000, 0)
+            ) / 1000, 0)::bigint
             FROM events e
             JOIN event_tags et ON et.event_id = e.id AND et.tag_name = 'amount'
             WHERE e.kind = 9735 AND e.created_at >= $1
