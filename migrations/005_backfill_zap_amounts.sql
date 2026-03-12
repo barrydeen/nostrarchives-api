@@ -9,17 +9,13 @@ SELECT
     '[]'::jsonb
 FROM events e
 CROSS JOIN LATERAL (
-    SELECT
-        (jsonb_array_elements(
-            (e.tags -> (idx.i))
-        ) ->> 1) AS desc_json
+    SELECT (e.tags -> idx.i) ->> 1 AS desc_json
     FROM generate_series(0, jsonb_array_length(e.tags) - 1) AS idx(i)
     WHERE (e.tags -> idx.i) ->> 0 = 'description'
     LIMIT 1
 ) AS desc_tag
 CROSS JOIN LATERAL (
-    SELECT
-        (tag_arr ->> 1) AS amount
+    SELECT tag_arr ->> 1 AS amount
     FROM jsonb_array_elements(desc_tag.desc_json::jsonb -> 'tags') AS tag_arr
     WHERE tag_arr ->> 0 = 'amount'
     LIMIT 1
