@@ -71,8 +71,10 @@ impl StatsCache {
         let ingestion_rate_per_min = ingestion_count.unwrap_or(0) as f64;
 
         // Events by kind from Redis hash
-        let kind_map: std::collections::HashMap<String, i64> =
-            conn.hgetall(&key("events_by_kind")).await.unwrap_or_default();
+        let kind_map: std::collections::HashMap<String, i64> = conn
+            .hgetall(&key("events_by_kind"))
+            .await
+            .unwrap_or_default();
 
         let mut events_by_kind: Vec<KindCount> = kind_map
             .into_iter()
@@ -97,7 +99,9 @@ impl StatsCache {
 
         // Populate Redis cache
         if let Ok(mut conn) = self.redis.get_multiplexed_async_connection().await {
-            let _: Result<(), _> = conn.set_ex(&key("total_events"), total_events, STATS_TTL).await;
+            let _: Result<(), _> = conn
+                .set_ex(&key("total_events"), total_events, STATS_TTL)
+                .await;
             // Re-populate kind hash
             for kc in &events_by_kind {
                 let _: Result<(), _> = conn

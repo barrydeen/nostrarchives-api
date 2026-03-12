@@ -102,13 +102,19 @@ async fn main() {
     // Shutdown signal
     let (shutdown_tx, _) = broadcast::channel::<()>(1);
 
-    // Start relay ingestion
+    // Start metadata resolver (fetches kind-0 for discovered pubkeys)
+    let metadata_resolver =
+        relay::metadata::MetadataResolver::new(repo.clone(), relay_urls.clone());
+    let metadata_tx = metadata_resolver.start(shutdown_tx.clone());
+
+    // Start relay ingestion (with metadata resolver attached)
     let ingester = relay::ingester::RelayIngester::new(
         relay_urls.clone(),
         repo.clone(),
         stats_cache.clone(),
         cfg.ingestion_since,
-    );
+    )
+    .with_metadata_sender(metadata_tx);
     ingester.run(shutdown_tx.clone()).await;
 
     // HTTP API
