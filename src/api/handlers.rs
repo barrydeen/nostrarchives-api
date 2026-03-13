@@ -12,7 +12,7 @@ use sha2::{Sha256, Digest};
 use tracing::warn;
 
 use super::AppState;
-use crate::db::models::{EventQuery, NoteSearchResult, ProfileSearchResult, StoredEvent};
+use crate::db::models::{EventQuery, NoteSearchResult, ProfileSearchResult};
 use crate::error::AppError;
 use crate::nip19;
 

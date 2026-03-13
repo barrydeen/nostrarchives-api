@@ -255,7 +255,7 @@ async fn handle_trending_req(
         .first()
         .and_then(|f| f.get("limit"))
         .and_then(|v| v.as_i64())
-        .unwrap_or(50)
+        .unwrap_or(20)
         .clamp(1, 200);
 
     tracing::info!(
