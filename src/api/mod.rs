@@ -36,6 +36,8 @@ async fn cache_control_middleware(
         120
     } else if path.contains("/search") {
         60
+    } else if path.contains("/hashtags/") {
+        600
     } else if path.contains("/profiles/metadata") {
         300
     } else {
@@ -85,6 +87,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/users/new", get(handlers::get_new_users))
         .route("/v1/users/trending", get(handlers::get_trending_users))
         .route("/v1/users/zappers", get(handlers::get_top_zappers))
+        .route("/v1/hashtags/trending", get(handlers::get_trending_hashtags))
         .route("/v1/stats/daily", get(handlers::get_daily_stats))
 
         .route("/v1/notes/search", get(handlers::advanced_note_search))

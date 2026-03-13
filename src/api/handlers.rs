@@ -872,6 +872,33 @@ fn normalize_pubkey(input: &str) -> Result<String, AppError> {
     }
 }
 
+/// Get trending hashtags from the last 24 hours.
+pub async fn get_trending_hashtags(
+    State(state): State<AppState>,
+    Query(q): Query<ListingQuery>,
+) -> Result<Json<Value>, AppError> {
+    let limit = clamp_listing_limit(q.limit).min(50);
+    let offset = clamp_offset(q.offset);
+
+    let cache_key = format!("home:trending_hashtags:{limit}:{offset}");
+    if let Some(cached) = state.cache.get_json(&cache_key).await {
+        if let Ok(val) = serde_json::from_str::<Value>(&cached) {
+            return Ok(Json(val));
+        }
+    }
+
+    let hashtags = state.repo.trending_hashtags(limit, offset).await?;
+    let response = json!({
+        "hashtags": hashtags,
+    });
+
+    if let Ok(json_str) = serde_json::to_string(&response) {
+        state.cache.set_json(&cache_key, &json_str, 600).await;
+    }
+
+    Ok(Json(response))
+}
+
 fn decode_npub(npub: &str) -> Result<String, AppError> {
     let (hrp, data, _) =
         bech32::decode(npub).map_err(|_| AppError::BadRequest(format!("invalid npub: {npub}")))?;

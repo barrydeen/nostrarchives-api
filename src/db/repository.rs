@@ -1904,6 +1904,42 @@ impl EventRepository {
             .await?;
         Ok(())
     }
+
+    /// Get trending hashtags from kind-1 notes in the last 24 hours.
+    pub async fn trending_hashtags(
+        &self,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<super::models::TrendingHashtag>, AppError> {
+        let since = chrono::Utc::now().timestamp() - 86400;
+
+        let rows = sqlx::query_as::<_, (String, i64)>(
+            r#"
+            SELECT LOWER(et.tag_value) AS hashtag,
+                   COUNT(DISTINCT et.event_id)::bigint AS cnt
+            FROM event_tags et
+            JOIN events e ON e.id = et.event_id
+            WHERE et.tag_name = 't'
+              AND e.kind = 1
+              AND e.created_at >= $1
+              AND LENGTH(et.tag_value) BETWEEN 1 AND 100
+            GROUP BY LOWER(et.tag_value)
+            HAVING COUNT(DISTINCT et.event_id) >= 3
+            ORDER BY cnt DESC
+            LIMIT $2 OFFSET $3
+            "#,
+        )
+        .bind(since)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|(hashtag, count)| super::models::TrendingHashtag { hashtag, count })
+            .collect())
+    }
 }
 
 enum BindValue {
