@@ -514,7 +514,7 @@ impl EventRepository {
         let row = sqlx::query_as::<_, (i64, i64, i64, i64, i64)>(
             r#"
             SELECT
-                COUNT(*) FILTER (WHERE r.ref_type = 'reply') AS replies,
+                COUNT(*) FILTER (WHERE r.ref_type IN ('reply', 'root')) AS replies,
                 COUNT(*) FILTER (WHERE r.ref_type = 'reaction') AS reactions,
                 COUNT(*) FILTER (WHERE r.ref_type = 'repost') AS reposts,
                 COUNT(*) FILTER (WHERE r.ref_type = 'zap') AS zaps,
@@ -582,7 +582,7 @@ impl EventRepository {
             )
             SELECT
                 r.target_event_id AS event_id,
-                COUNT(*) FILTER (WHERE r.ref_type = 'reply') AS replies,
+                COUNT(*) FILTER (WHERE r.ref_type IN ('reply', 'root')) AS replies,
                 COUNT(*) FILTER (WHERE r.ref_type = 'reaction') AS reactions,
                 COUNT(*) FILTER (WHERE r.ref_type = 'repost') AS reposts,
                 COUNT(*) FILTER (WHERE r.ref_type = 'zap') AS zaps,
@@ -639,6 +639,31 @@ impl EventRepository {
         Ok(events)
     }
 
+    /// Get events that reference a target event, matching any of the given ref_types.
+    pub async fn get_referencing_events_multi(
+        &self,
+        target_event_id: &str,
+        ref_types: &[&str],
+        limit: i64,
+    ) -> Result<Vec<StoredEvent>, AppError> {
+        let types: Vec<String> = ref_types.iter().map(|s| s.to_string()).collect();
+        let events = sqlx::query_as::<_, StoredEvent>(
+            "SELECT e.id, e.pubkey, e.created_at, e.kind, e.content, e.sig, e.tags, e.raw, e.relay_url, e.received_at
+             FROM events e
+             INNER JOIN event_refs r ON r.source_event_id = e.id
+             WHERE r.target_event_id = $1 AND r.ref_type = ANY($2)
+             ORDER BY e.created_at DESC
+             LIMIT $3",
+        )
+        .bind(target_event_id)
+        .bind(&types)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(events)
+    }
+
     /// Get the full thread context for an event: parent chain, interactions, and related events.
     pub async fn get_thread(
         &self,
@@ -668,7 +693,7 @@ impl EventRepository {
             .bind(event_id)
             .fetch_all(&self.pool),
             self.get_interactions(event_id),
-            self.get_referencing_events(event_id, "reply", limit),
+            self.get_referencing_events_multi(event_id, &["reply", "root"], limit),
             self.get_referencing_events(event_id, "reaction", limit),
             self.get_referencing_events(event_id, "repost", limit),
             self.get_referencing_events(event_id, "zap", limit),
@@ -765,134 +790,6 @@ impl EventRepository {
         Ok((follows_count, followers_count))
     }
 
-    /// Return ranked note events by ref_type (reaction/zap) with optional since filter.
-    pub async fn top_notes_by_ref(
-        &self,
-        ref_type: &str,
-        since: Option<i64>,
-        limit: i64,
-        offset: i64,
-    ) -> Result<Vec<RankedEvent>, AppError> {
-        let is_zap = ref_type == "zap";
-
-        let rows = sqlx::query(
-            r#"
-            WITH credible_actors AS (
-                SELECT followed_pubkey AS pubkey
-                FROM follows
-                GROUP BY followed_pubkey
-                HAVING COUNT(*) >= 10
-            ),
-            zap_amounts AS (
-                SELECT
-                    event_id,
-                    MAX(
-                        CASE
-                            WHEN tag_value ~ '^[0-9]+$' THEN tag_value::bigint
-                            ELSE 0
-                        END
-                    ) AS amount_msats
-                FROM event_tags
-                WHERE tag_name = 'amount'
-                GROUP BY event_id
-            ),
-            -- When metric is zap: count ALL zaps (real money, no credibility filter)
-            -- When metric is anything else: use credible_actors filter
-            ranked AS (
-                SELECT
-                    r.target_event_id,
-                    COUNT(*) FILTER (WHERE r.ref_type = $1) AS metric_count,
-                    SUM(CASE WHEN r.ref_type = 'zap' THEN COALESCE(za.amount_msats, 0) ELSE 0 END)::bigint AS zap_total_msats,
-                    COUNT(*) FILTER (WHERE r.ref_type = 'reaction') AS reactions,
-                    COUNT(*) FILTER (WHERE r.ref_type = 'reply') AS replies,
-                    COUNT(*) FILTER (WHERE r.ref_type = 'repost') AS reposts
-                FROM event_refs r
-                JOIN events src ON src.id = r.source_event_id
-                LEFT JOIN credible_actors ca ON ca.pubkey = src.pubkey
-                LEFT JOIN zap_amounts za ON za.event_id = r.source_event_id
-                WHERE ($2::bigint IS NULL OR r.created_at >= $2)
-                  AND ($1 = 'zap' OR ca.pubkey IS NOT NULL)
-                GROUP BY r.target_event_id
-                HAVING COUNT(*) FILTER (WHERE r.ref_type = $1) > 0
-                ORDER BY
-                    CASE WHEN $1 = 'zap' THEN SUM(CASE WHEN r.ref_type = 'zap' THEN COALESCE(za.amount_msats, 0) ELSE 0 END)::bigint
-                         ELSE COUNT(*) FILTER (WHERE r.ref_type = $1)
-                    END DESC
-                LIMIT $3 OFFSET $4
-            )
-            SELECT
-                e.id,
-                e.pubkey,
-                e.created_at,
-                e.kind,
-                e.content,
-                e.sig,
-                e.tags,
-                e.raw,
-                e.relay_url,
-                e.received_at,
-                ranked.metric_count,
-                ranked.zap_total_msats,
-                ranked.reactions,
-                ranked.replies,
-                ranked.reposts
-            FROM ranked
-            JOIN events e ON e.id = ranked.target_event_id
-            WHERE e.kind = 1
-            ORDER BY
-                CASE WHEN $1 = 'zap' THEN ranked.zap_total_msats
-                     ELSE ranked.metric_count
-                END DESC,
-                e.created_at DESC
-            "#,
-        )
-        .bind(ref_type)
-        .bind(since)
-        .bind(limit)
-        .bind(offset)
-        .fetch_all(&self.pool)
-        .await?;
-
-        let events = rows
-            .into_iter()
-            .map(|row| -> Result<RankedEvent, sqlx::Error> {
-                let event = StoredEvent {
-                    id: row.try_get("id")?,
-                    pubkey: row.try_get("pubkey")?,
-                    created_at: row.try_get("created_at")?,
-                    kind: row.try_get("kind")?,
-                    content: row.try_get("content")?,
-                    sig: row.try_get("sig")?,
-                    tags: row.try_get("tags")?,
-                    raw: row.try_get("raw")?,
-                    relay_url: row.try_get("relay_url").ok(),
-                    received_at: row.try_get("received_at")?,
-                };
-
-                let count = row.try_get("metric_count")?;
-                let zap_total_msats: i64 = row.try_get("zap_total_msats")?;
-                let total_sats = if is_zap {
-                    Some(zap_total_msats / 1000)
-                } else {
-                    None
-                };
-                let zap_sats = zap_total_msats / 1000;
-
-                Ok(RankedEvent {
-                    event,
-                    count,
-                    total_sats,
-                    reactions: row.try_get("reactions")?,
-                    replies: row.try_get("replies")?,
-                    reposts: row.try_get("reposts")?,
-                    zap_sats,
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-
-        Ok(events)
-    }
-
     /// Two-phase optimized trending query:
     /// Phase 1: Find top target_event_ids by primary metric using (ref_type, created_at) index.
     /// Phase 2: Fetch full engagement stats only for those top events.
@@ -917,7 +814,8 @@ impl EventRepository {
             primary_metric AS (
                 SELECT
                     r.target_event_id,
-                    COUNT(*) AS metric_count,
+                    -- Count DISTINCT authors so bot/thread chains don't inflate rankings
+                    COUNT(DISTINCT src.pubkey) AS metric_count,
                     CASE WHEN $1 = 'zap' THEN
                         COALESCE(SUM(
                             CASE WHEN et.tag_value ~ '^[0-9]+$' THEN et.tag_value::bigint ELSE 0 END
@@ -930,7 +828,7 @@ impl EventRepository {
                     ON $1 = 'zap'
                     AND et.event_id = r.source_event_id
                     AND et.tag_name = 'amount'
-                WHERE r.ref_type = $1
+                WHERE (r.ref_type = $1 OR ($1 = 'reply' AND r.ref_type = 'root'))
                   AND ($2::bigint IS NULL OR r.created_at >= $2)
                   AND ($1 = 'zap' OR ca.pubkey IS NOT NULL)
                 GROUP BY r.target_event_id
@@ -939,7 +837,7 @@ impl EventRepository {
                         COALESCE(SUM(
                             CASE WHEN et.tag_value ~ '^[0-9]+$' THEN et.tag_value::bigint ELSE 0 END
                         ), 0)::bigint
-                    ELSE COUNT(*)
+                    ELSE COUNT(DISTINCT src.pubkey)
                     END DESC
                 LIMIT $3 OFFSET $4
             ),
@@ -947,13 +845,14 @@ impl EventRepository {
             full_engagement AS (
                 SELECT
                     r.target_event_id,
-                    COUNT(*) FILTER (WHERE r.ref_type = 'reaction') AS reactions,
-                    COUNT(*) FILTER (WHERE r.ref_type = 'reply')    AS replies,
-                    COUNT(*) FILTER (WHERE r.ref_type = 'repost')   AS reposts,
+                    COUNT(DISTINCT src2.pubkey) FILTER (WHERE r.ref_type = 'reaction') AS reactions,
+                    COUNT(DISTINCT src2.pubkey) FILTER (WHERE r.ref_type IN ('reply', 'root')) AS replies,
+                    COUNT(DISTINCT src2.pubkey) FILTER (WHERE r.ref_type = 'repost')   AS reposts,
                     COALESCE(SUM(
                         CASE WHEN r.ref_type = 'zap' THEN COALESCE(za.amount_msats, 0) ELSE 0 END
                     ), 0)::bigint AS zap_total_msats
                 FROM event_refs r
+                JOIN events src2 ON src2.id = r.source_event_id
                 LEFT JOIN (
                     SELECT event_id,
                            MAX(CASE WHEN tag_value ~ '^[0-9]+$' THEN tag_value::bigint ELSE 0 END) AS amount_msats
@@ -1074,12 +973,12 @@ impl EventRepository {
                 SELECT
                     r.target_event_id,
                     COUNT(*) FILTER (WHERE r.ref_type = 'repost')   AS repost_count,
-                    COUNT(*) FILTER (WHERE r.ref_type = 'reply')    AS reply_count,
+                    COUNT(*) FILTER (WHERE r.ref_type IN ('reply', 'root')) AS reply_count,
                     COUNT(*) FILTER (WHERE r.ref_type = 'reaction') AS reaction_count
                 FROM event_refs r
                 JOIN events src ON src.id = r.source_event_id
                 JOIN credible_actors ca ON ca.pubkey = src.pubkey
-                WHERE r.ref_type IN ('repost', 'reply', 'reaction')
+                WHERE r.ref_type IN ('repost', 'reply', 'root', 'reaction')
                   AND r.created_at >= $1
                 GROUP BY r.target_event_id
             ),
@@ -1512,7 +1411,7 @@ impl EventRepository {
             LEFT JOIN LATERAL (
                 SELECT
                     COUNT(*) FILTER (WHERE ref_type = 'reaction') AS reaction_count,
-                    COUNT(*) FILTER (WHERE ref_type = 'reply') AS reply_count,
+                    COUNT(*) FILTER (WHERE ref_type IN ('reply', 'root')) AS reply_count,
                     COUNT(*) FILTER (WHERE ref_type = 'repost') AS repost_count,
                     COUNT(*) FILTER (WHERE ref_type = 'zap') AS zap_count
                 FROM event_refs
@@ -1612,7 +1511,7 @@ impl EventRepository {
             ),
             stats AS (
                 SELECT
-                    COUNT(*) FILTER (WHERE ref_type = 'reply')    AS replies,
+                    COUNT(*) FILTER (WHERE ref_type IN ('reply', 'root')) AS replies,
                     COUNT(*) FILTER (WHERE ref_type = 'reaction') AS reactions,
                     COUNT(*) FILTER (WHERE ref_type = 'repost')   AS reposts,
                     COUNT(*) FILTER (WHERE ref_type = 'zap')      AS zaps
@@ -1624,7 +1523,7 @@ impl EventRepository {
                        e.sig, e.tags, e.relay_url, e.received_at
                 FROM events e
                 INNER JOIN event_refs r ON r.source_event_id = e.id
-                WHERE r.target_event_id = $1 AND r.ref_type = 'reply'
+                WHERE r.target_event_id = $1 AND r.ref_type IN ('reply', 'root')
                 ORDER BY e.created_at DESC
                 LIMIT $2
             ),
@@ -1743,7 +1642,7 @@ impl EventRepository {
         // Reply-to filter
         if let Some(reply_pk) = reply_to {
             conditions.push(format!(
-                "EXISTS (SELECT 1 FROM event_refs er JOIN events parent ON parent.id = er.target_event_id WHERE er.source_event_id = e.id AND er.ref_type = 'reply' AND parent.pubkey = ${param_idx})"
+                "EXISTS (SELECT 1 FROM event_refs er JOIN events parent ON parent.id = er.target_event_id WHERE er.source_event_id = e.id AND er.ref_type IN ('reply', 'root') AND parent.pubkey = ${param_idx})"
             ));
             bind_values.push(BindValue::Text(reply_pk.to_string()));
             param_idx += 1;
@@ -1758,7 +1657,7 @@ impl EventRepository {
         let engagement_join = r#"LEFT JOIN LATERAL (
                 SELECT
                     COUNT(*) FILTER (WHERE ref_type = 'reaction') AS reaction_count,
-                    COUNT(*) FILTER (WHERE ref_type = 'reply') AS reply_count,
+                    COUNT(*) FILTER (WHERE ref_type IN ('reply', 'root')) AS reply_count,
                     COUNT(*) FILTER (WHERE ref_type = 'repost') AS repost_count,
                     COUNT(*) FILTER (WHERE ref_type = 'zap') AS zap_count,
                     COALESCE(SUM(CASE WHEN ref_type = 'zap' THEN COALESCE(za.amount_msats, 0) ELSE 0 END), 0)::bigint AS zap_total_msats

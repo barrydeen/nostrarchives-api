@@ -223,10 +223,10 @@ impl Crawler {
             }
         }
 
-        // Phase 3: Backfill engagement (reactions/reposts/zaps) for this author's notes.
-        // Only for tier 1-2 authors (high-follower) to avoid overwhelming relays.
+        // Phase 3: Backfill engagement (replies/reactions/reposts/zaps) for this author's notes.
+        // Tier 1-3 authors (10+ followers) to capture reply threads.
         let mut engagement_new = 0i64;
-        if target.priority_tier <= 2 {
+        if target.priority_tier <= 3 {
             engagement_new = self.crawl_engagement(&target.pubkey).await;
         }
 
@@ -329,9 +329,9 @@ impl Crawler {
 
         let (mut write, mut read) = ws_stream.split();
 
-        // Fetch reactions, reposts, and zaps that tag this pubkey
+        // Fetch replies, reactions, reposts, and zaps that tag this pubkey
         let filter = serde_json::json!({
-            "kinds": [6, 7, 9735],
+            "kinds": [1, 6, 7, 9735],
             "#p": [pubkey],
             "limit": self.config.events_per_author,
         });
@@ -345,7 +345,7 @@ impl Crawler {
             .map_err(|e| format!("send REQ failed: {e}"))?;
 
         let mut events = Vec::new();
-        let allowed = [6i64, 7, 9735];
+        let allowed = [1i64, 6, 7, 9735];
 
         loop {
             match timeout(msg_timeout, read.next()).await {

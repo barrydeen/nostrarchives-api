@@ -22,7 +22,7 @@ pub struct AppState {
 /// Build the axum router with all routes.
 pub fn router(state: AppState) -> Router {
     // 30 requests per minute per IP
-    let limiter = RateLimiter::new(30, Duration::from_secs(60));
+    let limiter = RateLimiter::new(120, Duration::from_secs(60));
 
     // Rate-limited API routes
     let api_routes = Router::new()
@@ -50,16 +50,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/users/trending", get(handlers::get_trending_users))
         .route("/v1/users/zappers", get(handlers::get_top_zappers))
         .route("/v1/stats/daily", get(handlers::get_daily_stats))
-        .route("/v1/notes/likes/top", get(handlers::get_top_likes))
-        .route(
-            "/v1/notes/likes/top/today",
-            get(handlers::get_top_likes_today),
-        )
-        .route("/v1/notes/zaps/top", get(handlers::get_top_zaps))
-        .route(
-            "/v1/notes/zaps/top/today",
-            get(handlers::get_top_zaps_today),
-        )
+
         .route("/v1/notes/search", get(handlers::advanced_note_search))
         .route("/v1/search", get(handlers::search))
         .route("/v1/search/suggest", get(handlers::search_suggest))
