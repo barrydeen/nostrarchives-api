@@ -19,6 +19,42 @@ pub struct AppState {
     pub crawl_queue: Option<CrawlQueue>,
 }
 
+async fn cache_control_middleware(
+    req: axum::extract::Request,
+    next: middleware::Next,
+) -> axum::response::Response {
+    let path = req.uri().path().to_string();
+    let mut response = next.run(req).await;
+
+    if path == "/health" {
+        return response;
+    }
+
+    let max_age = if path.contains("/notes/top") {
+        300
+    } else if path.contains("/stats") {
+        120
+    } else if path.contains("/search") {
+        60
+    } else if path.contains("/profiles/metadata") {
+        300
+    } else {
+        60
+    };
+
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        format!(
+            "public, max-age={max_age}, stale-while-revalidate={}",
+            max_age * 2
+        )
+        .parse()
+        .unwrap(),
+    );
+
+    response
+}
+
 /// Build the axum router with all routes.
 pub fn router(state: AppState) -> Router {
     // 30 requests per minute per IP
@@ -58,7 +94,8 @@ pub fn router(state: AppState) -> Router {
         .route_layer(middleware::from_fn_with_state(
             limiter,
             rate_limit_middleware,
-        ));
+        ))
+        .layer(middleware::from_fn(cache_control_middleware));
 
     // Health check is NOT rate-limited (monitoring/uptime checks)
     Router::new()
