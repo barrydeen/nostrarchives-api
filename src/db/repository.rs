@@ -1858,20 +1858,22 @@ impl EventRepository {
     }
 
     /// Search kind-1 notes containing a literal hashtag (e.g. `#bitcoin`) in content.
-    /// Case-insensitive via ILIKE, uses GIN trigram index `idx_events_content_trgm`.
+    /// Case-insensitive via regex with word boundaries, uses GIN trigram index.
     ///
-    /// Matches the actual `#hashtag` string in content, not just the word without `#`.
-    /// This catches all notes regardless of whether the client added a `t` tag.
+    /// Matches the exact hashtag — `#bitcoin` won't match `#bitcoinart`.
+    /// This catches all notes regardless of whether the client added a `t` tag,
+    /// since many clients get tagging wrong.
     ///
-    /// Strategy: GIN trigram index finds matching notes fast, cap at 500 recent
-    /// candidates, then rank by engagement.
+    /// Strategy: GIN trigram index finds candidates (~110ms for popular hashtags),
+    /// cap at 500, then rank by engagement.
     pub async fn search_notes_by_hashtag(
         &self,
         hashtag: &str,
         limit: i64,
     ) -> Result<Vec<StoredEvent>, AppError> {
-        // Build the ILIKE pattern: %#bitcoin%
-        let pattern = format!("%#{}%", hashtag);
+        // Regex: word-boundary match for #hashtag (case-insensitive via ~*)
+        // (?<!\w) = not preceded by a word char, (?!\w) = not followed by a word char
+        let pattern = format!(r"(?<!\w)#{}(?!\w)", regex_escape(hashtag));
 
         let rows = sqlx::query_as::<_, StoredEvent>(
             r#"
@@ -1880,7 +1882,7 @@ impl EventRepository {
                     e.id, e.pubkey, e.created_at, e.kind, e.content, e.sig,
                     e.tags, e.raw, e.relay_url, e.received_at
                 FROM events e
-                WHERE e.kind = 1 AND e.content ILIKE $1
+                WHERE e.kind = 1 AND e.content ~* $1
                 LIMIT 500
             )
             SELECT
@@ -1929,6 +1931,22 @@ impl EventRepository {
 
 enum BindValue {
     Text(String),
+}
+
+/// Escape special regex characters in user input to prevent regex injection.
+fn regex_escape(s: &str) -> String {
+    let mut escaped = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' | '.' | '+' | '*' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '^'
+            | '$' => {
+                escaped.push('\\');
+                escaped.push(c);
+            }
+            _ => escaped.push(c),
+        }
+    }
+    escaped
 }
 
 fn is_hex_pubkey(value: &str) -> bool {
