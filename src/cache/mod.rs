@@ -154,6 +154,22 @@ impl StatsCache {
         let _: Result<(), _> = conn.set_ex(&cache_key, json, ttl).await;
     }
 
+    /// Generic JSON cache: get
+    pub async fn get_json(&self, cache_key: &str) -> Option<String> {
+        let Ok(mut conn) = self.redis.get_multiplexed_async_connection().await else {
+            return None;
+        };
+        conn.get(&key(cache_key)).await.ok()
+    }
+
+    /// Generic JSON cache: set with TTL
+    pub async fn set_json(&self, cache_key: &str, json: &str, ttl: u64) {
+        let Ok(mut conn) = self.redis.get_multiplexed_async_connection().await else {
+            return;
+        };
+        let _: Result<(), _> = conn.set_ex(&key(cache_key), json, ttl).await;
+    }
+
     /// Refresh stats from the database and populate cache.
     pub async fn refresh_stats(&self) -> Result<GlobalStats, AppError> {
         let total_events = self.repo.count_events().await?;
