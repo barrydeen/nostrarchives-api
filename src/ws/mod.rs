@@ -225,17 +225,17 @@ async fn handle_search_req(sub_id: &str, filters: &[Value], state: &AppState) ->
 
         // Hashtag search: skip profiles, use tag-based lookup for notes
         if is_hashtag && search_notes {
-            match state.repo.search_notes_by_hashtag(hashtag, limit).await {
-                Ok(events) => {
+            match state.repo.notes_by_hashtag(hashtag, limit, 0).await {
+                Ok((notes, _profiles)) => {
                     tracing::info!(
                         sub_id = %sub_id,
                         hashtag = %hashtag,
-                        results = events.len(),
+                        results = notes.len(),
                         "hashtag search completed"
                     );
-                    for event in events {
+                    for note in notes {
                         let event_msg = serde_json::to_string(
-                            &serde_json::json!(["EVENT", sub_id, event.raw.0]),
+                            &serde_json::json!(["EVENT", sub_id, note.event.raw.0]),
                         )
                         .expect("json serialization cannot fail");
                         messages.push(event_msg);
