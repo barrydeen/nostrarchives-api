@@ -1857,6 +1857,67 @@ impl EventRepository {
         Ok(rows)
     }
 
+    /// Search kind-1 notes containing a literal hashtag (e.g. `#bitcoin`) in content.
+    /// Case-insensitive via ILIKE, uses GIN trigram index `idx_events_content_trgm`.
+    ///
+    /// Matches the actual `#hashtag` string in content, not just the word without `#`.
+    /// This catches all notes regardless of whether the client added a `t` tag.
+    ///
+    /// Strategy: GIN trigram index finds matching notes fast, cap at 500 recent
+    /// candidates, then rank by engagement.
+    pub async fn search_notes_by_hashtag(
+        &self,
+        hashtag: &str,
+        limit: i64,
+    ) -> Result<Vec<StoredEvent>, AppError> {
+        // Build the ILIKE pattern: %#bitcoin%
+        let pattern = format!("%#{}%", hashtag);
+
+        let rows = sqlx::query_as::<_, StoredEvent>(
+            r#"
+            WITH candidates AS (
+                SELECT
+                    e.id, e.pubkey, e.created_at, e.kind, e.content, e.sig,
+                    e.tags, e.raw, e.relay_url, e.received_at
+                FROM events e
+                WHERE e.kind = 1 AND e.content ILIKE $1
+                LIMIT 500
+            )
+            SELECT
+                c.id, c.pubkey, c.created_at, c.kind, c.content, c.sig,
+                c.tags, c.raw, c.relay_url, c.received_at
+            FROM candidates c
+            LEFT JOIN LATERAL (
+                SELECT
+                    COUNT(*) FILTER (WHERE ref_type = 'reaction') AS reaction_count,
+                    COUNT(*) FILTER (WHERE ref_type IN ('reply', 'root')) AS reply_count,
+                    COUNT(*) FILTER (WHERE ref_type = 'repost') AS repost_count,
+                    COUNT(*) FILTER (WHERE ref_type = 'zap') AS zap_count
+                FROM event_refs
+                WHERE target_event_id = c.id
+            ) eng ON TRUE
+            ORDER BY (
+                COALESCE(eng.reaction_count, 0) * 100 +
+                COALESCE(eng.reply_count, 0) * 500 +
+                COALESCE(eng.repost_count, 0) * 1000 +
+                COALESCE(eng.zap_count, 0) * 2000 +
+                CASE
+                    WHEN c.created_at > EXTRACT(EPOCH FROM NOW())::bigint - 86400 THEN 500
+                    WHEN c.created_at > EXTRACT(EPOCH FROM NOW())::bigint - 604800 THEN 200
+                    ELSE 0
+                END
+            ) DESC, c.created_at DESC
+            LIMIT $2
+            "#,
+        )
+        .bind(&pattern)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows)
+    }
+
     /// Refresh the profile_search materialized view (CONCURRENTLY to avoid blocking reads).
     pub async fn refresh_profile_search(&self) -> Result<(), AppError> {
         sqlx::query("REFRESH MATERIALIZED VIEW CONCURRENTLY profile_search")
