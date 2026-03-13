@@ -4,15 +4,15 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
 use bech32::{self, FromBase32};
-use chrono::{Duration, Utc};
+use chrono::Utc;
 use hex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Sha256, Digest};
 use tracing::warn;
 
 use super::AppState;
-use crate::db::models::{EventQuery, NoteSearchResult, ProfileSearchResult, StoredEvent};
-use crate::db::repository::EventRepository;
+use crate::db::models::{EventQuery, NoteSearchResult, ProfileSearchResult};
 use crate::error::AppError;
 use crate::nip19;
 
@@ -201,6 +201,19 @@ pub async fn get_profiles_metadata(
         return Err(AppError::BadRequest("no valid pubkeys provided".into()));
     }
 
+    // Deterministic cache key from sorted pubkeys
+    let mut sorted_for_hash = ordered_pubkeys.clone();
+    sorted_for_hash.sort();
+    let sorted_joined = sorted_for_hash.join(",");
+    let hash = format!("{:x}", Sha256::digest(sorted_joined.as_bytes()));
+    let cache_key = format!("profiles:metadata:{hash}");
+
+    if let Some(cached) = state.cache.get_json(&cache_key).await {
+        if let Ok(val) = serde_json::from_str::<ProfilesMetadataResponse>(&cached) {
+            return Ok(Json(val));
+        }
+    }
+
     let rows = state.repo.latest_profile_metadata(&unique_pubkeys).await?;
     let mut metadata_map: HashMap<String, Value> = HashMap::new();
     for row in rows {
@@ -219,7 +232,13 @@ pub async fn get_profiles_metadata(
         .map(|pubkey| build_profile_entry(&pubkey, metadata_map.get(&pubkey)))
         .collect();
 
-    Ok(Json(ProfilesMetadataResponse { profiles }))
+    let response = ProfilesMetadataResponse { profiles };
+
+    if let Ok(json_str) = serde_json::to_string(&response) {
+        state.cache.set_json(&cache_key, &json_str, 300).await;
+    }
+
+    Ok(Json(response))
 }
 
 /// Unified trending endpoint: GET /v1/notes/top?metric=reactions|replies|reposts|zaps&range=today|7d|30d|1y|all
@@ -332,8 +351,22 @@ pub async fn get_trending_notes(
 ) -> Result<Json<Value>, AppError> {
     let limit = clamp_listing_limit(q.limit);
     let offset = clamp_offset(q.offset);
+
+    let cache_key = format!("home:trending:{limit}:{offset}");
+    if let Some(cached) = state.cache.get_json(&cache_key).await {
+        if let Ok(val) = serde_json::from_str::<Value>(&cached) {
+            return Ok(Json(val));
+        }
+    }
+
     let notes = state.repo.trending_notes(limit, offset).await?;
-    Ok(Json(json!({ "notes": notes })))
+    let response = json!({ "notes": notes });
+
+    if let Ok(json_str) = serde_json::to_string(&response) {
+        state.cache.set_json(&cache_key, &json_str, 300).await;
+    }
+
+    Ok(Json(response))
 }
 
 /// Get new users (first seen in last 24h).
@@ -343,8 +376,22 @@ pub async fn get_new_users(
 ) -> Result<Json<Value>, AppError> {
     let limit = clamp_listing_limit(q.limit);
     let offset = clamp_offset(q.offset);
+
+    let cache_key = format!("home:new_users:{limit}:{offset}");
+    if let Some(cached) = state.cache.get_json(&cache_key).await {
+        if let Ok(val) = serde_json::from_str::<Value>(&cached) {
+            return Ok(Json(val));
+        }
+    }
+
     let users = state.repo.new_users(limit, offset).await?;
-    Ok(Json(json!({ "users": users })))
+    let response = json!({ "users": users });
+
+    if let Ok(json_str) = serde_json::to_string(&response) {
+        state.cache.set_json(&cache_key, &json_str, 300).await;
+    }
+
+    Ok(Json(response))
 }
 
 /// Get trending users by new follower count (last 24h).
@@ -354,8 +401,22 @@ pub async fn get_trending_users(
 ) -> Result<Json<Value>, AppError> {
     let limit = clamp_listing_limit(q.limit);
     let offset = clamp_offset(q.offset);
+
+    let cache_key = format!("home:trending_users:{limit}:{offset}");
+    if let Some(cached) = state.cache.get_json(&cache_key).await {
+        if let Ok(val) = serde_json::from_str::<Value>(&cached) {
+            return Ok(Json(val));
+        }
+    }
+
     let users = state.repo.trending_users(limit, offset).await?;
-    Ok(Json(json!({ "users": users })))
+    let response = json!({ "users": users });
+
+    if let Ok(json_str) = serde_json::to_string(&response) {
+        state.cache.set_json(&cache_key, &json_str, 300).await;
+    }
+
+    Ok(Json(response))
 }
 
 /// Top zappers by sats sent or received in last 24h.
@@ -371,72 +432,47 @@ pub async fn get_top_zappers(
     }
     let limit = clamp_listing_limit(q.limit);
     let offset = clamp_offset(q.offset);
+
+    let cache_key = format!("home:zappers:{direction}:{limit}:{offset}");
+    if let Some(cached) = state.cache.get_json(&cache_key).await {
+        if let Ok(val) = serde_json::from_str::<Value>(&cached) {
+            return Ok(Json(val));
+        }
+    }
+
     let zappers = state.repo.top_zappers(direction, limit, offset).await?;
-    Ok(Json(json!({
+    let response = json!({
         "direction": direction,
         "zappers": zappers,
-    })))
+    });
+
+    if let Ok(json_str) = serde_json::to_string(&response) {
+        state.cache.set_json(&cache_key, &json_str, 300).await;
+    }
+
+    Ok(Json(response))
 }
 
 /// Get daily network stats (DAU, total sats, daily posts).
 pub async fn get_daily_stats(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
+    let cache_key = "home:daily_stats";
+    if let Some(cached) = state.cache.get_json(cache_key).await {
+        if let Ok(val) = serde_json::from_str::<Value>(&cached) {
+            return Ok(Json(val));
+        }
+    }
+
     let stats = state.repo.daily_stats().await?;
-    Ok(Json(serde_json::to_value(stats).unwrap()))
+    let response = serde_json::to_value(stats).unwrap();
+
+    if let Ok(json_str) = serde_json::to_string(&response) {
+        state.cache.set_json(cache_key, &json_str, 120).await;
+    }
+
+    Ok(Json(response))
 }
 
-pub async fn get_top_likes(
-    State(state): State<AppState>,
-    Query(q): Query<ListingQuery>,
-) -> Result<Json<RankedNotesResponse>, AppError> {
-    ranked_notes(
-        state.repo, "reaction", None, "likes", "all_time", q.limit, q.offset,
-    )
-    .await
-}
 
-pub async fn get_top_likes_today(
-    State(state): State<AppState>,
-    Query(q): Query<ListingQuery>,
-) -> Result<Json<RankedNotesResponse>, AppError> {
-    let since = Utc::now().timestamp() - Duration::hours(24).num_seconds();
-    ranked_notes(
-        state.repo,
-        "reaction",
-        Some(since),
-        "likes",
-        "today",
-        q.limit,
-        q.offset,
-    )
-    .await
-}
-
-pub async fn get_top_zaps(
-    State(state): State<AppState>,
-    Query(q): Query<ListingQuery>,
-) -> Result<Json<RankedNotesResponse>, AppError> {
-    ranked_notes(
-        state.repo, "zap", None, "zaps", "all_time", q.limit, q.offset,
-    )
-    .await
-}
-
-pub async fn get_top_zaps_today(
-    State(state): State<AppState>,
-    Query(q): Query<ListingQuery>,
-) -> Result<Json<RankedNotesResponse>, AppError> {
-    let since = Utc::now().timestamp() - Duration::hours(24).num_seconds();
-    ranked_notes(
-        state.repo,
-        "zap",
-        Some(since),
-        "zaps",
-        "today",
-        q.limit,
-        q.offset,
-    )
-    .await
-}
 
 #[derive(Debug, Deserialize)]
 pub struct TopNotesQuery {
@@ -487,31 +523,12 @@ pub struct SocialGraphResponse {
     pub followers: SocialListResponse,
 }
 
-#[derive(Debug, Serialize)]
-pub struct RankedNoteResponse {
-    pub count: i64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub total_sats: Option<i64>,
-    pub reactions: i64,
-    pub replies: i64,
-    pub reposts: i64,
-    pub zap_sats: i64,
-    pub event: StoredEvent,
-}
-
-#[derive(Debug, Serialize)]
-pub struct RankedNotesResponse {
-    pub metric: String,
-    pub range: String,
-    pub notes: Vec<RankedNoteResponse>,
-}
-
 #[derive(Debug, Deserialize)]
 pub struct ProfilesMetadataRequest {
     pub pubkeys: Vec<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ProfileMetadataEntry {
     pub pubkey: String,
     pub display_name: Option<String>,
@@ -520,7 +537,7 @@ pub struct ProfileMetadataEntry {
     pub picture: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ProfilesMetadataResponse {
     pub profiles: Vec<ProfileMetadataEntry>,
 }
@@ -535,41 +552,6 @@ fn clamp_listing_limit(value: Option<i64>) -> i64 {
 
 fn clamp_offset(value: Option<i64>) -> i64 {
     value.unwrap_or(0).max(0)
-}
-
-async fn ranked_notes(
-    repo: EventRepository,
-    ref_type: &str,
-    since: Option<i64>,
-    metric: &str,
-    range: &str,
-    limit: Option<i64>,
-    offset: Option<i64>,
-) -> Result<Json<RankedNotesResponse>, AppError> {
-    let limit = clamp_listing_limit(limit);
-    let offset = clamp_offset(offset);
-    let ranked = repo
-        .top_notes_by_ref(ref_type, since, limit, offset)
-        .await?;
-
-    let notes = ranked
-        .into_iter()
-        .map(|entry| RankedNoteResponse {
-            count: entry.count,
-            total_sats: entry.total_sats,
-            reactions: entry.reactions,
-            replies: entry.replies,
-            reposts: entry.reposts,
-            zap_sats: entry.zap_sats,
-            event: entry.event,
-        })
-        .collect();
-
-    Ok(Json(RankedNotesResponse {
-        metric: metric.into(),
-        range: range.into(),
-        notes,
-    }))
 }
 
 fn build_profile_entry(pubkey: &str, metadata: Option<&Value>) -> ProfileMetadataEntry {

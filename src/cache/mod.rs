@@ -11,7 +11,7 @@ const SEARCH_SUGGEST_TTL: u64 = 60; // seconds
 /// TTL for trending/top-notes cache, keyed by range.
 fn trending_ttl(range: &str) -> u64 {
     match range {
-        "today" => 90, // 1.5 min — data shifts frequently
+        "today" => 300, // 5 min — balanced freshness vs DB load
         "7d" => 300,   // 5 min
         "30d" => 900,  // 15 min
         "1y" => 1800,  // 30 min
@@ -152,6 +152,22 @@ impl StatsCache {
         let cache_key = key(&format!("trending:{metric}:{range}:{limit}:{offset}"));
         let ttl = trending_ttl(range);
         let _: Result<(), _> = conn.set_ex(&cache_key, json, ttl).await;
+    }
+
+    /// Generic JSON cache: get
+    pub async fn get_json(&self, cache_key: &str) -> Option<String> {
+        let Ok(mut conn) = self.redis.get_multiplexed_async_connection().await else {
+            return None;
+        };
+        conn.get(&key(cache_key)).await.ok()
+    }
+
+    /// Generic JSON cache: set with TTL
+    pub async fn set_json(&self, cache_key: &str, json: &str, ttl: u64) {
+        let Ok(mut conn) = self.redis.get_multiplexed_async_connection().await else {
+            return;
+        };
+        let _: Result<(), _> = conn.set_ex(&key(cache_key), json, ttl).await;
     }
 
     /// Refresh stats from the database and populate cache.
