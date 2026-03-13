@@ -165,3 +165,10 @@ pub struct AdvancedNoteSearchEntry {
     pub reposts: i64,
     pub zap_sats: i64,
 }
+
+/// A trending hashtag with usage count.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrendingHashtag {
+    pub hashtag: String,
+    pub count: i64,
+}
