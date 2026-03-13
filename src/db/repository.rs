@@ -1226,13 +1226,15 @@ impl EventRepository {
 
     /// Search profiles with ranked results.
     ///
-    /// Ranking algorithm:
-    /// - Exact name match: +100,000
-    /// - Prefix match: +10,000
-    /// - NIP-05 match: +5,000
+    /// Ranking algorithm (rebalanced so follower/engagement weight is
+    /// meaningful relative to match-quality bonuses):
+    /// - Exact name match: +500
+    /// - Exact NIP-05 match: +400
+    /// - Prefix match: +200
+    /// - NIP-05 prefix match: +100
     /// - Trigram similarity: 0-100
-    /// - Follower influence: ln(followers + 1) * 50
-    /// - Engagement influence: ln(engagement + 1) * 20
+    /// - Follower influence: ln(followers + 1) * 100
+    /// - Engagement influence: ln(engagement + 1) * 50
     /// - Recency bonus: +200 if active in last 7d, +100 if last 30d
     pub async fn search_profiles(
         &self,
@@ -1246,18 +1248,18 @@ impl EventRepository {
                 pubkey, name, display_name, nip05, about, picture,
                 follower_count, engagement_score, last_active_at,
                 (
-                    CASE WHEN LOWER(name) = LOWER($1) THEN 100000 ELSE 0 END +
-                    CASE WHEN LOWER(display_name) = LOWER($1) THEN 100000 ELSE 0 END +
-                    CASE WHEN LOWER(nip05) = LOWER($1) THEN 80000 ELSE 0 END +
-                    CASE WHEN name ILIKE $1 || '%' THEN 10000 ELSE 0 END +
-                    CASE WHEN display_name ILIKE $1 || '%' THEN 10000 ELSE 0 END +
-                    CASE WHEN nip05 ILIKE $1 || '%' THEN 5000 ELSE 0 END +
+                    CASE WHEN LOWER(name) = LOWER($1) THEN 500 ELSE 0 END +
+                    CASE WHEN LOWER(display_name) = LOWER($1) THEN 500 ELSE 0 END +
+                    CASE WHEN LOWER(nip05) = LOWER($1) THEN 400 ELSE 0 END +
+                    CASE WHEN name ILIKE $1 || '%' THEN 200 ELSE 0 END +
+                    CASE WHEN display_name ILIKE $1 || '%' THEN 200 ELSE 0 END +
+                    CASE WHEN nip05 ILIKE $1 || '%' THEN 100 ELSE 0 END +
                     GREATEST(
                         COALESCE(similarity(name, $1), 0),
                         COALESCE(similarity(display_name, $1), 0)
                     ) * 100 +
-                    LN(GREATEST(follower_count, 0) + 1) * 50 +
-                    LN(GREATEST(engagement_score, 0) + 1) * 20 +
+                    LN(GREATEST(follower_count, 0) + 1) * 100 +
+                    LN(GREATEST(engagement_score, 0) + 1) * 50 +
                     CASE
                         WHEN last_active_at > EXTRACT(EPOCH FROM NOW())::bigint - 604800 THEN 200
                         WHEN last_active_at > EXTRACT(EPOCH FROM NOW())::bigint - 2592000 THEN 100
@@ -1316,13 +1318,13 @@ impl EventRepository {
                 follower_count, engagement_score, last_active_at,
                 (
                     CASE
-                        WHEN LOWER(name) = LOWER($1) OR LOWER(display_name) = LOWER($1) THEN 100000
-                        WHEN name ILIKE $1 || '%' OR display_name ILIKE $1 || '%' THEN 10000
-                        WHEN nip05 ILIKE $1 || '%' THEN 5000
-                        ELSE 100
+                        WHEN LOWER(name) = LOWER($1) OR LOWER(display_name) = LOWER($1) THEN 500
+                        WHEN name ILIKE $1 || '%' OR display_name ILIKE $1 || '%' THEN 200
+                        WHEN nip05 ILIKE $1 || '%' THEN 100
+                        ELSE 0
                     END
-                    + LN(GREATEST(follower_count, 0) + 1) * 50
-                    + LN(GREATEST(engagement_score, 0) + 1) * 20
+                    + LN(GREATEST(follower_count, 0) + 1) * 100
+                    + LN(GREATEST(engagement_score, 0) + 1) * 50
                 )::float8 AS rank_score
             FROM profile_search
             WHERE
@@ -1760,13 +1762,13 @@ impl EventRepository {
                     ROW_NUMBER() OVER (ORDER BY
                         (
                             CASE
-                                WHEN LOWER(name) = LOWER($1) OR LOWER(display_name) = LOWER($1) THEN 100000
-                                WHEN name ILIKE $1 || '%' OR display_name ILIKE $1 || '%' THEN 10000
-                                WHEN nip05 ILIKE $1 || '%' THEN 5000
-                                ELSE 100
+                                WHEN LOWER(name) = LOWER($1) OR LOWER(display_name) = LOWER($1) THEN 500
+                                WHEN name ILIKE $1 || '%' OR display_name ILIKE $1 || '%' THEN 200
+                                WHEN nip05 ILIKE $1 || '%' THEN 100
+                                ELSE 0
                             END
-                            + LN(GREATEST(follower_count, 0) + 1) * 50
-                            + LN(GREATEST(engagement_score, 0) + 1) * 20
+                            + LN(GREATEST(follower_count, 0) + 1) * 100
+                            + LN(GREATEST(engagement_score, 0) + 1) * 50
                         ) DESC, follower_count DESC
                     ) AS rn
                 FROM profile_search
