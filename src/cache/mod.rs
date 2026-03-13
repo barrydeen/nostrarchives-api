@@ -11,7 +11,7 @@ const SEARCH_SUGGEST_TTL: u64 = 60; // seconds
 /// TTL for trending/top-notes cache, keyed by range.
 fn trending_ttl(range: &str) -> u64 {
     match range {
-        "today" => 90, // 1.5 min — data shifts frequently
+        "today" => 300, // 5 min — balanced freshness vs DB load
         "7d" => 300,   // 5 min
         "30d" => 900,  // 15 min
         "1y" => 1800,  // 30 min
