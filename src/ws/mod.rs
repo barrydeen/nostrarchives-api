@@ -210,22 +210,28 @@ async fn handle_search_req(sub_id: &str, filters: &[Value], state: &AppState) ->
         let search_profiles = kinds.is_empty() || kinds.contains(&0);
         let search_notes = kinds.is_empty() || kinds.contains(&1);
 
+        // Detect hashtag search: query starts with '#'
+        let is_hashtag = search_term.starts_with('#') && search_term.len() > 1;
+        let hashtag = if is_hashtag { &search_term[1..] } else { "" };
+
         tracing::info!(
             sub_id = %sub_id,
             search = %search_term,
             kinds = ?kinds,
             limit = limit,
+            hashtag = is_hashtag,
             "NIP-50 search request"
         );
 
-        // Search profiles (kind 0)
-        if search_profiles {
-            match state.repo.search_profiles_as_events(search_term, limit).await {
+        // Hashtag search: skip profiles, use tag-based lookup for notes
+        if is_hashtag && search_notes {
+            match state.repo.search_notes_by_hashtag(hashtag, limit).await {
                 Ok(events) => {
                     tracing::info!(
                         sub_id = %sub_id,
+                        hashtag = %hashtag,
                         results = events.len(),
-                        "profile search completed"
+                        "hashtag search completed"
                     );
                     for event in events {
                         let event_msg = serde_json::to_string(
@@ -236,32 +242,56 @@ async fn handle_search_req(sub_id: &str, filters: &[Value], state: &AppState) ->
                     }
                 }
                 Err(e) => {
-                    tracing::error!(error = %e, "profile search failed");
-                    messages.push(notice(&format!("error: profile search failed: {e}")));
+                    tracing::error!(error = %e, "hashtag search failed");
+                    messages.push(notice(&format!("error: hashtag search failed: {e}")));
                 }
             }
-        }
-
-        // Search notes (kind 1)
-        if search_notes {
-            match state.repo.search_notes_as_events(search_term, limit).await {
-                Ok(events) => {
-                    tracing::info!(
-                        sub_id = %sub_id,
-                        results = events.len(),
-                        "note search completed"
-                    );
-                    for event in events {
-                        let event_msg = serde_json::to_string(
-                            &serde_json::json!(["EVENT", sub_id, event.raw.0]),
-                        )
-                        .expect("json serialization cannot fail");
-                        messages.push(event_msg);
+        } else {
+            // Search profiles (kind 0) — skip for hashtag queries
+            if search_profiles && !is_hashtag {
+                match state.repo.search_profiles_as_events(search_term, limit).await {
+                    Ok(events) => {
+                        tracing::info!(
+                            sub_id = %sub_id,
+                            results = events.len(),
+                            "profile search completed"
+                        );
+                        for event in events {
+                            let event_msg = serde_json::to_string(
+                                &serde_json::json!(["EVENT", sub_id, event.raw.0]),
+                            )
+                            .expect("json serialization cannot fail");
+                            messages.push(event_msg);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "profile search failed");
+                        messages.push(notice(&format!("error: profile search failed: {e}")));
                     }
                 }
-                Err(e) => {
-                    tracing::error!(error = %e, "note search failed");
-                    messages.push(notice(&format!("error: note search failed: {e}")));
+            }
+
+            // Search notes (kind 1) — full-text search
+            if search_notes && !is_hashtag {
+                match state.repo.search_notes_as_events(search_term, limit).await {
+                    Ok(events) => {
+                        tracing::info!(
+                            sub_id = %sub_id,
+                            results = events.len(),
+                            "note search completed"
+                        );
+                        for event in events {
+                            let event_msg = serde_json::to_string(
+                                &serde_json::json!(["EVENT", sub_id, event.raw.0]),
+                            )
+                            .expect("json serialization cannot fail");
+                            messages.push(event_msg);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "note search failed");
+                        messages.push(notice(&format!("error: note search failed: {e}")));
+                    }
                 }
             }
         }
