@@ -1882,7 +1882,9 @@ impl EventRepository {
                 e.tags, e.raw, e.relay_url, e.received_at
             FROM events e
             JOIN profile_search ps ON ps.pubkey = e.pubkey AND ps.follower_count >= 3
-            WHERE e.kind = 1 AND e.content ~* $1
+            WHERE e.kind = 1
+              AND e.content ~* $1
+              AND (LENGTH(e.content) - LENGTH(REPLACE(e.content, '#', ''))) <= 5
             ORDER BY e.created_at DESC
             LIMIT $2
             "#,
