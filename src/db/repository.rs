@@ -1745,6 +1745,116 @@ impl EventRepository {
         Ok((entries, total, profiles))
     }
 
+    /// Search profiles and return raw kind-0 events, ranked by the profile search algorithm.
+    /// Used by the NIP-50 WebSocket search relay.
+    pub async fn search_profiles_as_events(
+        &self,
+        query: &str,
+        limit: i64,
+    ) -> Result<Vec<StoredEvent>, AppError> {
+        let rows = sqlx::query_as::<_, StoredEvent>(
+            r#"
+            WITH ranked_profiles AS (
+                SELECT
+                    pubkey,
+                    ROW_NUMBER() OVER (ORDER BY
+                        (
+                            CASE
+                                WHEN LOWER(name) = LOWER($1) OR LOWER(display_name) = LOWER($1) THEN 100000
+                                WHEN name ILIKE $1 || '%' OR display_name ILIKE $1 || '%' THEN 10000
+                                WHEN nip05 ILIKE $1 || '%' THEN 5000
+                                ELSE 100
+                            END
+                            + LN(GREATEST(follower_count, 0) + 1) * 50
+                            + LN(GREATEST(engagement_score, 0) + 1) * 20
+                        ) DESC, follower_count DESC
+                    ) AS rn
+                FROM profile_search
+                WHERE
+                    name ILIKE '%' || $1 || '%'
+                    OR display_name ILIKE '%' || $1 || '%'
+                    OR nip05 ILIKE '%' || $1 || '%'
+                    OR pubkey LIKE $1 || '%'
+                LIMIT $2
+            ),
+            latest_profiles AS (
+                SELECT DISTINCT ON (e.pubkey)
+                    e.id, e.pubkey, e.created_at, e.kind, e.content, e.sig,
+                    e.tags, e.raw, e.relay_url, e.received_at, rp.rn
+                FROM ranked_profiles rp
+                JOIN events e ON e.pubkey = rp.pubkey AND e.kind = 0
+                ORDER BY e.pubkey, e.created_at DESC
+            )
+            SELECT id, pubkey, created_at, kind, content, sig, tags, raw, relay_url, received_at
+            FROM latest_profiles
+            ORDER BY rn
+            "#,
+        )
+        .bind(query)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows)
+    }
+
+    /// Search notes and return raw kind-1 events, ranked by FTS relevance + engagement.
+    /// Used by the NIP-50 WebSocket search relay.
+    pub async fn search_notes_as_events(
+        &self,
+        query: &str,
+        limit: i64,
+    ) -> Result<Vec<StoredEvent>, AppError> {
+        let rows = sqlx::query_as::<_, StoredEvent>(
+            r#"
+            WITH ranked AS (
+                SELECT
+                    e.id, e.pubkey, e.created_at, e.kind, e.content, e.sig,
+                    e.tags, e.raw, e.relay_url, e.received_at,
+                    ts_rank(e.content_tsv, query) AS text_rank
+                FROM events e, plainto_tsquery('english', $1) query
+                WHERE e.kind = 1 AND e.content_tsv @@ query
+                ORDER BY ts_rank(e.content_tsv, query) DESC
+                LIMIT 200
+            )
+            SELECT
+                r.id, r.pubkey, r.created_at, r.kind, r.content, r.sig,
+                r.tags, r.raw, r.relay_url, r.received_at
+            FROM ranked r
+            LEFT JOIN LATERAL (
+                SELECT
+                    COUNT(*) FILTER (WHERE ref_type = 'reaction') AS reaction_count,
+                    COUNT(*) FILTER (WHERE ref_type IN ('reply', 'root')) AS reply_count,
+                    COUNT(*) FILTER (WHERE ref_type = 'repost') AS repost_count,
+                    COUNT(*) FILTER (WHERE ref_type = 'zap') AS zap_count
+                FROM event_refs
+                WHERE target_event_id = r.id
+            ) eng ON TRUE
+            ORDER BY (
+                r.text_rank * 1000 +
+                LN(
+                    COALESCE(eng.reaction_count, 0) * 100 +
+                    COALESCE(eng.reply_count, 0) * 500 +
+                    COALESCE(eng.repost_count, 0) * 1000 +
+                    COALESCE(eng.zap_count, 0) * 2000 + 1
+                ) * 10 +
+                CASE
+                    WHEN r.created_at > EXTRACT(EPOCH FROM NOW())::bigint - 86400 THEN 50
+                    WHEN r.created_at > EXTRACT(EPOCH FROM NOW())::bigint - 604800 THEN 25
+                    ELSE 0
+                END
+            ) DESC
+            LIMIT $2
+            "#,
+        )
+        .bind(query)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows)
+    }
+
     /// Refresh the profile_search materialized view (CONCURRENTLY to avoid blocking reads).
     pub async fn refresh_profile_search(&self) -> Result<(), AppError> {
         sqlx::query("REFRESH MATERIALIZED VIEW CONCURRENTLY profile_search")
