@@ -939,70 +939,59 @@ impl EventRepository {
     ) -> Result<Vec<TrendingNote>, AppError> {
         let since = chrono::Utc::now().timestamp() - 86400;
 
+        // Two-phase approach for speed:
+        // Phase 1: Find top target_event_ids by distinct-author engagement count
+        //          using idx_event_refs_reftype_created. No expensive joins.
+        // Phase 2: Compute full engagement breakdown only for those top N.
         let rows = sqlx::query(
             r#"
-            WITH credible_actors AS (
-                SELECT followed_pubkey AS pubkey
-                FROM follows
-                GROUP BY followed_pubkey
-                HAVING COUNT(*) >= 10
-            ),
-            zap_amounts AS (
-                SELECT
-                    event_id,
-                    MAX(
-                        CASE WHEN tag_value ~ '^[0-9]+$' THEN tag_value::bigint ELSE 0 END
-                    ) AS amount_msats
-                FROM event_tags
-                WHERE tag_name = 'amount'
-                GROUP BY event_id
-            ),
-            -- Zap sats counted from ALL senders (real money = legitimate signal)
-            all_zaps AS (
+            WITH top_candidates AS (
                 SELECT
                     r.target_event_id,
-                    COUNT(*)::bigint AS zap_count,
-                    COALESCE(SUM(COALESCE(za.amount_msats, 0) / 1000), 0)::bigint AS zap_sats
-                FROM event_refs r
-                LEFT JOIN zap_amounts za ON za.event_id = r.source_event_id
-                WHERE r.ref_type = 'zap' AND r.created_at >= $1
-                GROUP BY r.target_event_id
-            ),
-            -- Free engagement filtered to credible actors only
-            credible_engagement AS (
-                SELECT
-                    r.target_event_id,
-                    COUNT(*) FILTER (WHERE r.ref_type = 'repost')   AS repost_count,
-                    COUNT(*) FILTER (WHERE r.ref_type IN ('reply', 'root')) AS reply_count,
-                    COUNT(*) FILTER (WHERE r.ref_type = 'reaction') AS reaction_count
+                    COUNT(DISTINCT src.pubkey) AS unique_engagers
                 FROM event_refs r
                 JOIN events src ON src.id = r.source_event_id
-                JOIN credible_actors ca ON ca.pubkey = src.pubkey
-                WHERE r.ref_type IN ('repost', 'reply', 'root', 'reaction')
+                WHERE r.ref_type IN ('reaction', 'reply', 'root', 'repost', 'zap')
                   AND r.created_at >= $1
                 GROUP BY r.target_event_id
+                ORDER BY unique_engagers DESC
+                LIMIT 200
             ),
-            note_engagement AS (
+            full_engagement AS (
                 SELECT
-                    COALESCE(az.target_event_id, ce.target_event_id) AS target_event_id,
-                    COALESCE(az.zap_count, 0)      AS zap_count,
-                    COALESCE(az.zap_sats, 0)        AS zap_sats,
-                    COALESCE(ce.repost_count, 0)    AS repost_count,
-                    COALESCE(ce.reply_count, 0)     AS reply_count,
-                    COALESCE(ce.reaction_count, 0)  AS reaction_count
-                FROM all_zaps az
-                FULL OUTER JOIN credible_engagement ce ON ce.target_event_id = az.target_event_id
+                    r.target_event_id,
+                    COUNT(DISTINCT src2.pubkey) FILTER (WHERE r.ref_type = 'reaction') AS reaction_count,
+                    COUNT(DISTINCT src2.pubkey) FILTER (WHERE r.ref_type IN ('reply', 'root')) AS reply_count,
+                    COUNT(DISTINCT src2.pubkey) FILTER (WHERE r.ref_type = 'repost') AS repost_count,
+                    COALESCE(SUM(
+                        CASE WHEN r.ref_type = 'zap' THEN COALESCE(za.amount_msats, 0) ELSE 0 END
+                    ), 0)::bigint AS zap_total_msats
+                FROM event_refs r
+                JOIN events src2 ON src2.id = r.source_event_id
+                LEFT JOIN (
+                    SELECT event_id,
+                           MAX(CASE WHEN tag_value ~ '^[0-9]+$' THEN tag_value::bigint ELSE 0 END) AS amount_msats
+                    FROM event_tags WHERE tag_name = 'amount' GROUP BY event_id
+                ) za ON za.event_id = r.source_event_id
+                WHERE r.target_event_id IN (SELECT target_event_id FROM top_candidates)
+                GROUP BY r.target_event_id
             )
             SELECT
                 e.id, e.pubkey, e.created_at, e.kind, e.content, e.sig, e.tags, e.raw,
                 e.relay_url, e.received_at,
-                ne.zap_sats,
-                ne.repost_count,
-                ne.reply_count,
-                ne.reaction_count,
-                (ne.zap_sats + ne.repost_count * 1000 + ne.reply_count * 500 + ne.reaction_count * 100)::bigint AS score
-            FROM note_engagement ne
-            JOIN events e ON e.id = ne.target_event_id AND e.kind = 1
+                (COALESCE(fe.zap_total_msats, 0) / 1000)::bigint AS zap_sats,
+                COALESCE(fe.repost_count, 0)::bigint AS repost_count,
+                COALESCE(fe.reply_count, 0)::bigint AS reply_count,
+                COALESCE(fe.reaction_count, 0)::bigint AS reaction_count,
+                (
+                    COALESCE(fe.zap_total_msats, 0) / 1000
+                    + COALESCE(fe.repost_count, 0) * 1000
+                    + COALESCE(fe.reply_count, 0) * 500
+                    + COALESCE(fe.reaction_count, 0) * 100
+                )::bigint AS score
+            FROM top_candidates tc
+            JOIN events e ON e.id = tc.target_event_id AND e.kind = 1
+            LEFT JOIN full_engagement fe ON fe.target_event_id = tc.target_event_id
             ORDER BY score DESC, e.created_at DESC
             LIMIT $2 OFFSET $3
             "#,
@@ -1867,34 +1856,107 @@ impl EventRepository {
     /// Ranked by recency (newest first). Filters out spam by requiring the
     /// author to have at least 3 followers — cheap credibility check that
     /// eliminates bots and throwaway accounts without a heavy engagement join.
-    pub async fn search_notes_by_hashtag(
+    /// Find notes tagged with a specific hashtag (via event_tags `t` tag).
+    /// Returns notes with engagement stats, ordered by engagement score then recency.
+    pub async fn notes_by_hashtag(
         &self,
         hashtag: &str,
         limit: i64,
-    ) -> Result<Vec<StoredEvent>, AppError> {
-        // Regex: word-boundary match for #hashtag (case-insensitive via ~*)
-        let pattern = format!(r"(?<!\w)#{}(?!\w)", regex_escape(hashtag));
+        offset: i64,
+    ) -> Result<(Vec<TrendingNote>, Vec<ProfileRow>), AppError> {
+        let tag_lower = hashtag.trim().to_lowercase();
 
-        let rows = sqlx::query_as::<_, StoredEvent>(
+        let rows = sqlx::query(
             r#"
+            WITH tagged_notes AS (
+                SELECT DISTINCT e.id, e.pubkey, e.created_at, e.kind, e.content, e.sig,
+                       e.tags, e.raw, e.relay_url, e.received_at
+                FROM event_tags et
+                JOIN events e ON e.id = et.event_id AND e.kind = 1
+                WHERE et.tag_name = 't'
+                  AND LOWER(et.tag_value) = $1
+                ORDER BY e.created_at DESC
+                LIMIT 200
+            ),
+            engagement AS (
+                SELECT
+                    r.target_event_id,
+                    COUNT(*) FILTER (WHERE r.ref_type = 'reaction')::bigint AS reaction_count,
+                    COUNT(*) FILTER (WHERE r.ref_type IN ('reply', 'root'))::bigint AS reply_count,
+                    COUNT(*) FILTER (WHERE r.ref_type = 'repost')::bigint AS repost_count,
+                    COALESCE(SUM(
+                        CASE WHEN r.ref_type = 'zap' THEN COALESCE(za.amount_msats, 0) ELSE 0 END
+                    ), 0)::bigint AS zap_total_msats
+                FROM event_refs r
+                LEFT JOIN (
+                    SELECT event_id,
+                           MAX(CASE WHEN tag_value ~ '^[0-9]+$' THEN tag_value::bigint ELSE 0 END) AS amount_msats
+                    FROM event_tags WHERE tag_name = 'amount' GROUP BY event_id
+                ) za ON za.event_id = r.source_event_id
+                WHERE r.target_event_id IN (SELECT id FROM tagged_notes)
+                GROUP BY r.target_event_id
+            )
             SELECT
-                e.id, e.pubkey, e.created_at, e.kind, e.content, e.sig,
-                e.tags, e.raw, e.relay_url, e.received_at
-            FROM events e
-            JOIN profile_search ps ON ps.pubkey = e.pubkey AND ps.follower_count >= 3
-            WHERE e.kind = 1
-              AND e.content ~* $1
-              AND regexp_count(e.content, '(?<!\w)#\w+') <= 5
-            ORDER BY e.created_at DESC
-            LIMIT $2
+                tn.id, tn.pubkey, tn.created_at, tn.kind, tn.content, tn.sig,
+                tn.tags, tn.raw, tn.relay_url, tn.received_at,
+                (COALESCE(eng.zap_total_msats, 0) / 1000)::bigint AS zap_sats,
+                COALESCE(eng.repost_count, 0)::bigint AS repost_count,
+                COALESCE(eng.reply_count, 0)::bigint AS reply_count,
+                COALESCE(eng.reaction_count, 0)::bigint AS reaction_count,
+                (
+                    COALESCE(eng.zap_total_msats, 0) / 1000
+                    + COALESCE(eng.repost_count, 0) * 1000
+                    + COALESCE(eng.reply_count, 0) * 500
+                    + COALESCE(eng.reaction_count, 0) * 100
+                )::bigint AS score
+            FROM tagged_notes tn
+            LEFT JOIN engagement eng ON eng.target_event_id = tn.id
+            ORDER BY score DESC, tn.created_at DESC
+            LIMIT $2 OFFSET $3
             "#,
         )
-        .bind(&pattern)
+        .bind(&tag_lower)
         .bind(limit)
+        .bind(offset)
         .fetch_all(&self.pool)
         .await?;
 
-        Ok(rows)
+        let mut pubkeys = Vec::new();
+        let notes = rows
+            .into_iter()
+            .map(|row| -> Result<TrendingNote, sqlx::Error> {
+                let pubkey: String = row.try_get("pubkey")?;
+                pubkeys.push(pubkey.clone());
+                let event = StoredEvent {
+                    id: row.try_get("id")?,
+                    pubkey,
+                    created_at: row.try_get("created_at")?,
+                    kind: row.try_get("kind")?,
+                    content: row.try_get("content")?,
+                    sig: row.try_get("sig")?,
+                    tags: row.try_get("tags")?,
+                    raw: row.try_get("raw")?,
+                    relay_url: row.try_get("relay_url").ok(),
+                    received_at: row.try_get("received_at")?,
+                };
+                Ok(TrendingNote {
+                    event,
+                    score: row.try_get("score")?,
+                    zap_sats: row.try_get("zap_sats")?,
+                    reposts: row.try_get("repost_count")?,
+                    replies: row.try_get("reply_count")?,
+                    reactions: row.try_get("reaction_count")?,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let unique_pubkeys: Vec<String> = {
+            let mut seen = HashSet::new();
+            pubkeys.into_iter().filter(|pk| seen.insert(pk.clone())).collect()
+        };
+        let profiles = self.latest_profile_metadata(&unique_pubkeys).await?;
+
+        Ok((notes, profiles))
     }
 
     /// Refresh the profile_search materialized view (CONCURRENTLY to avoid blocking reads).
@@ -1944,22 +2006,6 @@ impl EventRepository {
 
 enum BindValue {
     Text(String),
-}
-
-/// Escape special regex characters in user input to prevent regex injection.
-fn regex_escape(s: &str) -> String {
-    let mut escaped = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '\\' | '.' | '+' | '*' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '^'
-            | '$' => {
-                escaped.push('\\');
-                escaped.push(c);
-            }
-            _ => escaped.push(c),
-        }
-    }
-    escaped
 }
 
 fn is_hex_pubkey(value: &str) -> bool {

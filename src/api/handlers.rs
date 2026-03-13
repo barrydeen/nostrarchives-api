@@ -899,6 +899,57 @@ pub async fn get_trending_hashtags(
     Ok(Json(response))
 }
 
+/// Get notes tagged with a specific hashtag: `GET /v1/hashtags/:tag/notes?limit=20&offset=0`
+pub async fn get_hashtag_notes(
+    State(state): State<AppState>,
+    Path(tag): Path<String>,
+    Query(q): Query<ListingQuery>,
+) -> Result<Json<Value>, AppError> {
+    let tag = tag.trim().to_lowercase();
+    if tag.is_empty() || tag.len() > 100 {
+        return Err(AppError::BadRequest("invalid hashtag".into()));
+    }
+
+    let limit = clamp_listing_limit(q.limit);
+    let offset = clamp_offset(q.offset);
+
+    let cache_key = format!("hashtag:{}:{limit}:{offset}", tag);
+    if let Some(cached) = state.cache.get_json(&cache_key).await {
+        if let Ok(val) = serde_json::from_str::<Value>(&cached) {
+            return Ok(Json(val));
+        }
+    }
+
+    let (notes, profile_rows) = state.repo.notes_by_hashtag(&tag, limit, offset).await?;
+
+    let profiles: HashMap<String, Value> = profile_rows
+        .into_iter()
+        .filter_map(|row| {
+            serde_json::from_str::<Value>(&row.content).ok().map(|v| {
+                let entry = json!({
+                    "name": v.get("name").and_then(|n| n.as_str()).filter(|s| !s.trim().is_empty()),
+                    "display_name": v.get("display_name").or_else(|| v.get("displayName")).and_then(|n| n.as_str()).filter(|s| !s.trim().is_empty()),
+                    "picture": v.get("picture").or_else(|| v.get("image")).and_then(|n| n.as_str()).filter(|s| !s.trim().is_empty()),
+                    "nip05": v.get("nip05").and_then(|n| n.as_str()).filter(|s| !s.trim().is_empty()),
+                });
+                (row.pubkey.clone(), entry)
+            })
+        })
+        .collect();
+
+    let response = json!({
+        "hashtag": tag,
+        "notes": notes,
+        "profiles": profiles,
+    });
+
+    if let Ok(json_str) = serde_json::to_string(&response) {
+        state.cache.set_json(&cache_key, &json_str, 300).await;
+    }
+
+    Ok(Json(response))
+}
+
 fn decode_npub(npub: &str) -> Result<String, AppError> {
     let (hrp, data, _) =
         bech32::decode(npub).map_err(|_| AppError::BadRequest(format!("invalid npub: {npub}")))?;
