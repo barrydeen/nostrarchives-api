@@ -173,17 +173,102 @@ async fn handle_req(arr: &[Value], state: &AppState, feed_kind: &FeedKind) -> Ve
     }
 }
 
-/// Search relay: existing NIP-50 behavior (stub — returns EOSE for now).
-async fn handle_search_req(sub_id: &str, filters: &[Value], _state: &AppState) -> Vec<String> {
+/// NIP-50 search relay: handles kind 0 (profiles) and kind 1 (notes) search.
+///
+/// Protocol:
+///   Client: ["REQ", "<sub_id>", {"search": "<query>", "kinds": [0], "limit": 20}]
+///   Relay:  ["EVENT", "<sub_id>", <raw_event>] ... ["EOSE", "<sub_id>"]
+///
+/// - Kind 0 (profiles): ranked by name match quality, follower count, engagement
+/// - Kind 1 (notes): full-text search ranked by relevance + engagement + recency
+/// - No kinds filter: searches both kinds
+async fn handle_search_req(sub_id: &str, filters: &[Value], state: &AppState) -> Vec<String> {
+    let mut messages = Vec::new();
+
     for filter in filters {
-        if let Some(search_term) = filter.get("search").and_then(|v| v.as_str()) {
-            tracing::info!(sub_id = %sub_id, search = %search_term, "NIP-50 search request");
-        } else {
-            tracing::debug!(sub_id = %sub_id, "REQ with non-search filter (not yet supported)");
+        let search_term = match filter.get("search").and_then(|v| v.as_str()) {
+            Some(s) if !s.trim().is_empty() => s.trim(),
+            _ => {
+                tracing::debug!(sub_id = %sub_id, "REQ filter without search term, skipping");
+                continue;
+            }
+        };
+
+        let limit = filter
+            .get("limit")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(20)
+            .clamp(1, 200);
+
+        // Determine which kinds to search
+        let kinds: Vec<i64> = filter
+            .get("kinds")
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().filter_map(|v| v.as_i64()).collect())
+            .unwrap_or_default();
+
+        let search_profiles = kinds.is_empty() || kinds.contains(&0);
+        let search_notes = kinds.is_empty() || kinds.contains(&1);
+
+        tracing::info!(
+            sub_id = %sub_id,
+            search = %search_term,
+            kinds = ?kinds,
+            limit = limit,
+            "NIP-50 search request"
+        );
+
+        // Search profiles (kind 0)
+        if search_profiles {
+            match state.repo.search_profiles_as_events(search_term, limit).await {
+                Ok(events) => {
+                    tracing::info!(
+                        sub_id = %sub_id,
+                        results = events.len(),
+                        "profile search completed"
+                    );
+                    for event in events {
+                        let event_msg = serde_json::to_string(
+                            &serde_json::json!(["EVENT", sub_id, event.raw.0]),
+                        )
+                        .expect("json serialization cannot fail");
+                        messages.push(event_msg);
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "profile search failed");
+                    messages.push(notice(&format!("error: profile search failed: {e}")));
+                }
+            }
+        }
+
+        // Search notes (kind 1)
+        if search_notes {
+            match state.repo.search_notes_as_events(search_term, limit).await {
+                Ok(events) => {
+                    tracing::info!(
+                        sub_id = %sub_id,
+                        results = events.len(),
+                        "note search completed"
+                    );
+                    for event in events {
+                        let event_msg = serde_json::to_string(
+                            &serde_json::json!(["EVENT", sub_id, event.raw.0]),
+                        )
+                        .expect("json serialization cannot fail");
+                        messages.push(event_msg);
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "note search failed");
+                    messages.push(notice(&format!("error: note search failed: {e}")));
+                }
+            }
         }
     }
 
-    vec![eose(sub_id)]
+    messages.push(eose(sub_id));
+    messages
 }
 
 // ---------------------------------------------------------------------------
