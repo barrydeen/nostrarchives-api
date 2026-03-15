@@ -338,6 +338,32 @@ impl EventRepository {
             .collect())
     }
 
+    /// Latest kind-0 (profile metadata) events for a list of pubkeys.
+    /// Returns raw StoredEvents suitable for relay EVENT responses.
+    pub async fn profile_events_for_pubkeys(
+        &self,
+        pubkeys: &[String],
+    ) -> Result<Vec<StoredEvent>, AppError> {
+        if pubkeys.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let rows = sqlx::query_as::<_, StoredEvent>(
+            r#"
+            SELECT DISTINCT ON (pubkey)
+                id, pubkey, created_at, kind, content, sig, tags, raw, relay_url, received_at
+            FROM events
+            WHERE kind = 0 AND pubkey = ANY($1)
+            ORDER BY pubkey, created_at DESC
+            "#,
+        )
+        .bind(pubkeys)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows)
+    }
+
     /// Get a single event by ID.
     pub async fn get_event_by_id(&self, id: &str) -> Result<Option<StoredEvent>, AppError> {
         let event = sqlx::query_as::<_, StoredEvent>(
