@@ -1069,30 +1069,32 @@ impl EventRepository {
         offset: i64,
     ) -> Result<Vec<TrendingUser>, AppError> {
         let since = chrono::Utc::now().timestamp() - 86400;
-        let account_age_cutoff = chrono::Utc::now().timestamp() - (90 * 86400); // 3 months
 
         // "Up and coming" users: most new followers in the last 24h,
-        // but only accounts whose first event is within the last 3 months.
+        // but only accounts with fewer than 500 total followers.
+        // We can't use MIN(created_at) from events as account age because
+        // the crawler backfills — established accounts look "new" if we
+        // only recently ingested their events. Total follower count is a
+        // reliable proxy for whether someone is genuinely emerging.
         let rows = sqlx::query_as::<_, (String, i64)>(
             r#"
-            WITH young_accounts AS (
-                SELECT pubkey
-                FROM events
-                GROUP BY pubkey
-                HAVING MIN(created_at) >= $3
+            WITH follower_counts AS (
+                SELECT followed_pubkey, COUNT(DISTINCT follower_pubkey) AS total_followers
+                FROM follows
+                GROUP BY followed_pubkey
+                HAVING COUNT(DISTINCT follower_pubkey) < 500
             )
             SELECT f.followed_pubkey, COUNT(DISTINCT f.follower_pubkey) AS new_followers
             FROM follows f
-            JOIN young_accounts ya ON ya.pubkey = f.followed_pubkey
+            JOIN follower_counts fc ON fc.followed_pubkey = f.followed_pubkey
             WHERE f.created_at >= $1
             GROUP BY f.followed_pubkey
             ORDER BY new_followers DESC
-            LIMIT $2 OFFSET $4
+            LIMIT $2 OFFSET $3
             "#,
         )
         .bind(since)
         .bind(limit)
-        .bind(account_age_cutoff)
         .bind(offset)
         .fetch_all(&self.pool)
         .await?;
