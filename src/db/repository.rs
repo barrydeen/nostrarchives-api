@@ -1098,21 +1098,13 @@ impl EventRepository {
 
         // "Up and coming" users: most new followers in the last 24h,
         // but only accounts with fewer than 500 total followers.
-        // We can't use MIN(created_at) from events as account age because
-        // the crawler backfills — established accounts look "new" if we
-        // only recently ingested their events. Total follower count is a
-        // reliable proxy for whether someone is genuinely emerging.
+        // Uses profile_search materialized view for fast follower_count
+        // filtering instead of scanning the entire follows table.
         let rows = sqlx::query_as::<_, (String, i64)>(
             r#"
-            WITH follower_counts AS (
-                SELECT followed_pubkey, COUNT(DISTINCT follower_pubkey) AS total_followers
-                FROM follows
-                GROUP BY followed_pubkey
-                HAVING COUNT(DISTINCT follower_pubkey) < 500
-            )
             SELECT f.followed_pubkey, COUNT(DISTINCT f.follower_pubkey) AS new_followers
             FROM follows f
-            JOIN follower_counts fc ON fc.followed_pubkey = f.followed_pubkey
+            JOIN profile_search ps ON ps.pubkey = f.followed_pubkey AND ps.follower_count < 500
             WHERE f.created_at >= $1
             GROUP BY f.followed_pubkey
             ORDER BY new_followers DESC
