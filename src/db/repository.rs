@@ -1069,19 +1069,30 @@ impl EventRepository {
         offset: i64,
     ) -> Result<Vec<TrendingUser>, AppError> {
         let since = chrono::Utc::now().timestamp() - 86400;
+        let account_age_cutoff = chrono::Utc::now().timestamp() - (90 * 86400); // 3 months
 
+        // "Up and coming" users: most new followers in the last 24h,
+        // but only accounts whose first event is within the last 3 months.
         let rows = sqlx::query_as::<_, (String, i64)>(
             r#"
-            SELECT followed_pubkey, COUNT(DISTINCT follower_pubkey) AS new_followers
-            FROM follows
-            WHERE created_at >= $1
-            GROUP BY followed_pubkey
+            WITH young_accounts AS (
+                SELECT pubkey
+                FROM events
+                GROUP BY pubkey
+                HAVING MIN(created_at) >= $3
+            )
+            SELECT f.followed_pubkey, COUNT(DISTINCT f.follower_pubkey) AS new_followers
+            FROM follows f
+            JOIN young_accounts ya ON ya.pubkey = f.followed_pubkey
+            WHERE f.created_at >= $1
+            GROUP BY f.followed_pubkey
             ORDER BY new_followers DESC
-            LIMIT $2 OFFSET $3
+            LIMIT $2 OFFSET $4
             "#,
         )
         .bind(since)
         .bind(limit)
+        .bind(account_age_cutoff)
         .bind(offset)
         .fetch_all(&self.pool)
         .await?;
