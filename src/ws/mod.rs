@@ -509,9 +509,23 @@ async fn handle_upandcoming_req(
     filters: &[Value],
     state: &AppState,
 ) -> Vec<String> {
-    let limit = filters
-        .first()
-        .and_then(|f| f.get("limit"))
+    let filter = filters.first().unwrap_or(&Value::Null);
+
+    // Respect the kinds filter — this feed only serves kind 0 (profiles).
+    // If client requests specific kinds that don't include 0, return empty.
+    let kinds: Vec<i64> = filter
+        .get("kinds")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_i64()).collect())
+        .unwrap_or_default();
+
+    if !kinds.is_empty() && !kinds.contains(&0) {
+        tracing::debug!(sub_id = %sub_id, ?kinds, "up-and-coming: kinds filter excludes kind 0, returning empty");
+        return vec![eose(sub_id)];
+    }
+
+    let limit = filter
+        .get("limit")
         .and_then(|v| v.as_i64())
         .unwrap_or(20)
         .clamp(1, 100);
