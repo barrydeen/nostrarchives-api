@@ -532,31 +532,33 @@ async fn handle_upandcoming_req(
 
     tracing::info!(sub_id = %sub_id, limit = limit, "up-and-coming feed request");
 
-    // Try Redis cache first (same key the HTTP handler uses)
-    let cache_key = format!("home:trending_users:{limit}:0");
-    let pubkeys: Vec<String> = if let Some(cached) = state.cache.get_json(&cache_key).await {
-        if let Ok(val) = serde_json::from_str::<Value>(&cached) {
-            val.get("users")
-                .and_then(|u| u.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|u| u.get("pubkey")?.as_str().map(String::from))
-                        .collect()
-                })
-                .unwrap_or_default()
-        } else {
-            vec![]
-        }
-    } else {
-        match state.repo.trending_users(limit, 0).await {
-            Ok(users) => users.into_iter().map(|u| u.pubkey).collect(),
-            Err(e) => {
-                tracing::error!(error = %e, "up-and-coming query failed");
-                return vec![
-                    notice("error: failed to fetch up-and-coming users"),
-                    eose(sub_id),
-                ];
+    // Cache the full list of raw kind-0 event JSON so repeat requests are instant.
+    let cache_key = format!("ws:upandcoming:{limit}");
+
+    // Try cache first
+    if let Some(cached) = state.cache.get_json(&cache_key).await {
+        if let Ok(raw_events) = serde_json::from_str::<Vec<Value>>(&cached) {
+            let mut messages = Vec::with_capacity(raw_events.len() + 1);
+            for raw in &raw_events {
+                let msg = serde_json::to_string(&serde_json::json!(["EVENT", sub_id, raw]))
+                    .expect("json serialization cannot fail");
+                messages.push(msg);
             }
+            tracing::info!(sub_id = %sub_id, users = raw_events.len(), "up-and-coming feed served (cache hit)");
+            messages.push(eose(sub_id));
+            return messages;
+        }
+    }
+
+    // Cache miss — get trending user pubkeys
+    let pubkeys: Vec<String> = match state.repo.trending_users(limit, 0).await {
+        Ok(users) => users.into_iter().map(|u| u.pubkey).collect(),
+        Err(e) => {
+            tracing::error!(error = %e, "up-and-coming query failed");
+            return vec![
+                notice("error: failed to fetch up-and-coming users"),
+                eose(sub_id),
+            ];
         }
     };
 
@@ -564,24 +566,23 @@ async fn handle_upandcoming_req(
         return vec![eose(sub_id)];
     }
 
-    // Fetch latest kind-0 events for these pubkeys
+    // Fetch latest kind-0 events
     match state.repo.profile_events_for_pubkeys(&pubkeys).await {
         Ok(events) => {
+            let raw_events: Vec<&Value> = events.iter().map(|e| &e.raw.0).collect();
             let mut messages = Vec::with_capacity(events.len() + 1);
-            for event in &events {
-                let msg = serde_json::to_string(
-                    &serde_json::json!(["EVENT", sub_id, event.raw.0]),
-                )
-                .expect("json serialization cannot fail");
+            for raw in &raw_events {
+                let msg = serde_json::to_string(&serde_json::json!(["EVENT", sub_id, raw]))
+                    .expect("json serialization cannot fail");
                 messages.push(msg);
             }
 
-            tracing::info!(
-                sub_id = %sub_id,
-                users = events.len(),
-                "up-and-coming feed served"
-            );
+            // Cache for 5 minutes
+            if let Ok(json_str) = serde_json::to_string(&raw_events) {
+                state.cache.set_json(&cache_key, &json_str, 300).await;
+            }
 
+            tracing::info!(sub_id = %sub_id, users = events.len(), "up-and-coming feed served (cache miss)");
             messages.push(eose(sub_id));
             messages
         }
