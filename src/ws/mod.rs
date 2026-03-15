@@ -21,6 +21,8 @@ enum FeedKind {
     /// metric: "reactions" | "replies" | "reposts" | "zaps"
     /// range:  "today" | "7d" | "30d" | "1y" | "all"
     Trending { metric: String, range: String },
+    /// Up-and-coming users feed — returns a NIP-51 kind 30000 people list.
+    UpAndComing,
 }
 
 /// Build the WebSocket relay router.
@@ -33,6 +35,8 @@ pub fn router(state: AppState) -> Router {
             "/notes/trending/{metric}/{range}",
             any(ws_trending_handler),
         )
+        // Up-and-coming users feed
+        .route("/users/upandcoming", any(ws_upandcoming_handler))
         .with_state(state)
 }
 
@@ -62,6 +66,13 @@ async fn ws_search_handler(
     State(state): State<AppState>,
 ) -> impl IntoResponse {
     ws.on_upgrade(move |socket| handle_connection(socket, state, FeedKind::Search))
+}
+
+async fn ws_upandcoming_handler(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| handle_connection(socket, state, FeedKind::UpAndComing))
 }
 
 async fn ws_trending_handler(
@@ -169,6 +180,9 @@ async fn handle_req(arr: &[Value], state: &AppState, feed_kind: &FeedKind) -> Ve
         FeedKind::Search => handle_search_req(&sub_id, &arr[2..], state).await,
         FeedKind::Trending { metric, range } => {
             handle_trending_req(&sub_id, &arr[2..], state, metric, range).await
+        }
+        FeedKind::UpAndComing => {
+            handle_upandcoming_req(&sub_id, &arr[2..], state).await
         }
     }
 }
@@ -475,6 +489,92 @@ async fn handle_trending_req(
             );
             vec![
                 notice("error: failed to fetch trending notes"),
+                eose(sub_id),
+            ]
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Up-and-coming users feed handler
+// ---------------------------------------------------------------------------
+
+/// Up-and-coming users: returns kind-0 profile events for emerging users.
+///
+/// Protocol:
+///   Client: ["REQ", "<sub_id>", {"limit": 20}]
+///   Relay:  ["EVENT", "<sub_id>", <kind-0>] ... ["EOSE", "<sub_id>"]
+async fn handle_upandcoming_req(
+    sub_id: &str,
+    filters: &[Value],
+    state: &AppState,
+) -> Vec<String> {
+    let limit = filters
+        .first()
+        .and_then(|f| f.get("limit"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(20)
+        .clamp(1, 100);
+
+    tracing::info!(sub_id = %sub_id, limit = limit, "up-and-coming feed request");
+
+    // Try Redis cache first (same key the HTTP handler uses)
+    let cache_key = format!("home:trending_users:{limit}:0");
+    let pubkeys: Vec<String> = if let Some(cached) = state.cache.get_json(&cache_key).await {
+        if let Ok(val) = serde_json::from_str::<Value>(&cached) {
+            val.get("users")
+                .and_then(|u| u.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|u| u.get("pubkey")?.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            vec![]
+        }
+    } else {
+        match state.repo.trending_users(limit, 0).await {
+            Ok(users) => users.into_iter().map(|u| u.pubkey).collect(),
+            Err(e) => {
+                tracing::error!(error = %e, "up-and-coming query failed");
+                return vec![
+                    notice("error: failed to fetch up-and-coming users"),
+                    eose(sub_id),
+                ];
+            }
+        }
+    };
+
+    if pubkeys.is_empty() {
+        return vec![eose(sub_id)];
+    }
+
+    // Fetch latest kind-0 events for these pubkeys
+    match state.repo.profile_events_for_pubkeys(&pubkeys).await {
+        Ok(events) => {
+            let mut messages = Vec::with_capacity(events.len() + 1);
+            for event in &events {
+                let msg = serde_json::to_string(
+                    &serde_json::json!(["EVENT", sub_id, event.raw.0]),
+                )
+                .expect("json serialization cannot fail");
+                messages.push(msg);
+            }
+
+            tracing::info!(
+                sub_id = %sub_id,
+                users = events.len(),
+                "up-and-coming feed served"
+            );
+
+            messages.push(eose(sub_id));
+            messages
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "failed to fetch profile events");
+            vec![
+                notice("error: failed to fetch profile events"),
                 eose(sub_id),
             ]
         }
