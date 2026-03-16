@@ -577,9 +577,9 @@ async fn handle_upandcoming_req(
                 messages.push(msg);
             }
 
-            // Cache for 5 minutes
+            // Cache for 24 hours — this data changes slowly and initial load is expensive
             if let Ok(json_str) = serde_json::to_string(&raw_events) {
-                state.cache.set_json(&cache_key, &json_str, 300).await;
+                state.cache.set_json(&cache_key, &json_str, 86_400).await;
             }
 
             tracing::info!(sub_id = %sub_id, users = events.len(), "up-and-coming feed served (cache miss)");
