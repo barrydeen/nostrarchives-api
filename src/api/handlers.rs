@@ -413,7 +413,7 @@ pub async fn get_trending_users(
     let response = json!({ "users": users });
 
     if let Ok(json_str) = serde_json::to_string(&response) {
-        state.cache.set_json(&cache_key, &json_str, 300).await;
+        state.cache.set_json(&cache_key, &json_str, 86_400).await;
     }
 
     Ok(Json(response))
