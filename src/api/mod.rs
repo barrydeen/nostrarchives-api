@@ -3,6 +3,7 @@ pub mod handlers;
 use axum::middleware;
 use axum::routing::{get, post};
 use axum::Router;
+use std::net::IpAddr;
 use std::time::Duration;
 use tower_http::cors::CorsLayer;
 
@@ -63,8 +64,18 @@ async fn cache_control_middleware(
 
 /// Build the axum router with all routes.
 pub fn router(state: AppState) -> Router {
-    // 30 requests per minute per IP
-    let limiter = RateLimiter::new(120, Duration::from_secs(60));
+    // 120 requests per minute per IP
+    // Whitelist trusted server IPs (frontend SSR, localhost) to bypass rate limiting
+    let whitelist: Vec<IpAddr> = std::env::var("RATELIMIT_WHITELIST")
+        .unwrap_or_default()
+        .split(',')
+        .filter_map(|s| s.trim().parse().ok())
+        .collect();
+    if !whitelist.is_empty() {
+        tracing::info!("rate limiter: whitelisted IPs: {:?}", whitelist);
+    }
+    let limiter = RateLimiter::new(120, Duration::from_secs(60))
+        .with_whitelist(whitelist);
 
     // Rate-limited API routes
     let api_routes = Router::new()
