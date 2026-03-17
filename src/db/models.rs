@@ -194,3 +194,28 @@ pub struct RelayLeaderboardEntry {
     pub relay_url: String,
     pub user_count: i64,
 }
+
+/// A zap entry for profile zap activity tabs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProfileZapEntry {
+    pub event: StoredEvent,
+    pub amount_sats: i64,
+    /// The counterparty pubkey (sender for received, recipient for sent).
+    pub counterparty: Option<String>,
+    /// The event that was zapped (if any).
+    pub zapped_event_id: Option<String>,
+}
+
+/// Aggregate zap stats for a profile.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProfileZapStats {
+    pub pubkey: String,
+    pub sent: ZapAggregate,
+    pub received: ZapAggregate,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ZapAggregate {
+    pub total_sats: i64,
+    pub zap_count: i64,
+}

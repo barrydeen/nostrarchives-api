@@ -857,6 +857,259 @@ pub async fn advanced_note_search(
     })))
 }
 
+
+// ─── Profile Tabs ─────────────────────────────────────────────
+
+/// Profile notes (non-replies): GET /v1/profiles/{pubkey}/notes
+pub async fn get_profile_notes(
+    State(state): State<AppState>,
+    Path(pubkey): Path<String>,
+    Query(q): Query<ListingQuery>,
+) -> Result<Json<Value>, AppError> {
+    let pubkey = normalize_pubkey(&pubkey)?;
+    let limit = clamp_listing_limit(q.limit);
+    let offset = clamp_offset(q.offset);
+
+    let cache_key = format!("profile:notes:{pubkey}:{limit}:{offset}");
+    if let Some(cached) = state.cache.get_json(&cache_key).await {
+        if let Ok(val) = serde_json::from_str::<Value>(&cached) {
+            return Ok(Json(val));
+        }
+    }
+
+    let (events, total) = state.repo.profile_notes(&pubkey, limit, offset).await?;
+
+    let event_ids: Vec<String> = events.iter().map(|e| e.id.clone()).collect();
+    let interactions = state.repo.batch_get_interactions(&event_ids).await?;
+
+    let mut profile_pubkeys: HashSet<String> = events.iter().map(|e| e.pubkey.clone()).collect();
+    profile_pubkeys.insert(pubkey.clone());
+
+    let profile_rows = state
+        .repo
+        .latest_profile_metadata(&profile_pubkeys.into_iter().collect::<Vec<_>>())
+        .await?;
+    let profiles = build_profiles_map(profile_rows);
+
+    let enriched = enrich_events_with_interactions(&events, &interactions);
+
+    let response = json!({
+        "events": enriched,
+        "total": total,
+        "profiles": profiles,
+    });
+
+    if let Ok(json_str) = serde_json::to_string(&response) {
+        state.cache.set_json(&cache_key, &json_str, 60).await;
+    }
+
+    Ok(Json(response))
+}
+
+/// Profile replies: GET /v1/profiles/{pubkey}/replies
+pub async fn get_profile_replies(
+    State(state): State<AppState>,
+    Path(pubkey): Path<String>,
+    Query(q): Query<ListingQuery>,
+) -> Result<Json<Value>, AppError> {
+    let pubkey = normalize_pubkey(&pubkey)?;
+    let limit = clamp_listing_limit(q.limit);
+    let offset = clamp_offset(q.offset);
+
+    let cache_key = format!("profile:replies:{pubkey}:{limit}:{offset}");
+    if let Some(cached) = state.cache.get_json(&cache_key).await {
+        if let Ok(val) = serde_json::from_str::<Value>(&cached) {
+            return Ok(Json(val));
+        }
+    }
+
+    let (events, total) = state.repo.profile_replies(&pubkey, limit, offset).await?;
+
+    let event_ids: Vec<String> = events.iter().map(|e| e.id.clone()).collect();
+    let interactions = state.repo.batch_get_interactions(&event_ids).await?;
+
+    let mut profile_pubkeys: HashSet<String> = events.iter().map(|e| e.pubkey.clone()).collect();
+    profile_pubkeys.insert(pubkey.clone());
+
+    let profile_rows = state
+        .repo
+        .latest_profile_metadata(&profile_pubkeys.into_iter().collect::<Vec<_>>())
+        .await?;
+    let profiles = build_profiles_map(profile_rows);
+
+    let enriched = enrich_events_with_interactions(&events, &interactions);
+
+    let response = json!({
+        "events": enriched,
+        "total": total,
+        "profiles": profiles,
+    });
+
+    if let Ok(json_str) = serde_json::to_string(&response) {
+        state.cache.set_json(&cache_key, &json_str, 60).await;
+    }
+
+    Ok(Json(response))
+}
+
+/// Zaps sent by profile: GET /v1/profiles/{pubkey}/zaps/sent
+pub async fn get_profile_zaps_sent(
+    State(state): State<AppState>,
+    Path(pubkey): Path<String>,
+    Query(q): Query<ListingQuery>,
+) -> Result<Json<Value>, AppError> {
+    let pubkey = normalize_pubkey(&pubkey)?;
+    let limit = clamp_listing_limit(q.limit);
+    let offset = clamp_offset(q.offset);
+
+    let cache_key = format!("profile:zaps_sent:{pubkey}:{limit}:{offset}");
+    if let Some(cached) = state.cache.get_json(&cache_key).await {
+        if let Ok(val) = serde_json::from_str::<Value>(&cached) {
+            return Ok(Json(val));
+        }
+    }
+
+    let (entries, total, profile_rows) = state.repo.profile_zaps_sent(&pubkey, limit, offset).await?;
+    let profiles = build_profiles_map(profile_rows);
+
+    let zaps: Vec<Value> = entries
+        .iter()
+        .map(|e| {
+            json!({
+                "event": e.event,
+                "amount_sats": e.amount_sats,
+                "recipient": e.counterparty,
+                "zapped_event_id": e.zapped_event_id,
+            })
+        })
+        .collect();
+
+    let response = json!({
+        "zaps": zaps,
+        "total": total,
+        "profiles": profiles,
+    });
+
+    if let Ok(json_str) = serde_json::to_string(&response) {
+        state.cache.set_json(&cache_key, &json_str, 120).await;
+    }
+
+    Ok(Json(response))
+}
+
+/// Zaps received by profile: GET /v1/profiles/{pubkey}/zaps/received
+pub async fn get_profile_zaps_received(
+    State(state): State<AppState>,
+    Path(pubkey): Path<String>,
+    Query(q): Query<ListingQuery>,
+) -> Result<Json<Value>, AppError> {
+    let pubkey = normalize_pubkey(&pubkey)?;
+    let limit = clamp_listing_limit(q.limit);
+    let offset = clamp_offset(q.offset);
+
+    let cache_key = format!("profile:zaps_recv:{pubkey}:{limit}:{offset}");
+    if let Some(cached) = state.cache.get_json(&cache_key).await {
+        if let Ok(val) = serde_json::from_str::<Value>(&cached) {
+            return Ok(Json(val));
+        }
+    }
+
+    let (entries, total, profile_rows) = state
+        .repo
+        .profile_zaps_received(&pubkey, limit, offset)
+        .await?;
+    let profiles = build_profiles_map(profile_rows);
+
+    let zaps: Vec<Value> = entries
+        .iter()
+        .map(|e| {
+            json!({
+                "event": e.event,
+                "amount_sats": e.amount_sats,
+                "sender": e.counterparty,
+                "zapped_event_id": e.zapped_event_id,
+            })
+        })
+        .collect();
+
+    let response = json!({
+        "zaps": zaps,
+        "total": total,
+        "profiles": profiles,
+    });
+
+    if let Ok(json_str) = serde_json::to_string(&response) {
+        state.cache.set_json(&cache_key, &json_str, 120).await;
+    }
+
+    Ok(Json(response))
+}
+
+/// Aggregate zap stats: GET /v1/profiles/{pubkey}/zap-stats
+pub async fn get_profile_zap_stats(
+    State(state): State<AppState>,
+    Path(pubkey): Path<String>,
+) -> Result<Json<Value>, AppError> {
+    let pubkey = normalize_pubkey(&pubkey)?;
+
+    let cache_key = format!("profile:zap_stats:{pubkey}");
+    if let Some(cached) = state.cache.get_json(&cache_key).await {
+        if let Ok(val) = serde_json::from_str::<Value>(&cached) {
+            return Ok(Json(val));
+        }
+    }
+
+    let stats = state.repo.profile_zap_stats(&pubkey).await?;
+    let response = serde_json::to_value(&stats).unwrap();
+
+    if let Ok(json_str) = serde_json::to_string(&response) {
+        state.cache.set_json(&cache_key, &json_str, 300).await;
+    }
+
+    Ok(Json(response))
+}
+
+// ─── Shared helpers for profile tabs ──────────────────────────
+
+fn build_profiles_map(
+    profile_rows: Vec<crate::db::repository::ProfileRow>,
+) -> HashMap<String, Value> {
+    profile_rows
+        .into_iter()
+        .filter_map(|row| {
+            serde_json::from_str::<Value>(&row.content).ok().map(|v| {
+                let entry = json!({
+                    "name": v.get("name").and_then(|n| n.as_str()).filter(|s| !s.trim().is_empty()),
+                    "display_name": v.get("display_name").or_else(|| v.get("displayName")).and_then(|n| n.as_str()).filter(|s| !s.trim().is_empty()),
+                    "picture": v.get("picture").or_else(|| v.get("image")).and_then(|n| n.as_str()).filter(|s| !s.trim().is_empty()),
+                    "nip05": v.get("nip05").and_then(|n| n.as_str()).filter(|s| !s.trim().is_empty()),
+                });
+                (row.pubkey.clone(), entry)
+            })
+        })
+        .collect()
+}
+
+fn enrich_events_with_interactions(
+    events: &[crate::db::models::StoredEvent],
+    interactions: &HashMap<String, crate::db::models::EventInteractions>,
+) -> Vec<Value> {
+    events
+        .iter()
+        .map(|e| {
+            let stats = interactions.get(&e.id);
+            let mut obj = serde_json::to_value(e).unwrap();
+            if let Some(map) = obj.as_object_mut() {
+                map.insert("reactions".into(), json!(stats.map_or(0, |s| s.reactions)));
+                map.insert("replies".into(), json!(stats.map_or(0, |s| s.replies)));
+                map.insert("reposts".into(), json!(stats.map_or(0, |s| s.reposts)));
+                map.insert("zap_sats".into(), json!(stats.map_or(0, |s| s.zap_sats)));
+            }
+            obj
+        })
+        .collect()
+}
+
 fn normalize_pubkey(input: &str) -> Result<String, AppError> {
     let trimmed = input.trim();
     if trimmed.is_empty() {

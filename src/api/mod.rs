@@ -101,6 +101,11 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/notes/search", get(handlers::advanced_note_search))
         .route("/v1/search", get(handlers::search))
         .route("/v1/search/suggest", get(handlers::search_suggest))
+        .route("/v1/profiles/{pubkey}/notes", get(handlers::get_profile_notes))
+        .route("/v1/profiles/{pubkey}/replies", get(handlers::get_profile_replies))
+        .route("/v1/profiles/{pubkey}/zaps/sent", get(handlers::get_profile_zaps_sent))
+        .route("/v1/profiles/{pubkey}/zaps/received", get(handlers::get_profile_zaps_received))
+        .route("/v1/profiles/{pubkey}/zap-stats", get(handlers::get_profile_zap_stats))
         .route("/v1/crawler/stats", get(handlers::get_crawler_stats))
         .route_layer(middleware::from_fn_with_state(
             limiter,
