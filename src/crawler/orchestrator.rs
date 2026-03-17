@@ -14,7 +14,9 @@ use crate::cache::StatsCache;
 use crate::db::models::NostrEvent;
 use crate::db::repository::EventRepository;
 
+use super::negentropy::NegentropySyncer;
 use super::queue::CrawlQueue;
+use super::relay_caps;
 use super::relay_router::RelayRouter;
 
 /// Configuration for the hybrid crawler.
@@ -193,8 +195,8 @@ impl HybridCrawler {
     }
 
     /// Run one cycle of negentropy bulk sync.
-    /// Currently a placeholder — actual negentropy sync will be wired in
-    /// once the negentropy and relay_caps modules are ready.
+    /// Discovers top relays, probes for NIP-77 support, and runs set reconciliation
+    /// against capable relays.
     async fn negentropy_sync_cycle(&self) {
         let top_relays = match self
             .router
@@ -218,22 +220,85 @@ impl HybridCrawler {
             "negentropy cycle: starting bulk sync"
         );
 
-        for (relay_url, user_count) in &top_relays {
-            // Placeholder: would check relay capabilities here
-            tracing::debug!(
-                relay = %relay_url,
-                users = user_count,
-                "would check caps for relay"
-            );
+        let syncer = NegentropySyncer::new(
+            self.repo.clone(),
+            self.cache.clone(),
+            self.pool.clone(),
+        );
 
-            // Placeholder: would negentropy sync with capable relays
-            tracing::debug!(
-                relay = %relay_url,
-                "would negentropy sync with relay"
-            );
+        let mut total_discovered = 0usize;
+        let mut total_inserted = 0usize;
+        let mut relays_synced = 0usize;
+
+        for (relay_url, user_count) in &top_relays {
+            // Check relay capabilities (NIP-11 + NEG-OPEN probe with DB caching)
+            let caps = match relay_caps::check_and_update_caps(&self.pool, relay_url).await {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::debug!(
+                        relay = %relay_url,
+                        error = %e,
+                        "negentropy cycle: capability check failed"
+                    );
+                    continue;
+                }
+            };
+
+            if !caps.supports_negentropy {
+                tracing::debug!(
+                    relay = %relay_url,
+                    users = user_count,
+                    "negentropy cycle: relay does not support negentropy, skipping"
+                );
+                continue;
+            }
+
+            if self.config.dry_run {
+                tracing::info!(
+                    relay = %relay_url,
+                    users = user_count,
+                    "negentropy cycle: DRY RUN — would sync with relay"
+                );
+                continue;
+            }
+
+            // Run negentropy sync
+            match syncer.run_sync(relay_url).await {
+                Ok(stats) => {
+                    total_discovered += stats.events_discovered;
+                    total_inserted += stats.events_inserted;
+                    relays_synced += 1;
+                    self.total_events
+                        .fetch_add(stats.events_inserted as u64, Ordering::Relaxed);
+                    tracing::info!(
+                        relay = %relay_url,
+                        discovered = stats.events_discovered,
+                        inserted = stats.events_inserted,
+                        duration_ms = stats.duration_ms,
+                        "negentropy cycle: relay sync complete"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        relay = %relay_url,
+                        error = %e,
+                        "negentropy cycle: sync failed"
+                    );
+                }
+            }
+
+            // Brief delay between relays to be polite
+            if self.config.legacy_request_delay_ms > 0 {
+                sleep(Duration::from_millis(self.config.legacy_request_delay_ms)).await;
+            }
         }
 
-        tracing::info!("negentropy cycle: complete (placeholder — no actual sync yet)");
+        tracing::info!(
+            relays_synced = relays_synced,
+            total_discovered = total_discovered,
+            total_inserted = total_inserted,
+            "negentropy cycle: complete"
+        );
     }
 
     /// Run one cycle of relay-list-aware targeted crawling.
