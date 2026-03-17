@@ -1180,14 +1180,13 @@ impl EventRepository {
                 r#"
                 WITH zap_data AS (
                     SELECT
-                        (t_desc.tag_value::jsonb)->>'pubkey' AS sender,
+                        LOWER(substring(t_desc.tag_value from '"pubkey"\s*:\s*"([0-9a-fA-F]{64})"')) AS sender,
                         CASE WHEN t_amt.tag_value ~ '^[0-9]+$'
                              THEN t_amt.tag_value::bigint ELSE 0 END AS amount_msats
                     FROM events e
                     JOIN event_tags t_amt ON t_amt.event_id = e.id AND t_amt.tag_name = 'amount'
                     JOIN event_tags t_desc ON t_desc.event_id = e.id AND t_desc.tag_name = 'description'
                     WHERE e.kind = 9735 AND e.created_at >= $1
-                      AND t_desc.tag_value LIKE '{%'
                 )
                 SELECT sender AS pubkey,
                        (SUM(amount_msats) / 1000)::bigint AS total_sats,
@@ -2361,8 +2360,7 @@ impl EventRepository {
             FROM events e
             JOIN event_tags t_desc ON t_desc.event_id = e.id AND t_desc.tag_name = 'description'
             WHERE e.kind = 9735
-              AND t_desc.tag_value LIKE '{%'
-              AND (t_desc.tag_value::jsonb)->>'pubkey' = $1
+              AND LOWER(substring(t_desc.tag_value from '"pubkey"\s*:\s*"([0-9a-fA-F]{64})"')) = $1
             "#,
         )
         .bind(pubkey)
@@ -2384,8 +2382,7 @@ impl EventRepository {
             FROM events e
             JOIN event_tags t_desc ON t_desc.event_id = e.id AND t_desc.tag_name = 'description'
             WHERE e.kind = 9735
-              AND t_desc.tag_value LIKE '{%'
-              AND (t_desc.tag_value::jsonb)->>'pubkey' = $1
+              AND LOWER(substring(t_desc.tag_value from '"pubkey"\s*:\s*"([0-9a-fA-F]{64})"')) = $1
             ORDER BY e.created_at DESC
             LIMIT $2 OFFSET $3
             "#,
@@ -2464,8 +2461,8 @@ impl EventRepository {
                      FROM event_tags t_amt WHERE t_amt.event_id = e.id AND t_amt.tag_name = 'amount' LIMIT 1),
                     0
                 ) AS amount_msats,
-                (SELECT (t_desc.tag_value::jsonb)->>'pubkey'
-                 FROM event_tags t_desc WHERE t_desc.event_id = e.id AND t_desc.tag_name = 'description' AND t_desc.tag_value LIKE '{%' LIMIT 1) AS sender,
+                (SELECT LOWER(substring(t_desc.tag_value from '"pubkey"\s*:\s*"([0-9a-fA-F]{64})"'))
+                 FROM event_tags t_desc WHERE t_desc.event_id = e.id AND t_desc.tag_name = 'description' LIMIT 1) AS sender,
                 (SELECT t_e.tag_value FROM event_tags t_e WHERE t_e.event_id = e.id AND t_e.tag_name = 'e' LIMIT 1) AS zapped_event_id
             FROM events e
             JOIN event_tags t_p ON t_p.event_id = e.id AND t_p.tag_name = 'p'
@@ -2537,8 +2534,7 @@ impl EventRepository {
             JOIN event_tags t_desc ON t_desc.event_id = e.id AND t_desc.tag_name = 'description'
             JOIN event_tags t_amt ON t_amt.event_id = e.id AND t_amt.tag_name = 'amount'
             WHERE e.kind = 9735
-              AND t_desc.tag_value LIKE '{%'
-              AND (t_desc.tag_value::jsonb)->>'pubkey' = $1
+              AND LOWER(substring(t_desc.tag_value from '"pubkey"\s*:\s*"([0-9a-fA-F]{64})"')) = $1
             "#,
         )
         .bind(pubkey)
