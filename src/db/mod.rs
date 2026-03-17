@@ -68,6 +68,10 @@ async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
             "010_relay_capabilities",
             include_str!("../../migrations/010_relay_capabilities.sql"),
         ),
+        (
+            "011_negentropy_sync_state",
+            include_str!("../../migrations/011_negentropy_sync_state.sql"),
+        ),
     ];
 
     for (name, sql) in migrations {

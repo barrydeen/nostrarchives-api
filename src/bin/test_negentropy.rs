@@ -264,7 +264,7 @@ async fn cmd_sync(pool: &sqlx::PgPool, relay_url: &str, dry_run: bool) {
         println!("  This will reconcile, fetch, and INSERT events into the database.\n");
 
         match syncer
-            .run_sync_window(relay_url, Some(since), Some(now))
+            .run_sync_window(relay_url, &[1], Some(since), Some(now))
             .await
         {
             Ok(stats) => {
