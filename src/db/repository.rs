@@ -11,6 +11,7 @@ use crate::error::AppError;
 #[derive(Clone)]
 pub struct EventRepository {
     pool: PgPool,
+    min_follower_threshold: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -31,8 +32,8 @@ pub struct ProfileRow {
 }
 
 impl EventRepository {
-    pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+    pub fn new(pool: PgPool, min_follower_threshold: i64) -> Self {
+        Self { pool, min_follower_threshold }
     }
 
     /// Return a clone of the underlying connection pool.
@@ -46,6 +47,22 @@ impl EventRepository {
         event: &NostrEvent,
         relay_url: &str,
     ) -> Result<bool, AppError> {
+        // Check follower threshold for content events (skip profile/follow list events)
+        // We need profiles (kind 0) and follow lists (kind 3) to build the social graph
+        let skip_threshold_check = matches!(event.kind, 0 | 3);
+        
+        if !skip_threshold_check && self.min_follower_threshold > 0 {
+            if !self.meets_follower_threshold(&event.pubkey, self.min_follower_threshold).await? {
+                tracing::debug!(
+                    pubkey = %event.pubkey, 
+                    kind = event.kind,
+                    threshold = self.min_follower_threshold,
+                    "Skipping event from author below follower threshold"
+                );
+                return Ok(false); // Return false to indicate not inserted
+            }
+        }
+
         let raw = serde_json::to_value(event).unwrap_or_default();
         let tags_json = serde_json::to_value(&event.tags).unwrap_or_default();
 
@@ -867,6 +884,23 @@ impl EventRepository {
                 .await?;
 
         Ok((follows_count, followers_count))
+    }
+
+    /// Check if a pubkey meets the minimum follower threshold.
+    /// Uses the profile_search materialized view for performance.
+    /// Returns true if the author has enough followers or if no profile data exists
+    /// (to avoid blocking new users who haven't been crawled yet).
+    pub async fn meets_follower_threshold(&self, pubkey: &str, min_threshold: i64) -> Result<bool, AppError> {
+        let follower_count: Option<i64> = sqlx::query_scalar(
+            "SELECT follower_count FROM profile_search WHERE pubkey = $1"
+        )
+        .bind(pubkey)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        // If no profile data exists, allow the event (new users need to build followers)
+        // If profile exists, check threshold
+        Ok(follower_count.map_or(true, |count| count >= min_threshold))
     }
 
     /// Two-phase optimized trending query:

@@ -80,7 +80,7 @@ async fn main() {
         .expect("failed to connect to database");
     tracing::info!("database connected, migrations applied");
 
-    let repo = db::repository::EventRepository::new(pool);
+    let repo = db::repository::EventRepository::new(pool, cfg.min_follower_threshold);
 
     if cfg.social_graph_bootstrap {
         let builder_repo = repo.clone();
