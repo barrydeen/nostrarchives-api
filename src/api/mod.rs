@@ -30,7 +30,9 @@ async fn cache_control_middleware(
         return response;
     }
 
-    let max_age = if path.contains("/notes/top") {
+    let max_age = if path.contains("/analytics/") {
+        3600
+    } else if path.contains("/notes/top") {
         300
     } else if path.contains("/stats") {
         120
@@ -95,6 +97,7 @@ pub fn router(state: AppState) -> Router {
 
         .route("/v1/clients/leaderboard", get(handlers::get_client_leaderboard))
         .route("/v1/relays/leaderboard", get(handlers::get_relay_leaderboard))
+        .route("/v1/analytics/daily", get(handlers::get_analytics_daily))
         .route("/v1/notes/search", get(handlers::advanced_note_search))
         .route("/v1/search", get(handlers::search))
         .route("/v1/search/suggest", get(handlers::search_suggest))

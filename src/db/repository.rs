@@ -2122,6 +2122,95 @@ impl EventRepository {
             })
             .collect())
     }
+
+    // ─── Daily Analytics ─────────────────────────────────────────────
+
+    /// Compute and upsert daily analytics for a specific date.
+    pub async fn compute_daily_analytics(
+        &self,
+        date: chrono::NaiveDate,
+    ) -> Result<(), AppError> {
+        let start_ts = date
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc()
+            .timestamp();
+        let end_ts = start_ts + 86400;
+
+        sqlx::query(
+            r#"
+            INSERT INTO daily_analytics (date, active_users, zaps_sent, notes_posted, computed_at)
+            SELECT
+                $1::date,
+                COUNT(DISTINCT pubkey)::bigint,
+                COUNT(*) FILTER (WHERE kind = 9735)::bigint,
+                COUNT(*) FILTER (WHERE kind = 1)::bigint,
+                NOW()
+            FROM events
+            WHERE created_at >= $2 AND created_at < $3
+            ON CONFLICT (date) DO UPDATE SET
+                active_users = EXCLUDED.active_users,
+                zaps_sent = EXCLUDED.zaps_sent,
+                notes_posted = EXCLUDED.notes_posted,
+                computed_at = EXCLUDED.computed_at
+            "#,
+        )
+        .bind(date)
+        .bind(start_ts)
+        .bind(end_ts)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Fetch daily analytics rows between two dates inclusive, ordered by date ASC.
+    pub async fn get_daily_analytics(
+        &self,
+        since: chrono::NaiveDate,
+        until: chrono::NaiveDate,
+    ) -> Result<Vec<super::models::DailyAnalyticsRow>, AppError> {
+        let rows = sqlx::query_as::<_, super::models::DailyAnalyticsRow>(
+            "SELECT date, active_users, zaps_sent, notes_posted, computed_at
+             FROM daily_analytics
+             WHERE date >= $1 AND date <= $2
+             ORDER BY date ASC",
+        )
+        .bind(since)
+        .bind(until)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows)
+    }
+
+    /// Backfill daily analytics for the last N days, skipping dates that already have data.
+    /// Returns the count of days computed.
+    pub async fn backfill_daily_analytics(&self, days: i64) -> Result<i64, AppError> {
+        let today = chrono::Utc::now().date_naive();
+        let mut computed = 0i64;
+
+        for i in 1..=days {
+            let date = today - chrono::Duration::days(i);
+
+            // Skip if already computed
+            let exists: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM daily_analytics WHERE date = $1)",
+            )
+            .bind(date)
+            .fetch_one(&self.pool)
+            .await?;
+
+            if exists {
+                continue;
+            }
+
+            self.compute_daily_analytics(date).await?;
+            computed += 1;
+        }
+
+        Ok(computed)
+    }
 }
 
 enum BindValue {

@@ -202,6 +202,37 @@ async fn main() {
         }
     });
 
+    // Background: compute daily analytics.
+    // On startup: backfill last 30 days. Then loop: sleep until next midnight UTC, compute yesterday.
+    let analytics_repo = repo.clone();
+    tokio::spawn(async move {
+        // Backfill on startup
+        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        match analytics_repo.backfill_daily_analytics(30).await {
+            Ok(n) => tracing::info!(days_computed = n, "daily analytics backfill complete"),
+            Err(e) => tracing::warn!("daily analytics backfill failed: {e}"),
+        }
+
+        // Daily loop: sleep until next midnight UTC, then compute yesterday
+        loop {
+            let now = chrono::Utc::now();
+            let tomorrow_midnight = (now.date_naive() + chrono::Duration::days(1))
+                .and_hms_opt(0, 0, 0)
+                .unwrap()
+                .and_utc();
+            let sleep_duration = (tomorrow_midnight - now)
+                .to_std()
+                .unwrap_or(std::time::Duration::from_secs(3600));
+            tokio::time::sleep(sleep_duration).await;
+
+            let yesterday = chrono::Utc::now().date_naive() - chrono::Duration::days(1);
+            match analytics_repo.compute_daily_analytics(yesterday).await {
+                Ok(()) => tracing::info!(date = %yesterday, "daily analytics computed"),
+                Err(e) => tracing::warn!(date = %yesterday, "daily analytics computation failed: {e}"),
+            }
+        }
+    });
+
     // HTTP API
     let state = api::AppState {
         repo,
