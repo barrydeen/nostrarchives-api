@@ -200,10 +200,18 @@ async fn handle_search_req(sub_id: &str, filters: &[Value], state: &AppState) ->
     let mut messages = Vec::new();
 
     for filter in filters {
+        // Check if this filter has a #t tag filter (NIP-01 tag query)
+        let has_t_filter = filter
+            .get("#t")
+            .and_then(|v| v.as_array())
+            .map(|a| !a.is_empty())
+            .unwrap_or(false);
+
         let search_term = match filter.get("search").and_then(|v| v.as_str()) {
             Some(s) if !s.trim().is_empty() => s.trim(),
+            _ if has_t_filter => "", // Allow empty search when #t filter is present
             _ => {
-                tracing::debug!(sub_id = %sub_id, "REQ filter without search term, skipping");
+                tracing::debug!(sub_id = %sub_id, "REQ filter without search term or #t filter, skipping");
                 continue;
             }
         };
@@ -224,26 +232,54 @@ async fn handle_search_req(sub_id: &str, filters: &[Value], state: &AppState) ->
         let search_profiles = kinds.is_empty() || kinds.contains(&0);
         let search_notes = kinds.is_empty() || kinds.contains(&1);
 
-        // Detect hashtag search: query starts with '#'
+        // NIP-01 `#t` tag filter: array of hashtag values (OR semantics)
+        let tag_filter: Vec<String> = filter
+            .get("#t")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // Detect hashtag search via search field: query starts with '#'
         let is_hashtag = search_term.starts_with('#') && search_term.len() > 1;
-        let hashtag = if is_hashtag { &search_term[1..] } else { "" };
+
+        // Merge: #t tag filter takes priority, but also support "#tag" in search field
+        let hashtags: Vec<String> = if !tag_filter.is_empty() {
+            tag_filter
+        } else if is_hashtag {
+            // Support space-separated hashtags: "#bitcoin #nostr"
+            search_term
+                .split_whitespace()
+                .filter_map(|w| w.strip_prefix('#'))
+                .filter(|t| !t.is_empty())
+                .map(|t| t.to_string())
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        let has_hashtag_filter = !hashtags.is_empty();
 
         tracing::info!(
             sub_id = %sub_id,
             search = %search_term,
             kinds = ?kinds,
             limit = limit,
-            hashtag = is_hashtag,
+            hashtags = ?hashtags,
             "NIP-50 search request"
         );
 
         // Hashtag search: skip profiles, use tag-based lookup for notes
-        if is_hashtag && search_notes {
-            match state.repo.notes_by_hashtag(hashtag, limit, 0).await {
+        if has_hashtag_filter && search_notes {
+            match state.repo.notes_by_hashtags(&hashtags, limit, 0).await {
                 Ok((notes, _profiles)) => {
                     tracing::info!(
                         sub_id = %sub_id,
-                        hashtag = %hashtag,
+                        hashtags = ?hashtags,
                         results = notes.len(),
                         "hashtag search completed"
                     );
@@ -261,8 +297,8 @@ async fn handle_search_req(sub_id: &str, filters: &[Value], state: &AppState) ->
                 }
             }
         } else {
-            // Search profiles (kind 0) — skip for hashtag queries
-            if search_profiles && !is_hashtag {
+            // Search profiles (kind 0) — skip for hashtag queries and empty search
+            if search_profiles && !has_hashtag_filter && !search_term.is_empty() {
                 match state.repo.search_profiles_as_events(search_term, limit).await {
                     Ok(events) => {
                         tracing::info!(
@@ -285,8 +321,8 @@ async fn handle_search_req(sub_id: &str, filters: &[Value], state: &AppState) ->
                 }
             }
 
-            // Search notes (kind 1) — full-text search
-            if search_notes && !is_hashtag {
+            // Search notes (kind 1) — full-text search (skip when hashtag filter or empty search)
+            if search_notes && !has_hashtag_filter && !search_term.is_empty() {
                 match state.repo.search_notes_as_events(search_term, limit).await {
                     Ok(events) => {
                         tracing::info!(

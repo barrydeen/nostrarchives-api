@@ -1895,7 +1895,26 @@ impl EventRepository {
         limit: i64,
         offset: i64,
     ) -> Result<(Vec<TrendingNote>, Vec<ProfileRow>), AppError> {
-        let tag_lower = hashtag.trim().to_lowercase();
+        self.notes_by_hashtags(&[hashtag.to_string()], limit, offset).await
+    }
+
+    /// Fetch notes matching ANY of the given hashtags, ranked by engagement score.
+    /// Implements NIP-01 `#t` tag filter semantics (OR across values).
+    pub async fn notes_by_hashtags(
+        &self,
+        hashtags: &[String],
+        limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<TrendingNote>, Vec<ProfileRow>), AppError> {
+        let tags_lower: Vec<String> = hashtags
+            .iter()
+            .map(|t| t.trim().to_lowercase())
+            .filter(|t| !t.is_empty())
+            .collect();
+
+        if tags_lower.is_empty() {
+            return Ok((Vec::new(), Vec::new()));
+        }
 
         let rows = sqlx::query(
             r#"
@@ -1905,7 +1924,7 @@ impl EventRepository {
                 FROM event_tags et
                 JOIN events e ON e.id = et.event_id AND e.kind = 1
                 WHERE et.tag_name = 't'
-                  AND LOWER(et.tag_value) = $1
+                  AND LOWER(et.tag_value) = ANY($1)
                 ORDER BY e.created_at DESC
                 LIMIT 200
             ),
@@ -1946,7 +1965,7 @@ impl EventRepository {
             LIMIT $2 OFFSET $3
             "#,
         )
-        .bind(&tag_lower)
+        .bind(&tags_lower)
         .bind(limit)
         .bind(offset)
         .fetch_all(&self.pool)
