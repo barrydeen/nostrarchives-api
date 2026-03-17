@@ -12,7 +12,7 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Response},
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -24,6 +24,8 @@ pub struct RateLimiter {
     inner: Arc<Mutex<RateLimiterInner>>,
     max_requests: u32,
     window: Duration,
+    /// IPs that bypass rate limiting entirely (e.g. trusted frontend servers).
+    whitelisted: Arc<HashSet<IpAddr>>,
 }
 
 struct RateLimiterInner {
@@ -44,7 +46,19 @@ impl RateLimiter {
             })),
             max_requests,
             window,
+            whitelisted: Arc::new(HashSet::new()),
         }
+    }
+
+    /// Add IPs that should bypass rate limiting (e.g. trusted frontend servers).
+    pub fn with_whitelist(mut self, ips: Vec<IpAddr>) -> Self {
+        self.whitelisted = Arc::new(ips.into_iter().collect());
+        self
+    }
+
+    /// Returns true if the given IP is whitelisted.
+    fn is_whitelisted(&self, ip: &IpAddr) -> bool {
+        self.whitelisted.contains(ip)
     }
 
     /// Check if a request from `ip` is allowed. Returns the number of
@@ -125,6 +139,11 @@ pub async fn rate_limit_middleware(
             return next.run(req).await;
         }
     };
+
+    // Whitelisted IPs bypass rate limiting entirely
+    if limiter.is_whitelisted(&ip) {
+        return next.run(req).await;
+    }
 
     match limiter.check(ip).await {
         Ok(remaining) => {
