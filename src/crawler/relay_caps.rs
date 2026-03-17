@@ -7,6 +7,20 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 use crate::error::AppError;
 
+/// Normalize a relay URL: lowercase, strip trailing slash, ensure wss:// prefix.
+pub fn normalize_relay_url(url: &str) -> String {
+    let mut u = url.trim().to_lowercase();
+    // Strip trailing slash
+    while u.ends_with('/') {
+        u.pop();
+    }
+    // Ensure scheme
+    if !u.starts_with("wss://") && !u.starts_with("ws://") {
+        u = format!("wss://{u}");
+    }
+    u
+}
+
 /// Relay capabilities detected via NIP-11 and NEG-OPEN probing.
 #[derive(Debug, Clone)]
 pub struct RelayCaps {
@@ -257,7 +271,8 @@ pub async fn discover_relays_from_nip65(
         r#"
         SELECT relay_url, COUNT(DISTINCT pubkey) AS user_count
         FROM (
-            SELECT pubkey, tag_arr->>1 AS relay_url
+            SELECT pubkey,
+                   RTRIM(LOWER(tag_arr->>1), '/') AS relay_url
             FROM events,
                  jsonb_array_elements(tags) AS tag_arr
             WHERE kind = 10002
@@ -265,6 +280,7 @@ pub async fn discover_relays_from_nip65(
               AND tag_arr->>1 IS NOT NULL
               AND tag_arr->>1 != ''
         ) sub
+        WHERE relay_url LIKE 'wss://%' OR relay_url LIKE 'ws://%'
         GROUP BY relay_url
         ORDER BY user_count DESC
         "#,

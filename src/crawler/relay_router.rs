@@ -123,7 +123,7 @@ impl RelayRouter {
             relay_urls AS (
                 SELECT
                     lrl.pubkey,
-                    tag ->> 1 AS relay_url
+                    RTRIM(LOWER(tag ->> 1), '/') AS relay_url
                 FROM latest_relay_lists lrl,
                      jsonb_array_elements(lrl.tags::jsonb) AS tag
                 WHERE tag ->> 0 = 'r'
@@ -132,6 +132,7 @@ impl RelayRouter {
             )
             SELECT relay_url, COUNT(DISTINCT pubkey) AS user_count
             FROM relay_urls
+            WHERE relay_url LIKE 'wss://%' OR relay_url LIKE 'ws://%'
             GROUP BY relay_url
             ORDER BY user_count DESC
             LIMIT $1
@@ -159,8 +160,8 @@ fn parse_relay_tags(tags: &[Vec<String>]) -> Vec<RelayPreference> {
             continue;
         }
 
-        let url = &tag[1];
-        if url.is_empty() {
+        let url = tag[1].trim().to_lowercase().trim_end_matches('/').to_string();
+        if url.is_empty() || (!url.starts_with("wss://") && !url.starts_with("ws://")) {
             continue;
         }
 

@@ -262,8 +262,9 @@ impl HybridCrawler {
                 continue;
             }
 
-            // Run negentropy sync
-            match syncer.run_sync(relay_url).await {
+            // Run windowed negentropy sync (24h windows, up to 7 back = 1 week)
+            let window_secs = self.config.negentropy_sync_interval_secs.max(86400) as i64;
+            match syncer.run_sync_windowed(relay_url, Some(window_secs), 7).await {
                 Ok(stats) => {
                     total_discovered += stats.events_discovered;
                     total_inserted += stats.events_inserted;
