@@ -205,6 +205,7 @@ async fn main() {
     // Background: compute daily analytics.
     // On startup: backfill last 30 days. Then loop: sleep until next midnight UTC, compute yesterday.
     let analytics_repo = repo.clone();
+    let analytics_cache = stats_cache.clone();
     tokio::spawn(async move {
         // Backfill on startup
         tokio::time::sleep(std::time::Duration::from_secs(10)).await;
@@ -227,7 +228,13 @@ async fn main() {
 
             let yesterday = chrono::Utc::now().date_naive() - chrono::Duration::days(1);
             match analytics_repo.compute_daily_analytics(yesterday).await {
-                Ok(()) => tracing::info!(date = %yesterday, "daily analytics computed"),
+                Ok(()) => {
+                    tracing::info!(date = %yesterday, "daily analytics computed");
+                    // Invalidate cached responses so users see fresh data immediately
+                    for days in [7, 30, 365] {
+                        analytics_cache.delete_json(&format!("analytics:daily:{days}")).await;
+                    }
+                }
                 Err(e) => tracing::warn!(date = %yesterday, "daily analytics computation failed: {e}"),
             }
         }

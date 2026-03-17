@@ -1015,7 +1015,7 @@ pub struct DailyAnalyticsQuery {
 /// GET /v1/analytics/daily?days=30
 ///
 /// Returns daily analytics for the last N days (default 30, max 365).
-/// Redis-cached for 1 hour.
+/// Redis-cached for 24 hours (data is immutable once computed).
 pub async fn get_analytics_daily(
     State(state): State<AppState>,
     Query(q): Query<DailyAnalyticsQuery>,
@@ -1043,7 +1043,7 @@ pub async fn get_analytics_daily(
     });
 
     if let Ok(json_str) = serde_json::to_string(&response) {
-        state.cache.set_json(&cache_key, &json_str, 3600).await;
+        state.cache.set_json(&cache_key, &json_str, 86400).await;
     }
 
     Ok(Json(response))
