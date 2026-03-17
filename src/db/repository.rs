@@ -86,7 +86,6 @@ impl EventRepository {
         let inserted = result.rows_affected() > 0;
 
         if inserted {
-            self.insert_tags(&event.id, &event.tags).await?;
             self.insert_refs(event).await?;
             // For zap receipts (kind 9735), extract the amount from the embedded
             // zap request in the "description" tag (NIP-57).
@@ -168,32 +167,6 @@ impl EventRepository {
         tx.commit().await?;
 
         Ok(Some(followees.len()))
-    }
-
-    /// Extract and insert normalized tags for fast querying.
-    async fn insert_tags(&self, event_id: &str, tags: &[Vec<String>]) -> Result<(), AppError> {
-        for tag in tags {
-            if tag.len() < 2 {
-                continue;
-            }
-            let tag_name = &tag[0];
-            let tag_value = &tag[1];
-            let extra: Vec<&String> = tag.iter().skip(2).collect();
-            let extra_json = serde_json::to_value(&extra).unwrap_or_default();
-
-            sqlx::query(
-                "INSERT INTO event_tags (event_id, tag_name, tag_value, extra_values)
-                 VALUES ($1, $2, $3, $4)
-                 ON CONFLICT DO NOTHING",
-            )
-            .bind(event_id)
-            .bind(tag_name)
-            .bind(tag_value)
-            .bind(&extra_json)
-            .execute(&self.pool)
-            .await?;
-        }
-        Ok(())
     }
 
     /// Extract event references from tags and insert into event_refs.
@@ -280,8 +253,7 @@ impl EventRepository {
 
     /// Extract zap metadata from a kind-9735 zap receipt's embedded zap request.
     /// The "description" tag contains a JSON-encoded kind-9734 event whose tags
-    /// include ["amount", "<msats>"]. We insert a synthetic amount tag into event_tags
-    /// and persist normalized zap metadata for fast profile queries.
+    /// include ["amount", "<msats>"]. We persist normalized zap metadata for fast profile queries.
     async fn extract_zap_metadata(&self, event: &NostrEvent) -> Result<(), AppError> {
         let description = event
             .tags
@@ -289,7 +261,6 @@ impl EventRepository {
             .find(|t| t.len() >= 2 && t[0] == "description")
             .map(|t| &t[1]);
 
-        let mut amount_tag_value: Option<String> = None;
         let mut amount_msats: i64 = 0;
         let mut sender_pubkey: Option<String> = None;
 
@@ -305,7 +276,6 @@ impl EventRepository {
                         let Some(arr) = tag.as_array() else { continue };
                         if arr.len() >= 2 && arr[0].as_str() == Some("amount") {
                             if let Some(raw) = arr[1].as_str() {
-                                amount_tag_value = Some(raw.to_string());
                                 if let Ok(parsed) = raw.parse::<i64>() {
                                     amount_msats = parsed;
                                 }
@@ -315,18 +285,6 @@ impl EventRepository {
                     }
                 }
             }
-        }
-
-        if let Some(amount) = amount_tag_value.as_deref() {
-            sqlx::query(
-                "INSERT INTO event_tags (event_id, tag_name, tag_value, extra_values)
-                 VALUES ($1, 'amount', $2, '[]')
-                 ON CONFLICT DO NOTHING",
-            )
-            .bind(&event.id)
-            .bind(amount)
-            .execute(&self.pool)
-            .await?;
         }
 
         let recipient_pubkey = event
@@ -617,27 +575,14 @@ impl EventRepository {
                 COALESCE(
                     SUM(
                         CASE
-                            WHEN r.ref_type = 'zap' THEN COALESCE(za.amount_msats, 0)
+                            WHEN r.ref_type = 'zap' THEN COALESCE(zm.amount_msats, 0)
                             ELSE 0
                         END
                     ),
                     0
                 )::bigint AS zap_total_msats
             FROM event_refs r
-            LEFT JOIN LATERAL (
-                SELECT
-                    COALESCE(
-                        MAX(
-                            CASE
-                                WHEN tag_value ~ '^[0-9]+$' THEN tag_value::bigint
-                                ELSE 0
-                            END
-                        ),
-                        0
-                    ) AS amount_msats
-                FROM event_tags
-                WHERE event_id = r.source_event_id AND tag_name = 'amount'
-            ) za ON TRUE
+            LEFT JOIN zap_metadata zm ON zm.event_id = r.source_event_id
             WHERE r.target_event_id = $1
             "#,
         )
@@ -665,26 +610,15 @@ impl EventRepository {
 
         let rows = sqlx::query(
             r#"
-            WITH zap_amounts AS (
-                SELECT
-                    event_id,
-                    COALESCE(
-                        MAX(CASE WHEN tag_value ~ '^[0-9]+$' THEN tag_value::bigint ELSE 0 END),
-                        0
-                    ) AS amount_msats
-                FROM event_tags
-                WHERE tag_name = 'amount'
-                GROUP BY event_id
-            )
             SELECT
                 r.target_event_id AS event_id,
                 COUNT(*) FILTER (WHERE r.ref_type IN ('reply', 'root')) AS replies,
                 COUNT(*) FILTER (WHERE r.ref_type = 'reaction') AS reactions,
                 COUNT(*) FILTER (WHERE r.ref_type = 'repost') AS reposts,
                 COUNT(*) FILTER (WHERE r.ref_type = 'zap') AS zaps,
-                COALESCE(SUM(CASE WHEN r.ref_type = 'zap' THEN COALESCE(za.amount_msats, 0) ELSE 0 END), 0)::bigint AS zap_total_msats
+                COALESCE(SUM(CASE WHEN r.ref_type = 'zap' THEN COALESCE(zm.amount_msats, 0) ELSE 0 END), 0)::bigint AS zap_total_msats
             FROM event_refs r
-            LEFT JOIN zap_amounts za ON za.event_id = r.source_event_id
+            LEFT JOIN zap_metadata zm ON zm.event_id = r.source_event_id
             WHERE r.target_event_id = ANY($1)
             GROUP BY r.target_event_id
             "#,
@@ -915,26 +849,21 @@ impl EventRepository {
                     -- Count DISTINCT authors so bot/thread chains don't inflate rankings
                     COUNT(DISTINCT src.pubkey) AS metric_count,
                     CASE WHEN $1 = 'zap' THEN
-                        COALESCE(SUM(
-                            CASE WHEN et.tag_value ~ '^[0-9]+$' THEN et.tag_value::bigint ELSE 0 END
-                        ), 0)::bigint
+                        COALESCE(SUM(COALESCE(zm.amount_msats, 0)), 0)::bigint
                     ELSE 0::bigint END AS zap_total_msats
                 FROM event_refs r
                 JOIN events src ON src.id = r.source_event_id
                 LEFT JOIN credible_actors ca ON ca.pubkey = src.pubkey
-                LEFT JOIN event_tags et
+                LEFT JOIN zap_metadata zm
                     ON $1 = 'zap'
-                    AND et.event_id = r.source_event_id
-                    AND et.tag_name = 'amount'
+                    AND zm.event_id = r.source_event_id
                 WHERE (r.ref_type = $1 OR ($1 = 'reply' AND r.ref_type = 'root'))
                   AND ($2::bigint IS NULL OR r.created_at >= $2)
                   AND ($1 = 'zap' OR ca.pubkey IS NOT NULL)
                 GROUP BY r.target_event_id
                 ORDER BY
                     CASE WHEN $1 = 'zap' THEN
-                        COALESCE(SUM(
-                            CASE WHEN et.tag_value ~ '^[0-9]+$' THEN et.tag_value::bigint ELSE 0 END
-                        ), 0)::bigint
+                        COALESCE(SUM(COALESCE(zm.amount_msats, 0)), 0)::bigint
                     ELSE COUNT(DISTINCT src.pubkey)
                     END DESC
                 LIMIT $3 OFFSET $4
@@ -947,15 +876,11 @@ impl EventRepository {
                     COUNT(DISTINCT src2.pubkey) FILTER (WHERE r.ref_type IN ('reply', 'root')) AS replies,
                     COUNT(DISTINCT src2.pubkey) FILTER (WHERE r.ref_type = 'repost')   AS reposts,
                     COALESCE(SUM(
-                        CASE WHEN r.ref_type = 'zap' THEN COALESCE(za.amount_msats, 0) ELSE 0 END
+                        CASE WHEN r.ref_type = 'zap' THEN COALESCE(zm.amount_msats, 0) ELSE 0 END
                     ), 0)::bigint AS zap_total_msats
                 FROM event_refs r
                 JOIN events src2 ON src2.id = r.source_event_id
-                LEFT JOIN (
-                    SELECT event_id,
-                           MAX(CASE WHEN tag_value ~ '^[0-9]+$' THEN tag_value::bigint ELSE 0 END) AS amount_msats
-                    FROM event_tags WHERE tag_name = 'amount' GROUP BY event_id
-                ) za ON za.event_id = r.source_event_id
+                LEFT JOIN zap_metadata zm ON zm.event_id = r.source_event_id
                 WHERE r.target_event_id IN (SELECT target_event_id FROM primary_metric)
                 GROUP BY r.target_event_id
             )
@@ -1062,15 +987,11 @@ impl EventRepository {
                     COUNT(DISTINCT src2.pubkey) FILTER (WHERE r.ref_type IN ('reply', 'root')) AS reply_count,
                     COUNT(DISTINCT src2.pubkey) FILTER (WHERE r.ref_type = 'repost') AS repost_count,
                     COALESCE(SUM(
-                        CASE WHEN r.ref_type = 'zap' THEN COALESCE(za.amount_msats, 0) ELSE 0 END
+                        CASE WHEN r.ref_type = 'zap' THEN COALESCE(zm.amount_msats, 0) ELSE 0 END
                     ), 0)::bigint AS zap_total_msats
                 FROM event_refs r
                 JOIN events src2 ON src2.id = r.source_event_id
-                LEFT JOIN (
-                    SELECT event_id,
-                           MAX(CASE WHEN tag_value ~ '^[0-9]+$' THEN tag_value::bigint ELSE 0 END) AS amount_msats
-                    FROM event_tags WHERE tag_name = 'amount' GROUP BY event_id
-                ) za ON za.event_id = r.source_event_id
+                LEFT JOIN zap_metadata zm ON zm.event_id = r.source_event_id
                 WHERE r.target_event_id IN (SELECT target_event_id FROM top_candidates)
                 GROUP BY r.target_event_id
             )
@@ -1218,11 +1139,9 @@ impl EventRepository {
         // Total sats: sum of zap receipt amounts in last 24h
         let total_sats: i64 = sqlx::query_scalar(
             r#"
-            SELECT COALESCE(SUM(
-                CASE WHEN et.tag_value ~ '^[0-9]+$' THEN et.tag_value::bigint ELSE 0 END
-            ) / 1000, 0)::bigint
-            FROM events e
-            JOIN event_tags et ON et.event_id = e.id AND et.tag_name = 'amount'
+            SELECT COALESCE(SUM(zm.amount_msats) / 1000, 0)::bigint
+            FROM zap_metadata zm
+            JOIN events e ON e.id = zm.event_id
             WHERE e.kind = 9735 AND e.created_at >= $1
             "#,
         )
@@ -1736,12 +1655,9 @@ impl EventRepository {
                     COUNT(*) FILTER (WHERE ref_type IN ('reply', 'root')) AS reply_count,
                     COUNT(*) FILTER (WHERE ref_type = 'repost') AS repost_count,
                     COUNT(*) FILTER (WHERE ref_type = 'zap') AS zap_count,
-                    COALESCE(SUM(CASE WHEN ref_type = 'zap' THEN COALESCE(za.amount_msats, 0) ELSE 0 END), 0)::bigint AS zap_total_msats
+                    COALESCE(SUM(CASE WHEN ref_type = 'zap' THEN COALESCE(zm.amount_msats, 0) ELSE 0 END), 0)::bigint AS zap_total_msats
                 FROM event_refs er2
-                LEFT JOIN (
-                    SELECT event_id, MAX(CASE WHEN tag_value ~ '^[0-9]+$' THEN tag_value::bigint ELSE 0 END) AS amount_msats
-                    FROM event_tags WHERE tag_name = 'amount' GROUP BY event_id
-                ) za ON za.event_id = er2.source_event_id
+                LEFT JOIN zap_metadata zm ON zm.event_id = er2.source_event_id
                 WHERE er2.target_event_id = e.id
             ) eng ON TRUE"#;
 
@@ -1941,7 +1857,6 @@ impl EventRepository {
     /// Ranked by recency (newest first). Filters out spam by requiring the
     /// author to have at least 3 followers — cheap credibility check that
     /// eliminates bots and throwaway accounts without a heavy engagement join.
-    /// Find notes tagged with a specific hashtag (via event_tags `t` tag).
     /// Returns notes with engagement stats, ordered by engagement score then recency.
     pub async fn notes_by_hashtag(
         &self,
@@ -1975,10 +1890,11 @@ impl EventRepository {
             WITH tagged_notes AS (
                 SELECT DISTINCT e.id, e.pubkey, e.created_at, e.kind, e.content, e.sig,
                        e.tags, e.raw, e.relay_url, e.received_at
-                FROM event_tags et
-                JOIN events e ON e.id = et.event_id AND e.kind = 1
-                WHERE et.tag_name = 't'
-                  AND LOWER(et.tag_value) = ANY($1)
+                FROM events e,
+                     jsonb_array_elements(e.tags) AS tag_elem
+                WHERE e.kind = 1
+                  AND tag_elem->>0 = 't'
+                  AND LOWER(tag_elem->>1) = ANY($1)
                 ORDER BY e.created_at DESC
                 LIMIT 200
             ),
@@ -1989,14 +1905,10 @@ impl EventRepository {
                     COUNT(*) FILTER (WHERE r.ref_type IN ('reply', 'root'))::bigint AS reply_count,
                     COUNT(*) FILTER (WHERE r.ref_type = 'repost')::bigint AS repost_count,
                     COALESCE(SUM(
-                        CASE WHEN r.ref_type = 'zap' THEN COALESCE(za.amount_msats, 0) ELSE 0 END
+                        CASE WHEN r.ref_type = 'zap' THEN COALESCE(zm.amount_msats, 0) ELSE 0 END
                     ), 0)::bigint AS zap_total_msats
                 FROM event_refs r
-                LEFT JOIN (
-                    SELECT event_id,
-                           MAX(CASE WHEN tag_value ~ '^[0-9]+$' THEN tag_value::bigint ELSE 0 END) AS amount_msats
-                    FROM event_tags WHERE tag_name = 'amount' GROUP BY event_id
-                ) za ON za.event_id = r.source_event_id
+                LEFT JOIN zap_metadata zm ON zm.event_id = r.source_event_id
                 WHERE r.target_event_id IN (SELECT id FROM tagged_notes)
                 GROUP BY r.target_event_id
             )
@@ -2081,16 +1993,16 @@ impl EventRepository {
 
         let rows = sqlx::query_as::<_, (String, i64)>(
             r#"
-            SELECT LOWER(et.tag_value) AS hashtag,
-                   COUNT(DISTINCT et.event_id)::bigint AS cnt
-            FROM event_tags et
-            JOIN events e ON e.id = et.event_id
-            WHERE et.tag_name = 't'
+            SELECT LOWER(tag_elem->>1) AS hashtag,
+                   COUNT(DISTINCT e.id)::bigint AS cnt
+            FROM events e,
+                 jsonb_array_elements(e.tags) AS tag_elem
+            WHERE tag_elem->>0 = 't'
               AND e.kind = 1
               AND e.created_at >= $1
-              AND LENGTH(et.tag_value) BETWEEN 1 AND 100
-            GROUP BY LOWER(et.tag_value)
-            HAVING COUNT(DISTINCT et.event_id) >= 3
+              AND LENGTH(tag_elem->>1) BETWEEN 1 AND 100
+            GROUP BY LOWER(tag_elem->>1)
+            HAVING COUNT(DISTINCT e.id) >= 3
             ORDER BY cnt DESC
             LIMIT $2 OFFSET $3
             "#,
@@ -2109,7 +2021,7 @@ impl EventRepository {
 
     /// Client leaderboard: top Nostr clients by note count and distinct users.
     ///
-    /// Reads `client` tags from `event_tags`, joins to `events` (kind=1 notes only),
+    /// Reads `client` tags from JSONB `events.tags`, joins to `events` (kind=1 notes only),
     /// and aggregates per client name. Case-insensitive grouping merges variants
     /// like "Coracle" / "coracle". Only counts notes from qualified users
     /// (at least 1 follower in `profile_search`) to filter out bot spam.
@@ -2121,18 +2033,18 @@ impl EventRepository {
     ) -> Result<Vec<super::models::ClientEntry>, AppError> {
         let rows = sqlx::query_as::<_, (String, i64, i64)>(
             r#"
-            SELECT LOWER(et.tag_value)                   AS client_name,
-                   COUNT(DISTINCT et.event_id)::bigint    AS note_count,
+            SELECT LOWER(tag_elem->>1)                    AS client_name,
+                   COUNT(DISTINCT e.id)::bigint           AS note_count,
                    COUNT(DISTINCT e.pubkey)::bigint       AS user_count
-            FROM event_tags et
-            JOIN events e ON e.id = et.event_id
+            FROM events e,
+                 jsonb_array_elements(e.tags) AS tag_elem
             JOIN profile_search ps ON ps.pubkey = e.pubkey AND ps.follower_count >= 1
-            WHERE et.tag_name = 'client'
+            WHERE tag_elem->>0 = 'client'
               AND e.kind = 1
-              AND LENGTH(et.tag_value) BETWEEN 1 AND 100
-              AND LOWER(et.tag_value) NOT IN ('mostr')
-            GROUP BY LOWER(et.tag_value)
-            HAVING COUNT(DISTINCT et.event_id) >= 2
+              AND LENGTH(tag_elem->>1) BETWEEN 1 AND 100
+              AND LOWER(tag_elem->>1) NOT IN ('mostr')
+            GROUP BY LOWER(tag_elem->>1)
+            HAVING COUNT(DISTINCT e.id) >= 2
             ORDER BY note_count DESC
             LIMIT $1 OFFSET $2
             "#,
@@ -2232,11 +2144,9 @@ impl EventRepository {
                 WHERE e.created_at >= $2 AND e.created_at < $3
             ),
             zap_sats AS (
-                SELECT COALESCE(SUM(
-                    CASE WHEN et.tag_value ~ '^[0-9]+$' THEN et.tag_value::bigint ELSE 0 END
-                ) / 1000, 0)::bigint AS total_sats
-                FROM events e
-                JOIN event_tags et ON et.event_id = e.id AND et.tag_name = 'amount'
+                SELECT COALESCE(SUM(zm.amount_msats) / 1000, 0)::bigint AS total_sats
+                FROM zap_metadata zm
+                JOIN events e ON e.id = zm.event_id
                 WHERE e.kind = 9735 AND e.created_at >= $2 AND e.created_at < $3
             )
             INSERT INTO daily_analytics (date, active_users, zaps_sent, notes_posted, computed_at)
