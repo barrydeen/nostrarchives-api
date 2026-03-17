@@ -7,10 +7,12 @@ use super::models::{
     NostrEvent, StoredEvent, TrendingNote, TrendingUser,
 };
 use crate::error::AppError;
+use crate::follower_cache::FollowerCache;
 
 #[derive(Clone)]
 pub struct EventRepository {
     pool: PgPool,
+    pub follower_cache: FollowerCache,
 }
 
 #[derive(Debug, Clone)]
@@ -31,8 +33,8 @@ pub struct ProfileRow {
 }
 
 impl EventRepository {
-    pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+    pub fn new(pool: PgPool, follower_cache: FollowerCache) -> Self {
+        Self { pool, follower_cache }
     }
 
     /// Return a clone of the underlying connection pool.
@@ -46,6 +48,21 @@ impl EventRepository {
         event: &NostrEvent,
         relay_url: &str,
     ) -> Result<bool, AppError> {
+        // Check follower threshold for content events (skip profile/follow list events)
+        // We need profiles (kind 0) and follow lists (kind 3) to build the social graph
+        let skip_threshold_check = matches!(event.kind, 0 | 3);
+        
+        if !skip_threshold_check {
+            if !self.follower_cache.meets_threshold(&event.pubkey).await? {
+                tracing::debug!(
+                    pubkey = %event.pubkey, 
+                    kind = event.kind,
+                    "Skipping event from author below follower threshold"
+                );
+                return Ok(false); // Return false to indicate not inserted
+            }
+        }
+
         let raw = serde_json::to_value(event).unwrap_or_default();
         let tags_json = serde_json::to_value(&event.tags).unwrap_or_default();
 
@@ -868,6 +885,8 @@ impl EventRepository {
 
         Ok((follows_count, followers_count))
     }
+
+
 
     /// Two-phase optimized trending query:
     /// Phase 1: Find top target_event_ids by primary metric using (ref_type, created_at) index.
