@@ -2057,7 +2057,9 @@ impl EventRepository {
     ///
     /// Reads `client` tags from `event_tags`, joins to `events` (kind=1 notes only),
     /// and aggregates per client name. Case-insensitive grouping merges variants
-    /// like "Coracle" / "coracle". Returns results ordered by note_count DESC.
+    /// like "Coracle" / "coracle". Only counts notes from qualified users
+    /// (at least 1 follower in `profile_search`) to filter out bot spam.
+    /// Returns results ordered by note_count DESC.
     pub async fn client_leaderboard(
         &self,
         limit: i64,
@@ -2070,6 +2072,7 @@ impl EventRepository {
                    COUNT(DISTINCT e.pubkey)::bigint       AS user_count
             FROM event_tags et
             JOIN events e ON e.id = et.event_id
+            JOIN profile_search ps ON ps.pubkey = e.pubkey AND ps.follower_count >= 1
             WHERE et.tag_name = 'client'
               AND e.kind = 1
               AND LENGTH(et.tag_value) BETWEEN 1 AND 100
