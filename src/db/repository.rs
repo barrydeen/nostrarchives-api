@@ -2075,6 +2075,53 @@ impl EventRepository {
             })
             .collect())
     }
+
+    /// Top relays by number of users who list them in kind-10002 relay lists (NIP-65).
+    /// Only counts the latest relay list per pubkey.
+    pub async fn relay_leaderboard(
+        &self,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<super::models::RelayLeaderboardEntry>, AppError> {
+        let rows = sqlx::query_as::<_, (String, i64)>(
+            r#"
+            WITH latest_relay_lists AS (
+                SELECT DISTINCT ON (pubkey) pubkey, tags
+                FROM events
+                WHERE kind = 10002
+                ORDER BY pubkey, created_at DESC
+            ),
+            relay_urls AS (
+                SELECT
+                    lrl.pubkey,
+                    RTRIM(LOWER(tag ->> 1), '/') AS relay_url
+                FROM latest_relay_lists lrl,
+                     jsonb_array_elements(lrl.tags::jsonb) AS tag
+                WHERE tag ->> 0 = 'r'
+                  AND tag ->> 1 IS NOT NULL
+                  AND tag ->> 1 != ''
+            )
+            SELECT relay_url, COUNT(DISTINCT pubkey)::bigint AS user_count
+            FROM relay_urls
+            WHERE relay_url LIKE 'wss://%' OR relay_url LIKE 'ws://%'
+            GROUP BY relay_url
+            ORDER BY user_count DESC
+            LIMIT $1 OFFSET $2
+            "#,
+        )
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|(relay_url, user_count)| super::models::RelayLeaderboardEntry {
+                relay_url,
+                user_count,
+            })
+            .collect())
+    }
 }
 
 enum BindValue {

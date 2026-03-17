@@ -94,6 +94,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/stats/daily", get(handlers::get_daily_stats))
 
         .route("/v1/clients/leaderboard", get(handlers::get_client_leaderboard))
+        .route("/v1/relays/leaderboard", get(handlers::get_relay_leaderboard))
         .route("/v1/notes/search", get(handlers::advanced_note_search))
         .route("/v1/search", get(handlers::search))
         .route("/v1/search/suggest", get(handlers::search_suggest))
