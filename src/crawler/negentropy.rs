@@ -49,13 +49,38 @@ impl NegentropySyncer {
         relay_url: &str,
         kinds: &[i64],
     ) -> Result<SyncResult, AppError> {
-        // 1. Load local events matching the requested kinds
-        let rows = sqlx::query_as::<_, EventIdRow>(
-            "SELECT id, created_at FROM events WHERE kind = ANY($1) ORDER BY created_at ASC, id ASC",
-        )
-        .bind(kinds)
-        .fetch_all(&self.pool)
-        .await?;
+        self.sync_with_relay_window(relay_url, kinds, None, None).await
+    }
+
+    /// Windowed negentropy reconciliation. Constrains both the relay filter and local
+    /// DB query to `[since, until)` so relays don't reject for "too many results".
+    pub async fn sync_with_relay_window(
+        &self,
+        relay_url: &str,
+        kinds: &[i64],
+        since: Option<i64>,
+        until: Option<i64>,
+    ) -> Result<SyncResult, AppError> {
+        // 1. Load local events matching the requested kinds + time window
+        let rows = if since.is_some() || until.is_some() {
+            let s = since.unwrap_or(0);
+            let u = until.unwrap_or(i64::MAX);
+            sqlx::query_as::<_, EventIdRow>(
+                "SELECT id, created_at FROM events WHERE kind = ANY($1) AND created_at >= $2 AND created_at < $3 ORDER BY created_at ASC, id ASC",
+            )
+            .bind(kinds)
+            .bind(s)
+            .bind(u)
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            sqlx::query_as::<_, EventIdRow>(
+                "SELECT id, created_at FROM events WHERE kind = ANY($1) ORDER BY created_at ASC, id ASC",
+            )
+            .bind(kinds)
+            .fetch_all(&self.pool)
+            .await?
+        };
 
         // 2. Build negentropy storage
         let mut storage = NegentropyStorageVector::with_capacity(rows.len());
@@ -94,7 +119,13 @@ impl NegentropySyncer {
         // 5. Send NEG-OPEN
         let sub_id = format!("neg-{}", uuid::Uuid::new_v4().as_simple());
         let kinds_json: Vec<serde_json::Value> = kinds.iter().map(|&k| serde_json::json!(k)).collect();
-        let filter = serde_json::json!({"kinds": kinds_json});
+        let mut filter = serde_json::json!({"kinds": kinds_json});
+        if let Some(s) = since {
+            filter["since"] = serde_json::json!(s);
+        }
+        if let Some(u) = until {
+            filter["until"] = serde_json::json!(u);
+        }
         let neg_open =
             serde_json::json!(["NEG-OPEN", &sub_id, filter, hex::encode(&init_msg)]);
 
@@ -337,12 +368,28 @@ impl NegentropySyncer {
     // Full sync orchestration
     // -----------------------------------------------------------------------
 
+    /// Default time window size for chunked sync (24 hours in seconds).
+    const DEFAULT_WINDOW_SECS: i64 = 86400;
+
     /// Run a full negentropy sync cycle: reconcile → fetch missing → insert.
+    /// Uses a single time window (unbounded). For large relays, use `run_sync_windowed`.
     pub async fn run_sync(&self, relay_url: &str) -> Result<SyncStats, AppError> {
+        self.run_sync_window(relay_url, None, None).await
+    }
+
+    /// Run negentropy sync for a specific time window.
+    pub async fn run_sync_window(
+        &self,
+        relay_url: &str,
+        since: Option<i64>,
+        until: Option<i64>,
+    ) -> Result<SyncStats, AppError> {
         let start = Instant::now();
 
         // 1. Reconcile kind-1 notes
-        let sync_result = self.sync_with_relay(relay_url, &[1]).await?;
+        let sync_result = self
+            .sync_with_relay_window(relay_url, &[1], since, until)
+            .await?;
         let events_discovered = sync_result.need_ids.len();
 
         // 2. Fetch missing events
@@ -357,7 +404,9 @@ impl NegentropySyncer {
             match self.repo.insert_event(event, relay_url).await {
                 Ok(true) => {
                     events_inserted += 1;
-                    self.cache.on_event_ingested(&event.pubkey, event.kind).await;
+                    self.cache
+                        .on_event_ingested(&event.pubkey, event.kind)
+                        .await;
                 }
                 Ok(false) => {
                     // Duplicate, skip
@@ -372,11 +421,13 @@ impl NegentropySyncer {
 
         tracing::info!(
             relay = relay_url,
+            since = since.unwrap_or(0),
+            until = until.unwrap_or(0),
             discovered = events_discovered,
             fetched = events_fetched,
             inserted = events_inserted,
             duration_ms = duration_ms,
-            "sync cycle complete"
+            "sync window complete"
         );
 
         Ok(SyncStats {
@@ -384,6 +435,119 @@ impl NegentropySyncer {
             events_discovered,
             events_fetched,
             events_inserted,
+            duration_ms,
+        })
+    }
+
+    /// Run negentropy sync using backward time windows.
+    /// Starts from `now` and walks backward in `window_secs` chunks.
+    /// Handles `NEG-ERR: blocked` by halving the window and retrying.
+    /// Stops after `max_windows` windows or when a window yields zero new events.
+    pub async fn run_sync_windowed(
+        &self,
+        relay_url: &str,
+        window_secs: Option<i64>,
+        max_windows: usize,
+    ) -> Result<SyncStats, AppError> {
+        let start = Instant::now();
+        let now = chrono::Utc::now().timestamp();
+        let mut window = window_secs.unwrap_or(Self::DEFAULT_WINDOW_SECS);
+        let min_window: i64 = 3600; // don't go below 1 hour
+
+        let mut total_discovered = 0usize;
+        let mut total_fetched = 0usize;
+        let mut total_inserted = 0usize;
+        let mut cursor = now;
+        let mut windows_done = 0usize;
+
+        while windows_done < max_windows && cursor > 0 {
+            let window_since = cursor - window;
+            let window_until = cursor;
+
+            tracing::info!(
+                relay = relay_url,
+                window = windows_done + 1,
+                since = window_since,
+                until = window_until,
+                window_hours = window / 3600,
+                "starting sync window"
+            );
+
+            match self
+                .run_sync_window(relay_url, Some(window_since), Some(window_until))
+                .await
+            {
+                Ok(stats) => {
+                    total_discovered += stats.events_discovered;
+                    total_fetched += stats.events_fetched;
+                    total_inserted += stats.events_inserted;
+                    windows_done += 1;
+
+                    // If this window yielded nothing, no point going further back
+                    if stats.events_discovered == 0 && windows_done > 1 {
+                        tracing::info!(
+                            relay = relay_url,
+                            "empty window — stopping backward crawl"
+                        );
+                        break;
+                    }
+
+                    // Move cursor backward
+                    cursor = window_since;
+                }
+                Err(e) => {
+                    let err_msg = format!("{e}");
+                    if err_msg.contains("too many") || err_msg.contains("blocked") {
+                        // Relay rejected — halve the window and retry
+                        let new_window = window / 2;
+                        if new_window < min_window {
+                            tracing::warn!(
+                                relay = relay_url,
+                                window_secs = window,
+                                "window too small, skipping this range"
+                            );
+                            cursor = window_since;
+                            windows_done += 1;
+                            continue;
+                        }
+                        tracing::info!(
+                            relay = relay_url,
+                            old_window = window,
+                            new_window = new_window,
+                            "NEG-ERR blocked — halving window size"
+                        );
+                        window = new_window;
+                        // Don't increment windows_done — retry same cursor
+                    } else {
+                        tracing::warn!(
+                            relay = relay_url,
+                            error = %e,
+                            "sync window failed, skipping"
+                        );
+                        cursor = window_since;
+                        windows_done += 1;
+                    }
+                }
+            }
+        }
+
+        let duration_ms = start.elapsed().as_millis() as u64;
+
+        tracing::info!(
+            relay = relay_url,
+            windows = windows_done,
+            total_discovered = total_discovered,
+            total_fetched = total_fetched,
+            total_inserted = total_inserted,
+            duration_ms = duration_ms,
+            "windowed sync complete"
+        );
+
+        Ok(SyncStats {
+            relay_url: relay_url.to_string(),
+            events_discovered: total_discovered,
+            events_fetched: total_fetched,
+            events_inserted: total_inserted,
             duration_ms,
         })
     }

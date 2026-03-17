@@ -7,4 +7,4 @@ CREATE TABLE IF NOT EXISTS relay_capabilities (
     check_interval_hours INTEGER NOT NULL DEFAULT 24
 );
 
-CREATE INDEX idx_relay_caps_negentropy ON relay_capabilities (supports_negentropy) WHERE supports_negentropy = true;
+CREATE INDEX IF NOT EXISTS idx_relay_caps_negentropy ON relay_capabilities (supports_negentropy) WHERE supports_negentropy = true;

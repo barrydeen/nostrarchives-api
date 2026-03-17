@@ -125,31 +125,65 @@ async fn main() {
     // Start intelligent crawler (historical note backfill)
     let crawl_queue = if cfg.crawler_enabled {
         let queue = crawler::queue::CrawlQueue::new(repo.pool());
-        let crawler_config = crawler::worker::CrawlerConfig {
-            relay_urls: cfg.relay_urls.clone(),
-            batch_size: cfg.crawler_batch_size,
-            events_per_author: cfg.crawler_events_per_author,
-            request_delay_ms: cfg.crawler_request_delay_ms,
-            poll_interval_secs: cfg.crawler_poll_interval_secs,
-            sync_interval_secs: cfg.crawler_sync_interval_secs,
-            max_concurrency: cfg.crawler_max_concurrency,
-        };
-        let crawler_worker = crawler::worker::Crawler::new(
-            crawler_config,
-            queue.clone(),
-            repo.clone(),
-            stats_cache.clone(),
-        );
-        let crawler_shutdown = shutdown_tx.clone();
-        tokio::spawn(async move {
-            // Small delay to let ingestion start first
-            tokio::time::sleep(std::time::Duration::from_secs(15)).await;
-            crawler_worker.run(crawler_shutdown).await;
-        });
-        tracing::info!("intelligent crawler enabled");
+
+        // Start hybrid crawler (negentropy + relay-list-aware) if enabled
+        if cfg.negentropy_enabled || cfg.crawler_use_relay_lists {
+            let hybrid_config = crawler::orchestrator::HybridCrawlerConfig {
+                negentropy_enabled: cfg.negentropy_enabled,
+                negentropy_sync_interval_secs: cfg.negentropy_sync_interval_secs,
+                negentropy_max_relays: cfg.negentropy_max_relays,
+                use_relay_lists: cfg.crawler_use_relay_lists,
+                max_relay_pool_size: cfg.crawler_max_relay_pool_size,
+                legacy_batch_size: cfg.crawler_batch_size,
+                legacy_request_delay_ms: cfg.crawler_request_delay_ms,
+                legacy_poll_interval_secs: cfg.crawler_poll_interval_secs,
+                legacy_events_per_author: cfg.crawler_events_per_author,
+                fallback_relay_urls: cfg.relay_urls.clone(),
+                dry_run: cfg.crawler_dry_run,
+            };
+            let router = crawler::relay_router::RelayRouter::new(repo.pool());
+            let hybrid = crawler::orchestrator::HybridCrawler::new(
+                hybrid_config,
+                repo.clone(),
+                stats_cache.clone(),
+                repo.pool(),
+                queue.clone(),
+                router,
+            );
+            let hybrid_shutdown = shutdown_tx.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                hybrid.run(hybrid_shutdown).await;
+            });
+            tracing::info!("hybrid crawler enabled (negentropy={}, relay_lists={})",
+                cfg.negentropy_enabled, cfg.crawler_use_relay_lists);
+        } else {
+            // Fall back to legacy crawler
+            let crawler_config = crawler::worker::CrawlerConfig {
+                relay_urls: cfg.relay_urls.clone(),
+                batch_size: cfg.crawler_batch_size,
+                events_per_author: cfg.crawler_events_per_author,
+                request_delay_ms: cfg.crawler_request_delay_ms,
+                poll_interval_secs: cfg.crawler_poll_interval_secs,
+                sync_interval_secs: cfg.crawler_sync_interval_secs,
+                max_concurrency: cfg.crawler_max_concurrency,
+            };
+            let crawler_worker = crawler::worker::Crawler::new(
+                crawler_config,
+                queue.clone(),
+                repo.clone(),
+                stats_cache.clone(),
+            );
+            let crawler_shutdown = shutdown_tx.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                crawler_worker.run(crawler_shutdown).await;
+            });
+            tracing::info!("legacy crawler enabled");
+        }
         Some(queue)
     } else {
-        tracing::info!("intelligent crawler disabled");
+        tracing::info!("crawler disabled");
         None
     };
 
