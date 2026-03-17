@@ -371,34 +371,29 @@ impl NegentropySyncer {
     /// Default time window size for chunked sync (24 hours in seconds).
     const DEFAULT_WINDOW_SECS: i64 = 86400;
 
-    /// Run a full negentropy sync cycle: reconcile → fetch missing → insert.
-    /// Uses a single time window (unbounded). For large relays, use `run_sync_windowed`.
-    pub async fn run_sync(&self, relay_url: &str) -> Result<SyncStats, AppError> {
-        self.run_sync_window(relay_url, None, None).await
-    }
+    /// All event kinds we crawl: notes, reposts, reactions, zaps.
+    pub const ALL_CRAWL_KINDS: &'static [i64] = &[1, 6, 7, 9735];
 
-    /// Run negentropy sync for a specific time window.
+    /// Run negentropy sync for a specific time window and set of kinds.
     pub async fn run_sync_window(
         &self,
         relay_url: &str,
+        kinds: &[i64],
         since: Option<i64>,
         until: Option<i64>,
     ) -> Result<SyncStats, AppError> {
         let start = Instant::now();
 
-        // 1. Reconcile kind-1 notes
         let sync_result = self
-            .sync_with_relay_window(relay_url, &[1], since, until)
+            .sync_with_relay_window(relay_url, kinds, since, until)
             .await?;
         let events_discovered = sync_result.need_ids.len();
 
-        // 2. Fetch missing events
         let events = self
             .fetch_missing_events(relay_url, &sync_result.need_ids)
             .await?;
         let events_fetched = events.len();
 
-        // 3. Insert and update cache
         let mut events_inserted = 0usize;
         for event in &events {
             match self.repo.insert_event(event, relay_url).await {
@@ -408,9 +403,7 @@ impl NegentropySyncer {
                         .on_event_ingested(&event.pubkey, event.kind)
                         .await;
                 }
-                Ok(false) => {
-                    // Duplicate, skip
-                }
+                Ok(false) => {}
                 Err(e) => {
                     tracing::warn!(event_id = %event.id, "insert failed: {e}");
                 }
@@ -421,6 +414,7 @@ impl NegentropySyncer {
 
         tracing::info!(
             relay = relay_url,
+            kinds = ?kinds,
             since = since.unwrap_or(0),
             until = until.unwrap_or(0),
             discovered = events_discovered,
@@ -439,26 +433,37 @@ impl NegentropySyncer {
         })
     }
 
-    /// Run negentropy sync using backward time windows.
-    /// Starts from `now` and walks backward in `window_secs` chunks.
-    /// Handles `NEG-ERR: blocked` by halving the window and retrying.
-    /// Stops after `max_windows` windows or when a window yields zero new events.
+    /// Run negentropy sync using backward time windows (stateless, for test binary).
     pub async fn run_sync_windowed(
         &self,
         relay_url: &str,
         window_secs: Option<i64>,
         max_windows: usize,
     ) -> Result<SyncStats, AppError> {
-        let start = Instant::now();
         let now = chrono::Utc::now().timestamp();
+        self.run_sync_windowed_from(relay_url, &[1], now, window_secs, max_windows)
+            .await
+    }
+
+    /// Internal: walk backward from a cursor in time windows for specific kinds.
+    async fn run_sync_windowed_from(
+        &self,
+        relay_url: &str,
+        kinds: &[i64],
+        start_cursor: i64,
+        window_secs: Option<i64>,
+        max_windows: usize,
+    ) -> Result<SyncStats, AppError> {
+        let start = Instant::now();
         let mut window = window_secs.unwrap_or(Self::DEFAULT_WINDOW_SECS);
-        let min_window: i64 = 3600; // don't go below 1 hour
+        let min_window: i64 = 3600;
 
         let mut total_discovered = 0usize;
         let mut total_fetched = 0usize;
         let mut total_inserted = 0usize;
-        let mut cursor = now;
+        let mut cursor = start_cursor;
         let mut windows_done = 0usize;
+        let mut consecutive_empty = 0usize;
 
         while windows_done < max_windows && cursor > 0 {
             let window_since = cursor - window;
@@ -466,6 +471,7 @@ impl NegentropySyncer {
 
             tracing::info!(
                 relay = relay_url,
+                kinds = ?kinds,
                 window = windows_done + 1,
                 since = window_since,
                 until = window_until,
@@ -474,7 +480,7 @@ impl NegentropySyncer {
             );
 
             match self
-                .run_sync_window(relay_url, Some(window_since), Some(window_until))
+                .run_sync_window(relay_url, kinds, Some(window_since), Some(window_until))
                 .await
             {
                 Ok(stats) => {
@@ -483,22 +489,25 @@ impl NegentropySyncer {
                     total_inserted += stats.events_inserted;
                     windows_done += 1;
 
-                    // If this window yielded nothing, no point going further back
-                    if stats.events_discovered == 0 && windows_done > 1 {
-                        tracing::info!(
-                            relay = relay_url,
-                            "empty window — stopping backward crawl"
-                        );
-                        break;
+                    if stats.events_discovered == 0 {
+                        consecutive_empty += 1;
+                        if consecutive_empty >= 2 {
+                            tracing::info!(
+                                relay = relay_url,
+                                kinds = ?kinds,
+                                "2 consecutive empty windows — stopping backward crawl"
+                            );
+                            break;
+                        }
+                    } else {
+                        consecutive_empty = 0;
                     }
 
-                    // Move cursor backward
                     cursor = window_since;
                 }
                 Err(e) => {
                     let err_msg = format!("{e}");
                     if err_msg.contains("too many") || err_msg.contains("blocked") {
-                        // Relay rejected — halve the window and retry
                         let new_window = window / 2;
                         if new_window < min_window {
                             tracing::warn!(
@@ -517,7 +526,6 @@ impl NegentropySyncer {
                             "NEG-ERR blocked — halving window size"
                         );
                         window = new_window;
-                        // Don't increment windows_done — retry same cursor
                     } else {
                         tracing::warn!(
                             relay = relay_url,
@@ -535,6 +543,7 @@ impl NegentropySyncer {
 
         tracing::info!(
             relay = relay_url,
+            kinds = ?kinds,
             windows = windows_done,
             total_discovered = total_discovered,
             total_fetched = total_fetched,
@@ -551,6 +560,224 @@ impl NegentropySyncer {
             duration_ms,
         })
     }
+
+    // -----------------------------------------------------------------------
+    // Exhaustive sync with persistent cursor
+    // -----------------------------------------------------------------------
+
+    /// Run an exhaustive sync cycle for a relay across all event kinds.
+    /// Uses persistent cursors in `negentropy_sync_state` to resume from
+    /// where it left off. Each cycle:
+    ///   1. Recent pass: sync last 24h for all kinds (catch new content)
+    ///   2. Backfill pass: for each non-fully-backfilled kind, walk backward
+    ///      from the stored cursor for up to `max_windows_per_kind` windows
+    pub async fn run_exhaustive_sync(
+        &self,
+        relay_url: &str,
+        max_windows_per_kind: usize,
+    ) -> Result<SyncStats, AppError> {
+        let start = Instant::now();
+        let now = chrono::Utc::now().timestamp();
+
+        let mut total_discovered = 0usize;
+        let mut total_fetched = 0usize;
+        let mut total_inserted = 0usize;
+
+        for &kind in Self::ALL_CRAWL_KINDS {
+            let kinds = &[kind];
+
+            // Load sync state for this relay+kind
+            let state = self.get_sync_state(relay_url, kind).await?;
+
+            // --- Recent pass: always sync last 24h ---
+            let recent_since = now - Self::DEFAULT_WINDOW_SECS;
+            match self
+                .run_sync_window(relay_url, kinds, Some(recent_since), Some(now))
+                .await
+            {
+                Ok(stats) => {
+                    total_discovered += stats.events_discovered;
+                    total_fetched += stats.events_fetched;
+                    total_inserted += stats.events_inserted;
+
+                    // Update newest_synced_at
+                    if now > state.newest_synced_at {
+                        self.update_sync_state(relay_url, kind, |s| {
+                            s.newest_synced_at = now;
+                        })
+                        .await?;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        relay = relay_url,
+                        kind = kind,
+                        error = %e,
+                        "recent sync pass failed"
+                    );
+                }
+            }
+
+            // --- Backfill pass: walk backward from cursor ---
+            if state.fully_backfilled {
+                tracing::debug!(
+                    relay = relay_url,
+                    kind = kind,
+                    "already fully backfilled, skipping"
+                );
+                continue;
+            }
+
+            // Determine starting cursor: use stored oldest_synced_at,
+            // or start from now if this is the first time
+            let backfill_cursor = if state.oldest_synced_at > 0 {
+                state.oldest_synced_at
+            } else {
+                // First time: start from 24h ago (recent pass covers now-24h)
+                recent_since
+            };
+
+            tracing::info!(
+                relay = relay_url,
+                kind = kind,
+                cursor = backfill_cursor,
+                cursor_date = %chrono::DateTime::from_timestamp(backfill_cursor, 0)
+                    .map(|d| d.format("%Y-%m-%d").to_string())
+                    .unwrap_or_default(),
+                "starting backfill pass"
+            );
+
+            match self
+                .run_sync_windowed_from(
+                    relay_url,
+                    kinds,
+                    backfill_cursor,
+                    Some(Self::DEFAULT_WINDOW_SECS),
+                    max_windows_per_kind,
+                )
+                .await
+            {
+                Ok(stats) => {
+                    total_discovered += stats.events_discovered;
+                    total_fetched += stats.events_fetched;
+                    total_inserted += stats.events_inserted;
+
+                    // Calculate where the cursor ended up
+                    let new_cursor =
+                        backfill_cursor - (Self::DEFAULT_WINDOW_SECS * max_windows_per_kind as i64);
+                    let new_empty = if stats.events_discovered == 0 {
+                        state.consecutive_empty_windows + max_windows_per_kind as i32
+                    } else {
+                        0
+                    };
+
+                    // If we've had 3+ consecutive empty windows, mark as fully backfilled
+                    let fully_done = new_empty >= 3 || new_cursor < 1_000_000_000; // before 2001
+
+                    self.update_sync_state(relay_url, kind, |s| {
+                        s.oldest_synced_at = new_cursor.max(0);
+                        s.total_discovered += stats.events_discovered as i64;
+                        s.total_inserted += stats.events_inserted as i64;
+                        s.consecutive_empty_windows = new_empty;
+                        s.fully_backfilled = fully_done;
+                    })
+                    .await?;
+
+                    if fully_done {
+                        tracing::info!(
+                            relay = relay_url,
+                            kind = kind,
+                            "marked as fully backfilled"
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        relay = relay_url,
+                        kind = kind,
+                        error = %e,
+                        "backfill pass failed"
+                    );
+                }
+            }
+        }
+
+        let duration_ms = start.elapsed().as_millis() as u64;
+
+        Ok(SyncStats {
+            relay_url: relay_url.to_string(),
+            events_discovered: total_discovered,
+            events_fetched: total_fetched,
+            events_inserted: total_inserted,
+            duration_ms,
+        })
+    }
+
+    // -----------------------------------------------------------------------
+    // Sync state persistence
+    // -----------------------------------------------------------------------
+
+    async fn get_sync_state(
+        &self,
+        relay_url: &str,
+        kind: i64,
+    ) -> Result<SyncState, AppError> {
+        let row = sqlx::query_as::<_, SyncStateRow>(
+            "SELECT oldest_synced_at, newest_synced_at, fully_backfilled, total_discovered, total_inserted, consecutive_empty_windows
+             FROM negentropy_sync_state WHERE relay_url = $1 AND kind = $2",
+        )
+        .bind(relay_url)
+        .bind(kind)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.map(|r| r.into()).unwrap_or(SyncState {
+            oldest_synced_at: 0,
+            newest_synced_at: 0,
+            fully_backfilled: false,
+            total_discovered: 0,
+            total_inserted: 0,
+            consecutive_empty_windows: 0,
+        }))
+    }
+
+    async fn update_sync_state<F>(
+        &self,
+        relay_url: &str,
+        kind: i64,
+        f: F,
+    ) -> Result<(), AppError>
+    where
+        F: FnOnce(&mut SyncState),
+    {
+        let mut state = self.get_sync_state(relay_url, kind).await?;
+        f(&mut state);
+
+        sqlx::query(
+            "INSERT INTO negentropy_sync_state (relay_url, kind, oldest_synced_at, newest_synced_at, fully_backfilled, total_discovered, total_inserted, consecutive_empty_windows, last_sync_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+             ON CONFLICT (relay_url, kind) DO UPDATE SET
+               oldest_synced_at = EXCLUDED.oldest_synced_at,
+               newest_synced_at = EXCLUDED.newest_synced_at,
+               fully_backfilled = EXCLUDED.fully_backfilled,
+               total_discovered = EXCLUDED.total_discovered,
+               total_inserted = EXCLUDED.total_inserted,
+               consecutive_empty_windows = EXCLUDED.consecutive_empty_windows,
+               last_sync_at = NOW()",
+        )
+        .bind(relay_url)
+        .bind(kind)
+        .bind(state.oldest_synced_at)
+        .bind(state.newest_synced_at)
+        .bind(state.fully_backfilled)
+        .bind(state.total_discovered)
+        .bind(state.total_inserted)
+        .bind(state.consecutive_empty_windows)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -561,4 +788,37 @@ impl NegentropySyncer {
 struct EventIdRow {
     id: String,
     created_at: i64,
+}
+
+#[derive(Debug, Clone)]
+struct SyncState {
+    oldest_synced_at: i64,
+    newest_synced_at: i64,
+    fully_backfilled: bool,
+    total_discovered: i64,
+    total_inserted: i64,
+    consecutive_empty_windows: i32,
+}
+
+#[derive(sqlx::FromRow)]
+struct SyncStateRow {
+    oldest_synced_at: i64,
+    newest_synced_at: i64,
+    fully_backfilled: bool,
+    total_discovered: i64,
+    total_inserted: i64,
+    consecutive_empty_windows: i32,
+}
+
+impl From<SyncStateRow> for SyncState {
+    fn from(r: SyncStateRow) -> Self {
+        Self {
+            oldest_synced_at: r.oldest_synced_at,
+            newest_synced_at: r.newest_synced_at,
+            fully_backfilled: r.fully_backfilled,
+            total_discovered: r.total_discovered,
+            total_inserted: r.total_inserted,
+            consecutive_empty_windows: r.consecutive_empty_windows,
+        }
+    }
 }
