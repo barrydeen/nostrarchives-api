@@ -64,6 +64,10 @@ async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
             "009_trending_indexes",
             include_str!("../../migrations/009_trending_indexes.sql"),
         ),
+        (
+            "010_relay_capabilities",
+            include_str!("../../migrations/010_relay_capabilities.sql"),
+        ),
     ];
 
     for (name, sql) in migrations {

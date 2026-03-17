@@ -23,3 +23,9 @@ tower-http = { version = "0.6", features = ["cors"] }
 uuid = { version = "1", features = ["v4"] }
 url = "2"
 sha2 = "0.10"
+negentropy = "0.5"
+reqwest = { version = "0.12", features = ["json"] }
+
+[[bin]]
+name = "test_negentropy"
+path = "src/bin/test_negentropy.rs"

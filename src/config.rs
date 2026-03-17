@@ -19,6 +19,12 @@ pub struct Config {
     pub crawler_poll_interval_secs: u64,
     pub crawler_sync_interval_secs: u64,
     pub crawler_max_concurrency: usize,
+    pub negentropy_enabled: bool,
+    pub negentropy_sync_interval_secs: u64,
+    pub negentropy_max_relays: usize,
+    pub crawler_use_relay_lists: bool,
+    pub crawler_max_relay_pool_size: usize,
+    pub crawler_dry_run: bool,
 }
 
 impl Config {
@@ -114,6 +120,33 @@ impl Config {
             .and_then(|v| v.parse().ok())
             .unwrap_or(3);
 
+        let negentropy_enabled = env::var("NEGENTROPY_ENABLED")
+            .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(true);
+
+        let negentropy_sync_interval_secs = env::var("NEGENTROPY_SYNC_INTERVAL_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(300);
+
+        let negentropy_max_relays = env::var("NEGENTROPY_MAX_RELAYS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(20);
+
+        let crawler_use_relay_lists = env::var("CRAWLER_USE_RELAY_LISTS")
+            .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(true);
+
+        let crawler_max_relay_pool_size = env::var("CRAWLER_MAX_RELAY_POOL_SIZE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(50);
+
+        let crawler_dry_run = env::var("CRAWLER_DRY_RUN")
+            .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(false);
+
         Self {
             database_url,
             redis_url,
@@ -132,6 +165,12 @@ impl Config {
             crawler_poll_interval_secs,
             crawler_sync_interval_secs,
             crawler_max_concurrency,
+            negentropy_enabled,
+            negentropy_sync_interval_secs,
+            negentropy_max_relays,
+            crawler_use_relay_lists,
+            crawler_max_relay_pool_size,
+            crawler_dry_run,
         }
     }
 }
