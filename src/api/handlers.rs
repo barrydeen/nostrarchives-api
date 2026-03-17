@@ -550,6 +550,10 @@ fn clamp_listing_limit(value: Option<i64>) -> i64 {
     value.unwrap_or(100).clamp(1, 100)
 }
 
+fn clamp_profile_tab_limit(value: Option<i64>) -> i64 {
+    value.unwrap_or(20).clamp(1, 100)
+}
+
 fn clamp_offset(value: Option<i64>) -> i64 {
     value.unwrap_or(0).max(0)
 }
@@ -867,7 +871,7 @@ pub async fn get_profile_notes(
     Query(q): Query<ListingQuery>,
 ) -> Result<Json<Value>, AppError> {
     let pubkey = normalize_pubkey(&pubkey)?;
-    let limit = clamp_listing_limit(q.limit);
+    let limit = clamp_profile_tab_limit(q.limit);
     let offset = clamp_offset(q.offset);
 
     let cache_key = format!("profile:notes:{pubkey}:{limit}:{offset}");
@@ -884,6 +888,7 @@ pub async fn get_profile_notes(
 
     let mut profile_pubkeys: HashSet<String> = events.iter().map(|e| e.pubkey.clone()).collect();
     profile_pubkeys.insert(pubkey.clone());
+    profile_pubkeys.extend(collect_mentioned_pubkeys(&events));
 
     let profile_rows = state
         .repo
@@ -913,7 +918,7 @@ pub async fn get_profile_replies(
     Query(q): Query<ListingQuery>,
 ) -> Result<Json<Value>, AppError> {
     let pubkey = normalize_pubkey(&pubkey)?;
-    let limit = clamp_listing_limit(q.limit);
+    let limit = clamp_profile_tab_limit(q.limit);
     let offset = clamp_offset(q.offset);
 
     let cache_key = format!("profile:replies:{pubkey}:{limit}:{offset}");
@@ -930,6 +935,7 @@ pub async fn get_profile_replies(
 
     let mut profile_pubkeys: HashSet<String> = events.iter().map(|e| e.pubkey.clone()).collect();
     profile_pubkeys.insert(pubkey.clone());
+    profile_pubkeys.extend(collect_mentioned_pubkeys(&events));
 
     let profile_rows = state
         .repo
@@ -959,7 +965,7 @@ pub async fn get_profile_zaps_sent(
     Query(q): Query<ListingQuery>,
 ) -> Result<Json<Value>, AppError> {
     let pubkey = normalize_pubkey(&pubkey)?;
-    let limit = clamp_listing_limit(q.limit);
+    let limit = clamp_profile_tab_limit(q.limit);
     let offset = clamp_offset(q.offset);
 
     let cache_key = format!("profile:zaps_sent:{pubkey}:{limit}:{offset}");
@@ -1004,7 +1010,7 @@ pub async fn get_profile_zaps_received(
     Query(q): Query<ListingQuery>,
 ) -> Result<Json<Value>, AppError> {
     let pubkey = normalize_pubkey(&pubkey)?;
-    let limit = clamp_listing_limit(q.limit);
+    let limit = clamp_profile_tab_limit(q.limit);
     let offset = clamp_offset(q.offset);
 
     let cache_key = format!("profile:zaps_recv:{pubkey}:{limit}:{offset}");
@@ -1108,6 +1114,22 @@ fn enrich_events_with_interactions(
             obj
         })
         .collect()
+}
+
+fn collect_mentioned_pubkeys(events: &[crate::db::models::StoredEvent]) -> HashSet<String> {
+    let mut pubkeys = HashSet::new();
+
+    for event in events {
+        for tag in event.tags.0.iter() {
+            if tag.len() >= 2 && tag[0] == "p" {
+                if let Ok(pubkey) = normalize_pubkey(&tag[1]) {
+                    pubkeys.insert(pubkey);
+                }
+            }
+        }
+    }
+
+    pubkeys
 }
 
 fn normalize_pubkey(input: &str) -> Result<String, AppError> {
