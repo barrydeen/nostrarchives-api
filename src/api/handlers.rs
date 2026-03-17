@@ -27,6 +27,18 @@ pub async fn get_stats(State(state): State<AppState>) -> Result<Json<Value>, App
     Ok(Json(serde_json::to_value(stats).unwrap()))
 }
 
+/// Get follower cache statistics for monitoring.
+pub async fn get_follower_cache_stats(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
+    let stats = state.repo.follower_cache.stats().await;
+    Ok(Json(json!({
+        "qualified_count": stats.qualified_count,
+        "threshold": stats.threshold,
+        "last_refresh_ago_secs": stats.last_refresh_ago.as_secs(),
+        "refresh_interval_secs": stats.refresh_interval.as_secs(),
+        "cache_hit_ratio": "N/A - cache always hits for known pubkeys"
+    })))
+}
+
 /// Query events with filters.
 pub async fn get_events(
     State(state): State<AppState>,

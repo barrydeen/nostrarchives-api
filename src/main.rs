@@ -4,6 +4,7 @@ mod config;
 mod crawler;
 mod db;
 mod error;
+mod follower_cache;
 mod nip19;
 mod ratelimit;
 mod relay;
@@ -80,7 +81,19 @@ async fn main() {
         .expect("failed to connect to database");
     tracing::info!("database connected, migrations applied");
 
-    let repo = db::repository::EventRepository::new(pool, cfg.min_follower_threshold);
+    // Follower cache for high-performance threshold checking
+    let follower_cache = follower_cache::FollowerCache::new(
+        pool.clone(),
+        cfg.min_follower_threshold,
+        cfg.follower_cache_refresh_secs,
+    );
+    
+    // Initialize the cache on startup
+    if let Err(e) = follower_cache.initialize().await {
+        tracing::warn!(error = %e, "Failed to initialize follower cache, continuing anyway");
+    }
+
+    let repo = db::repository::EventRepository::new(pool.clone(), follower_cache);
 
     if cfg.social_graph_bootstrap {
         let builder_repo = repo.clone();

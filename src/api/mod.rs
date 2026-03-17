@@ -80,6 +80,7 @@ pub fn router(state: AppState) -> Router {
     // Rate-limited API routes
     let api_routes = Router::new()
         .route("/v1/stats", get(handlers::get_stats))
+        .route("/v1/stats/follower-cache", get(handlers::get_follower_cache_stats))
         .route("/v1/events", get(handlers::get_events))
         .route("/v1/events/{id}", get(handlers::get_event_by_id))
         .route("/v1/events/{id}/thread", get(handlers::get_event_thread))

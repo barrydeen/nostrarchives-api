@@ -216,7 +216,10 @@ async fn cmd_sync(pool: &sqlx::PgPool, relay_url: &str, dry_run: bool) {
 
     let redis_url = env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
     let redis_client = redis::Client::open(redis_url.as_str()).expect("invalid redis url");
-    let repo = nostr_api::db::repository::EventRepository::new(pool.clone(), 5);
+    
+    // Create a dummy follower cache for testing
+    let follower_cache = nostr_api::follower_cache::FollowerCache::new(pool.clone(), 5, 3600);
+    let repo = nostr_api::db::repository::EventRepository::new(pool.clone(), follower_cache);
     let cache = nostr_api::cache::StatsCache::new(redis_client, repo.clone());
     let syncer = NegentropySyncer::new(repo, cache, pool.clone());
 
@@ -292,7 +295,10 @@ async fn cmd_windowed_sync(
 
     let redis_url = env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
     let redis_client = redis::Client::open(redis_url.as_str()).expect("invalid redis url");
-    let repo = nostr_api::db::repository::EventRepository::new(pool.clone(), 5);
+    
+    // Create a dummy follower cache for testing
+    let follower_cache = nostr_api::follower_cache::FollowerCache::new(pool.clone(), 5, 3600);
+    let repo = nostr_api::db::repository::EventRepository::new(pool.clone(), follower_cache);
     let cache = nostr_api::cache::StatsCache::new(redis_client, repo.clone());
     let syncer = NegentropySyncer::new(repo, cache, pool.clone());
 

@@ -26,6 +26,7 @@ pub struct Config {
     pub crawler_max_relay_pool_size: usize,
     pub crawler_dry_run: bool,
     pub min_follower_threshold: i64,
+    pub follower_cache_refresh_secs: u64,
 }
 
 impl Config {
@@ -153,6 +154,11 @@ impl Config {
             .and_then(|v| v.parse().ok())
             .unwrap_or(5);
 
+        let follower_cache_refresh_secs = env::var("FOLLOWER_CACHE_REFRESH_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(3600); // Default: refresh every hour
+
         Self {
             database_url,
             redis_url,
@@ -178,6 +184,7 @@ impl Config {
             crawler_max_relay_pool_size,
             crawler_dry_run,
             min_follower_threshold,
+            follower_cache_refresh_secs,
         }
     }
 }
