@@ -1003,6 +1003,52 @@ pub async fn get_relay_leaderboard(
     Ok(Json(response))
 }
 
+// ---------------------------------------------------------------------------
+// Daily Analytics
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct DailyAnalyticsQuery {
+    pub days: Option<i64>,
+}
+
+/// GET /v1/analytics/daily?days=30
+///
+/// Returns daily analytics for the last N days (default 30, max 365).
+/// Redis-cached for 24 hours (data is immutable once computed).
+pub async fn get_analytics_daily(
+    State(state): State<AppState>,
+    Query(q): Query<DailyAnalyticsQuery>,
+) -> Result<Json<Value>, AppError> {
+    let days = q.days.unwrap_or(30).clamp(1, 365);
+
+    let cache_key = format!("analytics:daily:{days}");
+    if let Some(cached) = state.cache.get_json(&cache_key).await {
+        if let Ok(val) = serde_json::from_str::<Value>(&cached) {
+            return Ok(Json(val));
+        }
+    }
+
+    let today = Utc::now().date_naive();
+    let since = today - chrono::Duration::days(days);
+
+    let data = state.repo.get_daily_analytics(since, today).await?;
+
+    let response = json!({
+        "data": data,
+        "range": {
+            "from": since.format("%Y-%m-%d").to_string(),
+            "to": today.format("%Y-%m-%d").to_string(),
+        }
+    });
+
+    if let Ok(json_str) = serde_json::to_string(&response) {
+        state.cache.set_json(&cache_key, &json_str, 86400).await;
+    }
+
+    Ok(Json(response))
+}
+
 fn decode_npub(npub: &str) -> Result<String, AppError> {
     let (hrp, data, _) =
         bech32::decode(npub).map_err(|_| AppError::BadRequest(format!("invalid npub: {npub}")))?;

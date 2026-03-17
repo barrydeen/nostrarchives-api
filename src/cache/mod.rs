@@ -162,6 +162,14 @@ impl StatsCache {
         conn.get(&key(cache_key)).await.ok()
     }
 
+    /// Generic JSON cache: delete
+    pub async fn delete_json(&self, cache_key: &str) {
+        let Ok(mut conn) = self.redis.get_multiplexed_async_connection().await else {
+            return;
+        };
+        let _: Result<(), _> = conn.del(&key(cache_key)).await;
+    }
+
     /// Generic JSON cache: set with TTL
     pub async fn set_json(&self, cache_key: &str, json: &str, ttl: u64) {
         let Ok(mut conn) = self.redis.get_multiplexed_async_connection().await else {

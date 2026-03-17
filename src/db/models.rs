@@ -180,6 +180,15 @@ pub struct ClientEntry {
     pub user_count: i64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct DailyAnalyticsRow {
+    pub date: chrono::NaiveDate,
+    pub active_users: i64,
+    pub zaps_sent: i64,
+    pub notes_posted: i64,
+    pub computed_at: chrono::DateTime<chrono::Utc>,
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct RelayLeaderboardEntry {
     pub relay_url: String,
