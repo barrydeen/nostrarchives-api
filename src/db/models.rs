@@ -179,3 +179,9 @@ pub struct ClientEntry {
     pub note_count: i64,
     pub user_count: i64,
 }
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RelayLeaderboardEntry {
+    pub relay_url: String,
+    pub user_count: i64,
+}

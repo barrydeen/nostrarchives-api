@@ -978,6 +978,31 @@ pub async fn get_client_leaderboard(
     Ok(Json(response))
 }
 
+pub async fn get_relay_leaderboard(
+    State(state): State<AppState>,
+    Query(q): Query<ListingQuery>,
+) -> Result<Json<Value>, AppError> {
+    let limit = clamp_listing_limit(q.limit);
+    let offset = clamp_offset(q.offset);
+
+    let cache_key = format!("relays:leaderboard:{limit}:{offset}");
+    if let Some(cached) = state.cache.get_json(&cache_key).await {
+        if let Ok(val) = serde_json::from_str::<Value>(&cached) {
+            return Ok(Json(val));
+        }
+    }
+
+    let relays = state.repo.relay_leaderboard(limit, offset).await?;
+    let response = json!({ "relays": relays });
+
+    if let Ok(json_str) = serde_json::to_string(&response) {
+        // Cache for 30 minutes (heavy query)
+        state.cache.set_json(&cache_key, &json_str, 1800).await;
+    }
+
+    Ok(Json(response))
+}
+
 fn decode_npub(npub: &str) -> Result<String, AppError> {
     let (hrp, data, _) =
         bech32::decode(npub).map_err(|_| AppError::BadRequest(format!("invalid npub: {npub}")))?;
