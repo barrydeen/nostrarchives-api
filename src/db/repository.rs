@@ -2137,7 +2137,7 @@ impl EventRepository {
             .timestamp();
         let end_ts = start_ts + 86400;
 
-        // Credible actors: pubkeys with 10+ followers (eliminates bots/throwaways)
+        // Credible actors: pubkeys with 3+ followers (eliminates bots/throwaways)
         // active_users: distinct credible pubkeys who broadcasted any event
         // notes_posted: kind-1 events from credible pubkeys only
         // zaps_sent: total sats (not event count) from zap receipts in the period
@@ -2147,7 +2147,7 @@ impl EventRepository {
                 SELECT followed_pubkey AS pubkey
                 FROM follows
                 GROUP BY followed_pubkey
-                HAVING COUNT(*) >= 10
+                HAVING COUNT(*) >= 3
             ),
             day_events AS (
                 SELECT e.pubkey, e.kind, e.id
