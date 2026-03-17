@@ -2255,6 +2255,328 @@ impl EventRepository {
 
         Ok(computed)
     }
+
+    // ─── Profile Tabs ───────────────────────────────────────────────
+
+    /// Profile notes: kind 1 events by pubkey that are NOT replies.
+    pub async fn profile_notes(
+        &self,
+        pubkey: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<StoredEvent>, i64), AppError> {
+        let total: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM events e
+            WHERE e.pubkey = $1 AND e.kind = 1
+              AND NOT EXISTS (
+                SELECT 1 FROM event_refs r
+                WHERE r.source_event_id = e.id AND r.ref_type IN ('reply', 'root')
+              )
+            "#,
+        )
+        .bind(pubkey)
+        .fetch_one(&self.pool)
+        .await?;
+
+        let events = sqlx::query_as::<_, StoredEvent>(
+            r#"
+            SELECT e.id, e.pubkey, e.created_at, e.kind, e.content, e.sig, e.tags, e.raw, e.relay_url, e.received_at
+            FROM events e
+            WHERE e.pubkey = $1 AND e.kind = 1
+              AND NOT EXISTS (
+                SELECT 1 FROM event_refs r
+                WHERE r.source_event_id = e.id AND r.ref_type IN ('reply', 'root')
+              )
+            ORDER BY e.created_at DESC
+            LIMIT $2 OFFSET $3
+            "#,
+        )
+        .bind(pubkey)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok((events, total))
+    }
+
+    /// Profile replies: kind 1 events by pubkey that ARE replies.
+    pub async fn profile_replies(
+        &self,
+        pubkey: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<StoredEvent>, i64), AppError> {
+        let total: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM events e
+            WHERE e.pubkey = $1 AND e.kind = 1
+              AND EXISTS (
+                SELECT 1 FROM event_refs r
+                WHERE r.source_event_id = e.id AND r.ref_type IN ('reply', 'root')
+              )
+            "#,
+        )
+        .bind(pubkey)
+        .fetch_one(&self.pool)
+        .await?;
+
+        let events = sqlx::query_as::<_, StoredEvent>(
+            r#"
+            SELECT e.id, e.pubkey, e.created_at, e.kind, e.content, e.sig, e.tags, e.raw, e.relay_url, e.received_at
+            FROM events e
+            WHERE e.pubkey = $1 AND e.kind = 1
+              AND EXISTS (
+                SELECT 1 FROM event_refs r
+                WHERE r.source_event_id = e.id AND r.ref_type IN ('reply', 'root')
+              )
+            ORDER BY e.created_at DESC
+            LIMIT $2 OFFSET $3
+            "#,
+        )
+        .bind(pubkey)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok((events, total))
+    }
+
+    /// Zaps sent by a pubkey (sender is in the embedded zap request).
+    pub async fn profile_zaps_sent(
+        &self,
+        pubkey: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<super::models::ProfileZapEntry>, i64, Vec<ProfileRow>), AppError> {
+        // Count total
+        let total: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM events e
+            JOIN event_tags t_desc ON t_desc.event_id = e.id AND t_desc.tag_name = 'description'
+            WHERE e.kind = 9735
+              AND (t_desc.tag_value::jsonb)->>'pubkey' = $1
+            "#,
+        )
+        .bind(pubkey)
+        .fetch_one(&self.pool)
+        .await?;
+
+        // Fetch zap events with amount, recipient, and zapped event
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                e.id, e.pubkey, e.created_at, e.kind, e.content, e.sig, e.tags, e.raw, e.relay_url, e.received_at,
+                COALESCE(
+                    (SELECT CASE WHEN t_amt.tag_value ~ '^[0-9]+$' THEN t_amt.tag_value::bigint ELSE 0 END
+                     FROM event_tags t_amt WHERE t_amt.event_id = e.id AND t_amt.tag_name = 'amount' LIMIT 1),
+                    0
+                ) AS amount_msats,
+                (SELECT t_p.tag_value FROM event_tags t_p WHERE t_p.event_id = e.id AND t_p.tag_name = 'p' LIMIT 1) AS recipient,
+                (SELECT t_e.tag_value FROM event_tags t_e WHERE t_e.event_id = e.id AND t_e.tag_name = 'e' LIMIT 1) AS zapped_event_id
+            FROM events e
+            JOIN event_tags t_desc ON t_desc.event_id = e.id AND t_desc.tag_name = 'description'
+            WHERE e.kind = 9735
+              AND (t_desc.tag_value::jsonb)->>'pubkey' = $1
+            ORDER BY e.created_at DESC
+            LIMIT $2 OFFSET $3
+            "#,
+        )
+        .bind(pubkey)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut entries = Vec::with_capacity(rows.len());
+        let mut counterparty_pubkeys = HashSet::new();
+        counterparty_pubkeys.insert(pubkey.to_string());
+
+        for row in &rows {
+            let event = StoredEvent {
+                id: row.try_get("id")?,
+                pubkey: row.try_get("pubkey")?,
+                created_at: row.try_get("created_at")?,
+                kind: row.try_get("kind")?,
+                content: row.try_get("content")?,
+                sig: row.try_get("sig")?,
+                tags: row.try_get("tags")?,
+                raw: row.try_get("raw")?,
+                relay_url: row.try_get("relay_url")?,
+                received_at: row.try_get("received_at")?,
+            };
+            let amount_msats: i64 = row.try_get("amount_msats")?;
+            let recipient: Option<String> = row.try_get("recipient")?;
+            let zapped_event_id: Option<String> = row.try_get("zapped_event_id")?;
+
+            if let Some(ref r) = recipient {
+                counterparty_pubkeys.insert(r.clone());
+            }
+
+            entries.push(super::models::ProfileZapEntry {
+                event,
+                amount_sats: amount_msats / 1000,
+                counterparty: recipient,
+                zapped_event_id,
+            });
+        }
+
+        let profile_rows = self
+            .latest_profile_metadata(&counterparty_pubkeys.into_iter().collect::<Vec<_>>())
+            .await?;
+
+        Ok((entries, total, profile_rows))
+    }
+
+    /// Zaps received by a pubkey (recipient is the `p` tag).
+    pub async fn profile_zaps_received(
+        &self,
+        pubkey: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<super::models::ProfileZapEntry>, i64, Vec<ProfileRow>), AppError> {
+        let total: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM events e
+            JOIN event_tags t_p ON t_p.event_id = e.id AND t_p.tag_name = 'p'
+            WHERE e.kind = 9735 AND t_p.tag_value = $1
+            "#,
+        )
+        .bind(pubkey)
+        .fetch_one(&self.pool)
+        .await?;
+
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                e.id, e.pubkey, e.created_at, e.kind, e.content, e.sig, e.tags, e.raw, e.relay_url, e.received_at,
+                COALESCE(
+                    (SELECT CASE WHEN t_amt.tag_value ~ '^[0-9]+$' THEN t_amt.tag_value::bigint ELSE 0 END
+                     FROM event_tags t_amt WHERE t_amt.event_id = e.id AND t_amt.tag_name = 'amount' LIMIT 1),
+                    0
+                ) AS amount_msats,
+                (SELECT (t_desc.tag_value::jsonb)->>'pubkey'
+                 FROM event_tags t_desc WHERE t_desc.event_id = e.id AND t_desc.tag_name = 'description' LIMIT 1) AS sender,
+                (SELECT t_e.tag_value FROM event_tags t_e WHERE t_e.event_id = e.id AND t_e.tag_name = 'e' LIMIT 1) AS zapped_event_id
+            FROM events e
+            JOIN event_tags t_p ON t_p.event_id = e.id AND t_p.tag_name = 'p'
+            WHERE e.kind = 9735 AND t_p.tag_value = $1
+            ORDER BY e.created_at DESC
+            LIMIT $2 OFFSET $3
+            "#,
+        )
+        .bind(pubkey)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut entries = Vec::with_capacity(rows.len());
+        let mut counterparty_pubkeys = HashSet::new();
+        counterparty_pubkeys.insert(pubkey.to_string());
+
+        for row in &rows {
+            let event = StoredEvent {
+                id: row.try_get("id")?,
+                pubkey: row.try_get("pubkey")?,
+                created_at: row.try_get("created_at")?,
+                kind: row.try_get("kind")?,
+                content: row.try_get("content")?,
+                sig: row.try_get("sig")?,
+                tags: row.try_get("tags")?,
+                raw: row.try_get("raw")?,
+                relay_url: row.try_get("relay_url")?,
+                received_at: row.try_get("received_at")?,
+            };
+            let amount_msats: i64 = row.try_get("amount_msats")?;
+            let sender: Option<String> = row.try_get("sender")?;
+            let zapped_event_id: Option<String> = row.try_get("zapped_event_id")?;
+
+            if let Some(ref s) = sender {
+                counterparty_pubkeys.insert(s.clone());
+            }
+
+            entries.push(super::models::ProfileZapEntry {
+                event,
+                amount_sats: amount_msats / 1000,
+                counterparty: sender,
+                zapped_event_id,
+            });
+        }
+
+        let profile_rows = self
+            .latest_profile_metadata(&counterparty_pubkeys.into_iter().collect::<Vec<_>>())
+            .await?;
+
+        Ok((entries, total, profile_rows))
+    }
+
+    /// Aggregate zap stats for a pubkey (total sent + received).
+    pub async fn profile_zap_stats(
+        &self,
+        pubkey: &str,
+    ) -> Result<super::models::ProfileZapStats, AppError> {
+        // Sent
+        let sent_row = sqlx::query(
+            r#"
+            SELECT
+                COALESCE(SUM(
+                    CASE WHEN t_amt.tag_value ~ '^[0-9]+$' THEN t_amt.tag_value::bigint ELSE 0 END
+                ), 0)::bigint AS total_msats,
+                COUNT(*)::bigint AS zap_count
+            FROM events e
+            JOIN event_tags t_desc ON t_desc.event_id = e.id AND t_desc.tag_name = 'description'
+            JOIN event_tags t_amt ON t_amt.event_id = e.id AND t_amt.tag_name = 'amount'
+            WHERE e.kind = 9735
+              AND (t_desc.tag_value::jsonb)->>'pubkey' = $1
+            "#,
+        )
+        .bind(pubkey)
+        .fetch_one(&self.pool)
+        .await?;
+
+        let sent_msats: i64 = sent_row.try_get("total_msats")?;
+        let sent_count: i64 = sent_row.try_get("zap_count")?;
+
+        // Received
+        let recv_row = sqlx::query(
+            r#"
+            SELECT
+                COALESCE(SUM(
+                    CASE WHEN t_amt.tag_value ~ '^[0-9]+$' THEN t_amt.tag_value::bigint ELSE 0 END
+                ), 0)::bigint AS total_msats,
+                COUNT(*)::bigint AS zap_count
+            FROM events e
+            JOIN event_tags t_p ON t_p.event_id = e.id AND t_p.tag_name = 'p'
+            JOIN event_tags t_amt ON t_amt.event_id = e.id AND t_amt.tag_name = 'amount'
+            WHERE e.kind = 9735 AND t_p.tag_value = $1
+            "#,
+        )
+        .bind(pubkey)
+        .fetch_one(&self.pool)
+        .await?;
+
+        let recv_msats: i64 = recv_row.try_get("total_msats")?;
+        let recv_count: i64 = recv_row.try_get("zap_count")?;
+
+        Ok(super::models::ProfileZapStats {
+            pubkey: pubkey.to_string(),
+            sent: super::models::ZapAggregate {
+                total_sats: sent_msats / 1000,
+                zap_count: sent_count,
+            },
+            received: super::models::ZapAggregate {
+                total_sats: recv_msats / 1000,
+                zap_count: recv_count,
+            },
+        })
+    }
 }
 
 enum BindValue {
