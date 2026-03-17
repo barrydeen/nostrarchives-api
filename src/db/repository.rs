@@ -74,7 +74,7 @@ impl EventRepository {
             // For zap receipts (kind 9735), extract the amount from the embedded
             // zap request in the "description" tag (NIP-57).
             if event.kind == 9735 {
-                self.extract_zap_amount(event).await?;
+                self.extract_zap_metadata(event).await?;
             }
         }
 
@@ -198,6 +198,8 @@ impl EventRepository {
             return Ok(());
         }
 
+        let mut has_reply_ref = false;
+
         for tag in &e_tags {
             let target_id = &tag[1];
             let relay_hint = tag.get(2).filter(|s| !s.is_empty()).cloned();
@@ -231,6 +233,10 @@ impl EventRepository {
                 _ => "mention",
             };
 
+            if ref_type == "reply" || ref_type == "root" {
+                has_reply_ref = true;
+            }
+
             sqlx::query(
                 "INSERT INTO event_refs (source_event_id, target_event_id, ref_type, relay_hint, created_at)
                  VALUES ($1, $2, $3, $4, $5)
@@ -245,47 +251,94 @@ impl EventRepository {
             .await?;
         }
 
+        if has_reply_ref {
+            sqlx::query("UPDATE events SET is_reply = true WHERE id = $1")
+                .bind(&event.id)
+                .execute(&self.pool)
+                .await?;
+        }
+
         Ok(())
     }
 
-    /// Extract the zap amount from a kind-9735 zap receipt's embedded zap request.
+    /// Extract zap metadata from a kind-9735 zap receipt's embedded zap request.
     /// The "description" tag contains a JSON-encoded kind-9734 event whose tags
-    /// include ["amount", "<msats>"]. We insert a synthetic amount tag into event_tags.
-    async fn extract_zap_amount(&self, event: &NostrEvent) -> Result<(), AppError> {
+    /// include ["amount", "<msats>"]. We insert a synthetic amount tag into event_tags
+    /// and persist normalized zap metadata for fast profile queries.
+    async fn extract_zap_metadata(&self, event: &NostrEvent) -> Result<(), AppError> {
         let description = event
             .tags
             .iter()
             .find(|t| t.len() >= 2 && t[0] == "description")
             .map(|t| &t[1]);
 
-        let Some(desc_json) = description else {
-            return Ok(());
-        };
+        let mut amount_tag_value: Option<String> = None;
+        let mut amount_msats: i64 = 0;
+        let mut sender_pubkey: Option<String> = None;
 
-        let Ok(zap_request) = serde_json::from_str::<serde_json::Value>(desc_json) else {
-            return Ok(());
-        };
+        if let Some(desc_json) = description {
+            if let Ok(zap_request) = serde_json::from_str::<serde_json::Value>(desc_json) {
+                sender_pubkey = zap_request
+                    .get("pubkey")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_lowercase());
 
-        let Some(tags) = zap_request.get("tags").and_then(|t| t.as_array()) else {
-            return Ok(());
-        };
-
-        for tag in tags {
-            let Some(arr) = tag.as_array() else { continue };
-            if arr.len() >= 2 && arr[0].as_str() == Some("amount") && arr[1].as_str().is_some() {
-                let amount = arr[1].as_str().unwrap();
-                sqlx::query(
-                    "INSERT INTO event_tags (event_id, tag_name, tag_value, extra_values)
-                     VALUES ($1, 'amount', $2, '[]')
-                     ON CONFLICT DO NOTHING",
-                )
-                .bind(&event.id)
-                .bind(amount)
-                .execute(&self.pool)
-                .await?;
-                break;
+                if let Some(tags) = zap_request.get("tags").and_then(|t| t.as_array()) {
+                    for tag in tags {
+                        let Some(arr) = tag.as_array() else { continue };
+                        if arr.len() >= 2 && arr[0].as_str() == Some("amount") {
+                            if let Some(raw) = arr[1].as_str() {
+                                amount_tag_value = Some(raw.to_string());
+                                if let Ok(parsed) = raw.parse::<i64>() {
+                                    amount_msats = parsed;
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
             }
         }
+
+        if let Some(amount) = amount_tag_value.as_deref() {
+            sqlx::query(
+                "INSERT INTO event_tags (event_id, tag_name, tag_value, extra_values)
+                 VALUES ($1, 'amount', $2, '[]')
+                 ON CONFLICT DO NOTHING",
+            )
+            .bind(&event.id)
+            .bind(amount)
+            .execute(&self.pool)
+            .await?;
+        }
+
+        let recipient_pubkey = event
+            .tags
+            .iter()
+            .find(|t| t.len() >= 2 && t[0] == "p")
+            .and_then(|t| t.get(1))
+            .map(|s| s.to_lowercase());
+
+        let zapped_event_id = event
+            .tags
+            .iter()
+            .find(|t| t.len() >= 2 && t[0] == "e")
+            .and_then(|t| t.get(1))
+            .cloned();
+
+        sqlx::query(
+            "INSERT INTO zap_metadata (event_id, sender_pubkey, recipient_pubkey, amount_msats, zapped_event_id, created_at)
+             VALUES ($1, $2, $3, $4, $5, $6)
+             ON CONFLICT (event_id) DO NOTHING",
+        )
+        .bind(&event.id)
+        .bind(sender_pubkey)
+        .bind(recipient_pubkey)
+        .bind(amount_msats)
+        .bind(zapped_event_id)
+        .bind(event.created_at)
+        .execute(&self.pool)
+        .await?;
 
         Ok(())
     }
@@ -1178,22 +1231,13 @@ impl EventRepository {
             // Sender pubkey is inside the embedded zap request JSON (description tag)
             sqlx::query_as::<_, (String, i64, i64)>(
                 r#"
-                WITH zap_data AS (
-                    SELECT
-                        LOWER(substring(t_desc.tag_value from '"pubkey"\s*:\s*"([0-9a-fA-F]{64})"')) AS sender,
-                        CASE WHEN t_amt.tag_value ~ '^[0-9]+$'
-                             THEN t_amt.tag_value::bigint ELSE 0 END AS amount_msats
-                    FROM events e
-                    JOIN event_tags t_amt ON t_amt.event_id = e.id AND t_amt.tag_name = 'amount'
-                    JOIN event_tags t_desc ON t_desc.event_id = e.id AND t_desc.tag_name = 'description'
-                    WHERE e.kind = 9735 AND e.created_at >= $1
-                )
-                SELECT sender AS pubkey,
+                SELECT sender_pubkey AS pubkey,
                        (SUM(amount_msats) / 1000)::bigint AS total_sats,
                        COUNT(*)::bigint AS zap_count
-                FROM zap_data
-                WHERE sender IS NOT NULL AND sender != ''
-                GROUP BY sender
+                FROM zap_metadata
+                WHERE sender_pubkey IS NOT NULL AND sender_pubkey != ''
+                  AND created_at >= $1
+                GROUP BY sender_pubkey
                 ORDER BY total_sats DESC
                 LIMIT $2 OFFSET $3
                 "#,
@@ -1207,22 +1251,13 @@ impl EventRepository {
             // Received: recipient is the p tag on the zap receipt
             sqlx::query_as::<_, (String, i64, i64)>(
                 r#"
-                WITH zap_data AS (
-                    SELECT
-                        t_p.tag_value AS recipient,
-                        CASE WHEN t_amt.tag_value ~ '^[0-9]+$'
-                             THEN t_amt.tag_value::bigint ELSE 0 END AS amount_msats
-                    FROM events e
-                    JOIN event_tags t_amt ON t_amt.event_id = e.id AND t_amt.tag_name = 'amount'
-                    JOIN event_tags t_p ON t_p.event_id = e.id AND t_p.tag_name = 'p'
-                    WHERE e.kind = 9735 AND e.created_at >= $1
-                )
-                SELECT recipient AS pubkey,
+                SELECT recipient_pubkey AS pubkey,
                        (SUM(amount_msats) / 1000)::bigint AS total_sats,
                        COUNT(*)::bigint AS zap_count
-                FROM zap_data
-                WHERE recipient IS NOT NULL AND recipient != ''
-                GROUP BY recipient
+                FROM zap_metadata
+                WHERE recipient_pubkey IS NOT NULL AND recipient_pubkey != ''
+                  AND created_at >= $1
+                GROUP BY recipient_pubkey
                 ORDER BY total_sats DESC
                 LIMIT $2 OFFSET $3
                 "#,
@@ -2266,15 +2301,7 @@ impl EventRepository {
         offset: i64,
     ) -> Result<(Vec<StoredEvent>, i64), AppError> {
         let total: i64 = sqlx::query_scalar(
-            r#"
-            SELECT COUNT(*)
-            FROM events e
-            WHERE e.pubkey = $1 AND e.kind = 1
-              AND NOT EXISTS (
-                SELECT 1 FROM event_refs r
-                WHERE r.source_event_id = e.id AND r.ref_type IN ('reply', 'root')
-              )
-            "#,
+            "SELECT COUNT(*) FROM events WHERE pubkey = $1 AND kind = 1 AND NOT is_reply",
         )
         .bind(pubkey)
         .fetch_one(&self.pool)
@@ -2282,14 +2309,10 @@ impl EventRepository {
 
         let events = sqlx::query_as::<_, StoredEvent>(
             r#"
-            SELECT e.id, e.pubkey, e.created_at, e.kind, e.content, e.sig, e.tags, e.raw, e.relay_url, e.received_at
-            FROM events e
-            WHERE e.pubkey = $1 AND e.kind = 1
-              AND NOT EXISTS (
-                SELECT 1 FROM event_refs r
-                WHERE r.source_event_id = e.id AND r.ref_type IN ('reply', 'root')
-              )
-            ORDER BY e.created_at DESC
+            SELECT id, pubkey, created_at, kind, content, sig, tags, raw, relay_url, received_at
+            FROM events
+            WHERE pubkey = $1 AND kind = 1 AND NOT is_reply
+            ORDER BY created_at DESC
             LIMIT $2 OFFSET $3
             "#,
         )
@@ -2310,15 +2333,7 @@ impl EventRepository {
         offset: i64,
     ) -> Result<(Vec<StoredEvent>, i64), AppError> {
         let total: i64 = sqlx::query_scalar(
-            r#"
-            SELECT COUNT(*)
-            FROM events e
-            WHERE e.pubkey = $1 AND e.kind = 1
-              AND EXISTS (
-                SELECT 1 FROM event_refs r
-                WHERE r.source_event_id = e.id AND r.ref_type IN ('reply', 'root')
-              )
-            "#,
+            "SELECT COUNT(*) FROM events WHERE pubkey = $1 AND kind = 1 AND is_reply",
         )
         .bind(pubkey)
         .fetch_one(&self.pool)
@@ -2326,14 +2341,10 @@ impl EventRepository {
 
         let events = sqlx::query_as::<_, StoredEvent>(
             r#"
-            SELECT e.id, e.pubkey, e.created_at, e.kind, e.content, e.sig, e.tags, e.raw, e.relay_url, e.received_at
-            FROM events e
-            WHERE e.pubkey = $1 AND e.kind = 1
-              AND EXISTS (
-                SELECT 1 FROM event_refs r
-                WHERE r.source_event_id = e.id AND r.ref_type IN ('reply', 'root')
-              )
-            ORDER BY e.created_at DESC
+            SELECT id, pubkey, created_at, kind, content, sig, tags, raw, relay_url, received_at
+            FROM events
+            WHERE pubkey = $1 AND kind = 1 AND is_reply
+            ORDER BY created_at DESC
             LIMIT $2 OFFSET $3
             "#,
         )
@@ -2353,37 +2364,24 @@ impl EventRepository {
         limit: i64,
         offset: i64,
     ) -> Result<(Vec<super::models::ProfileZapEntry>, i64, Vec<ProfileRow>), AppError> {
-        // Count total
         let total: i64 = sqlx::query_scalar(
-            r#"
-            SELECT COUNT(*)
-            FROM events e
-            JOIN event_tags t_desc ON t_desc.event_id = e.id AND t_desc.tag_name = 'description'
-            WHERE e.kind = 9735
-              AND LOWER(substring(t_desc.tag_value from '"pubkey"\s*:\s*"([0-9a-fA-F]{64})"')) = $1
-            "#,
+            "SELECT COUNT(*) FROM zap_metadata WHERE sender_pubkey = $1",
         )
         .bind(pubkey)
         .fetch_one(&self.pool)
         .await?;
 
-        // Fetch zap events with amount, recipient, and zapped event
         let rows = sqlx::query(
             r#"
             SELECT
                 e.id, e.pubkey, e.created_at, e.kind, e.content, e.sig, e.tags, e.raw, e.relay_url, e.received_at,
-                COALESCE(
-                    (SELECT CASE WHEN t_amt.tag_value ~ '^[0-9]+$' THEN t_amt.tag_value::bigint ELSE 0 END
-                     FROM event_tags t_amt WHERE t_amt.event_id = e.id AND t_amt.tag_name = 'amount' LIMIT 1),
-                    0
-                ) AS amount_msats,
-                (SELECT t_p.tag_value FROM event_tags t_p WHERE t_p.event_id = e.id AND t_p.tag_name = 'p' LIMIT 1) AS recipient,
-                (SELECT t_e.tag_value FROM event_tags t_e WHERE t_e.event_id = e.id AND t_e.tag_name = 'e' LIMIT 1) AS zapped_event_id
-            FROM events e
-            JOIN event_tags t_desc ON t_desc.event_id = e.id AND t_desc.tag_name = 'description'
-            WHERE e.kind = 9735
-              AND LOWER(substring(t_desc.tag_value from '"pubkey"\s*:\s*"([0-9a-fA-F]{64})"')) = $1
-            ORDER BY e.created_at DESC
+                zm.amount_msats,
+                zm.recipient_pubkey,
+                zm.zapped_event_id
+            FROM zap_metadata zm
+            JOIN events e ON e.id = zm.event_id
+            WHERE zm.sender_pubkey = $1
+            ORDER BY zm.created_at DESC
             LIMIT $2 OFFSET $3
             "#,
         )
@@ -2411,7 +2409,7 @@ impl EventRepository {
                 received_at: row.try_get("received_at")?,
             };
             let amount_msats: i64 = row.try_get("amount_msats")?;
-            let recipient: Option<String> = row.try_get("recipient")?;
+            let recipient: Option<String> = row.try_get("recipient_pubkey")?;
             let zapped_event_id: Option<String> = row.try_get("zapped_event_id")?;
 
             if let Some(ref r) = recipient {
@@ -2441,12 +2439,7 @@ impl EventRepository {
         offset: i64,
     ) -> Result<(Vec<super::models::ProfileZapEntry>, i64, Vec<ProfileRow>), AppError> {
         let total: i64 = sqlx::query_scalar(
-            r#"
-            SELECT COUNT(*)
-            FROM events e
-            JOIN event_tags t_p ON t_p.event_id = e.id AND t_p.tag_name = 'p'
-            WHERE e.kind = 9735 AND t_p.tag_value = $1
-            "#,
+            "SELECT COUNT(*) FROM zap_metadata WHERE recipient_pubkey = $1",
         )
         .bind(pubkey)
         .fetch_one(&self.pool)
@@ -2456,18 +2449,13 @@ impl EventRepository {
             r#"
             SELECT
                 e.id, e.pubkey, e.created_at, e.kind, e.content, e.sig, e.tags, e.raw, e.relay_url, e.received_at,
-                COALESCE(
-                    (SELECT CASE WHEN t_amt.tag_value ~ '^[0-9]+$' THEN t_amt.tag_value::bigint ELSE 0 END
-                     FROM event_tags t_amt WHERE t_amt.event_id = e.id AND t_amt.tag_name = 'amount' LIMIT 1),
-                    0
-                ) AS amount_msats,
-                (SELECT LOWER(substring(t_desc.tag_value from '"pubkey"\s*:\s*"([0-9a-fA-F]{64})"'))
-                 FROM event_tags t_desc WHERE t_desc.event_id = e.id AND t_desc.tag_name = 'description' LIMIT 1) AS sender,
-                (SELECT t_e.tag_value FROM event_tags t_e WHERE t_e.event_id = e.id AND t_e.tag_name = 'e' LIMIT 1) AS zapped_event_id
-            FROM events e
-            JOIN event_tags t_p ON t_p.event_id = e.id AND t_p.tag_name = 'p'
-            WHERE e.kind = 9735 AND t_p.tag_value = $1
-            ORDER BY e.created_at DESC
+                zm.amount_msats,
+                zm.sender_pubkey,
+                zm.zapped_event_id
+            FROM zap_metadata zm
+            JOIN events e ON e.id = zm.event_id
+            WHERE zm.recipient_pubkey = $1
+            ORDER BY zm.created_at DESC
             LIMIT $2 OFFSET $3
             "#,
         )
@@ -2495,7 +2483,7 @@ impl EventRepository {
                 received_at: row.try_get("received_at")?,
             };
             let amount_msats: i64 = row.try_get("amount_msats")?;
-            let sender: Option<String> = row.try_get("sender")?;
+            let sender: Option<String> = row.try_get("sender_pubkey")?;
             let zapped_event_id: Option<String> = row.try_get("zapped_event_id")?;
 
             if let Some(ref s) = sender {
@@ -2522,58 +2510,29 @@ impl EventRepository {
         &self,
         pubkey: &str,
     ) -> Result<super::models::ProfileZapStats, AppError> {
-        // Sent
-        let sent_row = sqlx::query(
-            r#"
-            SELECT
-                COALESCE(SUM(
-                    CASE WHEN t_amt.tag_value ~ '^[0-9]+$' THEN t_amt.tag_value::bigint ELSE 0 END
-                ), 0)::bigint AS total_msats,
-                COUNT(*)::bigint AS zap_count
-            FROM events e
-            JOIN event_tags t_desc ON t_desc.event_id = e.id AND t_desc.tag_name = 'description'
-            JOIN event_tags t_amt ON t_amt.event_id = e.id AND t_amt.tag_name = 'amount'
-            WHERE e.kind = 9735
-              AND LOWER(substring(t_desc.tag_value from '"pubkey"\s*:\s*"([0-9a-fA-F]{64})"')) = $1
-            "#,
+        let sent_row: (i64, i64) = sqlx::query_as(
+            "SELECT COALESCE(SUM(amount_msats), 0)::bigint / 1000, COUNT(*)::bigint FROM zap_metadata WHERE sender_pubkey = $1",
         )
         .bind(pubkey)
         .fetch_one(&self.pool)
         .await?;
 
-        let sent_msats: i64 = sent_row.try_get("total_msats")?;
-        let sent_count: i64 = sent_row.try_get("zap_count")?;
-
-        // Received
-        let recv_row = sqlx::query(
-            r#"
-            SELECT
-                COALESCE(SUM(
-                    CASE WHEN t_amt.tag_value ~ '^[0-9]+$' THEN t_amt.tag_value::bigint ELSE 0 END
-                ), 0)::bigint AS total_msats,
-                COUNT(*)::bigint AS zap_count
-            FROM events e
-            JOIN event_tags t_p ON t_p.event_id = e.id AND t_p.tag_name = 'p'
-            JOIN event_tags t_amt ON t_amt.event_id = e.id AND t_amt.tag_name = 'amount'
-            WHERE e.kind = 9735 AND t_p.tag_value = $1
-            "#,
+        let recv_row: (i64, i64) = sqlx::query_as(
+            "SELECT COALESCE(SUM(amount_msats), 0)::bigint / 1000, COUNT(*)::bigint FROM zap_metadata WHERE recipient_pubkey = $1",
         )
         .bind(pubkey)
         .fetch_one(&self.pool)
         .await?;
-
-        let recv_msats: i64 = recv_row.try_get("total_msats")?;
-        let recv_count: i64 = recv_row.try_get("zap_count")?;
 
         Ok(super::models::ProfileZapStats {
             pubkey: pubkey.to_string(),
             sent: super::models::ZapAggregate {
-                total_sats: sent_msats / 1000,
-                zap_count: sent_count,
+                total_sats: sent_row.0,
+                zap_count: sent_row.1,
             },
             received: super::models::ZapAggregate {
-                total_sats: recv_msats / 1000,
-                zap_count: recv_count,
+                total_sats: recv_row.0,
+                zap_count: recv_row.1,
             },
         })
     }
