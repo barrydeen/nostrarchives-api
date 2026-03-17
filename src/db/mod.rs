@@ -72,6 +72,10 @@ async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
             "011_negentropy_sync_state",
             include_str!("../../migrations/011_negentropy_sync_state.sql"),
         ),
+        (
+            "012_daily_analytics",
+            include_str!("../../migrations/012_daily_analytics.sql"),
+        ),
     ];
 
     for (name, sql) in migrations {
