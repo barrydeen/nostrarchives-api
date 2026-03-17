@@ -2054,6 +2054,7 @@ impl EventRepository {
             WHERE et.tag_name = 'client'
               AND e.kind = 1
               AND LENGTH(et.tag_value) BETWEEN 1 AND 100
+              AND LOWER(et.tag_value) NOT IN ('mostr')
             GROUP BY LOWER(et.tag_value)
             HAVING COUNT(DISTINCT et.event_id) >= 2
             ORDER BY note_count DESC
