@@ -41,7 +41,7 @@ INSERT INTO zap_metadata (event_id, sender_pubkey, recipient_pubkey, amount_msat
 SELECT
     e.id,
     LOWER(substring(td.tag_value from '"pubkey"\s*:\s*"([0-9a-fA-F]{64})"')),
-    tp.tag_value,
+    LOWER(tp.tag_value),
     COALESCE(CASE WHEN ta.tag_value ~ '^[0-9]+$' THEN ta.tag_value::bigint ELSE 0 END, 0),
     te.tag_value,
     e.created_at
