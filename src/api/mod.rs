@@ -40,6 +40,8 @@ async fn cache_control_middleware(
         300
     } else if path.contains("/profiles/metadata") {
         300
+    } else if path.contains("/clients/") {
+        600
     } else {
         60
     };
@@ -91,6 +93,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/hashtags/{tag}/notes", get(handlers::get_hashtag_notes))
         .route("/v1/stats/daily", get(handlers::get_daily_stats))
 
+        .route("/v1/clients/leaderboard", get(handlers::get_client_leaderboard))
         .route("/v1/notes/search", get(handlers::advanced_note_search))
         .route("/v1/search", get(handlers::search))
         .route("/v1/search/suggest", get(handlers::search_suggest))

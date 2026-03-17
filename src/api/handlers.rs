@@ -950,6 +950,34 @@ pub async fn get_hashtag_notes(
     Ok(Json(response))
 }
 
+/// Client leaderboard: `GET /v1/clients/leaderboard?limit=50&offset=0`
+///
+/// Returns Nostr clients ranked by note count, with distinct user counts.
+/// Redis-cached for 10 minutes.
+pub async fn get_client_leaderboard(
+    State(state): State<AppState>,
+    Query(q): Query<ListingQuery>,
+) -> Result<Json<Value>, AppError> {
+    let limit = clamp_listing_limit(q.limit);
+    let offset = clamp_offset(q.offset);
+
+    let cache_key = format!("clients:leaderboard:{limit}:{offset}");
+    if let Some(cached) = state.cache.get_json(&cache_key).await {
+        if let Ok(val) = serde_json::from_str::<Value>(&cached) {
+            return Ok(Json(val));
+        }
+    }
+
+    let clients = state.repo.client_leaderboard(limit, offset).await?;
+    let response = json!({ "clients": clients });
+
+    if let Ok(json_str) = serde_json::to_string(&response) {
+        state.cache.set_json(&cache_key, &json_str, 600).await;
+    }
+
+    Ok(Json(response))
+}
+
 fn decode_npub(npub: &str) -> Result<String, AppError> {
     let (hrp, data, _) =
         bech32::decode(npub).map_err(|_| AppError::BadRequest(format!("invalid npub: {npub}")))?;

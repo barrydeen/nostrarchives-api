@@ -2033,6 +2033,47 @@ impl EventRepository {
             .map(|(hashtag, count)| super::models::TrendingHashtag { hashtag, count })
             .collect())
     }
+
+    /// Client leaderboard: top Nostr clients by note count and distinct users.
+    ///
+    /// Reads `client` tags from `event_tags`, joins to `events` (kind=1 notes only),
+    /// and aggregates per client name. Case-insensitive grouping merges variants
+    /// like "Coracle" / "coracle". Returns results ordered by note_count DESC.
+    pub async fn client_leaderboard(
+        &self,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<super::models::ClientEntry>, AppError> {
+        let rows = sqlx::query_as::<_, (String, i64, i64)>(
+            r#"
+            SELECT LOWER(et.tag_value)                   AS client_name,
+                   COUNT(DISTINCT et.event_id)::bigint    AS note_count,
+                   COUNT(DISTINCT e.pubkey)::bigint       AS user_count
+            FROM event_tags et
+            JOIN events e ON e.id = et.event_id
+            WHERE et.tag_name = 'client'
+              AND e.kind = 1
+              AND LENGTH(et.tag_value) BETWEEN 1 AND 100
+            GROUP BY LOWER(et.tag_value)
+            HAVING COUNT(DISTINCT et.event_id) >= 2
+            ORDER BY note_count DESC
+            LIMIT $1 OFFSET $2
+            "#,
+        )
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|(client_name, note_count, user_count)| super::models::ClientEntry {
+                client_name,
+                note_count,
+                user_count,
+            })
+            .collect())
+    }
 }
 
 enum BindValue {
