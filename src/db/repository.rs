@@ -2137,17 +2137,39 @@ impl EventRepository {
             .timestamp();
         let end_ts = start_ts + 86400;
 
+        // Credible actors: pubkeys with 10+ followers (eliminates bots/throwaways)
+        // active_users: distinct credible pubkeys who broadcasted any event
+        // notes_posted: kind-1 events from credible pubkeys only
+        // zaps_sent: total sats (not event count) from zap receipts in the period
         sqlx::query(
             r#"
+            WITH credible_actors AS (
+                SELECT followed_pubkey AS pubkey
+                FROM follows
+                GROUP BY followed_pubkey
+                HAVING COUNT(*) >= 10
+            ),
+            day_events AS (
+                SELECT e.pubkey, e.kind, e.id
+                FROM events e
+                INNER JOIN credible_actors ca ON ca.pubkey = e.pubkey
+                WHERE e.created_at >= $2 AND e.created_at < $3
+            ),
+            zap_sats AS (
+                SELECT COALESCE(SUM(
+                    CASE WHEN et.tag_value ~ '^[0-9]+$' THEN et.tag_value::bigint ELSE 0 END
+                ) / 1000, 0)::bigint AS total_sats
+                FROM events e
+                JOIN event_tags et ON et.event_id = e.id AND et.tag_name = 'amount'
+                WHERE e.kind = 9735 AND e.created_at >= $2 AND e.created_at < $3
+            )
             INSERT INTO daily_analytics (date, active_users, zaps_sent, notes_posted, computed_at)
             SELECT
                 $1::date,
-                COUNT(DISTINCT pubkey)::bigint,
-                COUNT(*) FILTER (WHERE kind = 9735)::bigint,
-                COUNT(*) FILTER (WHERE kind = 1)::bigint,
+                (SELECT COUNT(DISTINCT pubkey) FROM day_events)::bigint,
+                (SELECT total_sats FROM zap_sats),
+                (SELECT COUNT(*) FROM day_events WHERE kind = 1)::bigint,
                 NOW()
-            FROM events
-            WHERE created_at >= $2 AND created_at < $3
             ON CONFLICT (date) DO UPDATE SET
                 active_users = EXCLUDED.active_users,
                 zaps_sent = EXCLUDED.zaps_sent,
