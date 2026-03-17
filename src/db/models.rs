@@ -172,3 +172,10 @@ pub struct TrendingHashtag {
     pub hashtag: String,
     pub count: i64,
 }
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ClientEntry {
+    pub client_name: String,
+    pub note_count: i64,
+    pub user_count: i64,
+}
