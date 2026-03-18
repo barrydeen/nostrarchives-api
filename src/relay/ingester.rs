@@ -20,23 +20,18 @@ struct IngestedEvent {
 
 /// Kinds we ingest. Everything else is dropped.
 ///
+/// v2: Removed NIP-51 lists (10000, 10003, 10063, 30000-30003) -- not used by any endpoint.
+/// Kept 6/7/16 for real-time counter increments (processed as counters, not stored).
+///
 /// - 0:     Profile metadata (NIP-01)
 /// - 1:     Short text note (NIP-01)
-/// - 6:     Repost (NIP-18)
-/// - 7:     Reaction (NIP-25)
-/// - 16:    Generic repost (NIP-18)
-/// - 9735:  Zap receipt (NIP-57)
-/// - 10000: Mute list (NIP-51)
-/// - 10002: Relay list (NIP-65)
-/// - 10003: Bookmarks (NIP-51)
-/// - 10063: Media server list (Blossom)
-/// - 30000: Follow sets (NIP-51)
-/// - 30001: Generic lists (NIP-51)
-/// - 30002: Relay sets (NIP-51)
-/// - 30003: Bookmark sets (NIP-51)
-const ALLOWED_KINDS: &[i64] = &[
-    0, 1, 3, 6, 7, 16, 9735, 10000, 10002, 10003, 10063, 30000, 30001, 30002, 30003,
-];
+/// - 3:     Contact list (NIP-02) -- social graph
+/// - 6:     Repost (NIP-18) -- counter only
+/// - 7:     Reaction (NIP-25) -- counter only
+/// - 16:    Generic repost (NIP-18) -- counter only
+/// - 9735:  Zap receipt (NIP-57) -- always stored
+/// - 10002: Relay list (NIP-65) -- upsert only
+const ALLOWED_KINDS: &[i64] = &[0, 1, 3, 6, 7, 16, 9735, 10002];
 
 /// Manages connections to multiple relays and ingests events into the database.
 pub struct RelayIngester {
@@ -216,8 +211,8 @@ impl RelayIngester {
     }
 
     /// Process incoming events: deduplicate, store in DB, update cache.
-    /// Submits author pubkeys (and referenced pubkeys from follow lists) to the
-    /// metadata resolver for kind-0 fetching.
+    /// v2: kind-based routing -- reactions/reposts are counter-only,
+    /// kind-3/10002 are upsert-only.
     async fn process_events(
         mut rx: mpsc::Receiver<IngestedEvent>,
         repo: EventRepository,
@@ -235,10 +230,14 @@ impl RelayIngester {
                             cache.on_event_ingested(&ingested.event.pubkey, ingested.event.kind).await;
 
                             // Queue author pubkey for metadata resolution
-                            if let Some(ref tx) = metadata_tx {
-                                let _ = tx.try_send(ingested.event.pubkey.clone());
+                            // (skip for counter-only kinds 6/7/16 since we don't store them)
+                            if !matches!(ingested.event.kind, 6 | 7 | 16) {
+                                if let Some(ref tx) = metadata_tx {
+                                    let _ = tx.try_send(ingested.event.pubkey.clone());
+                                }
                             }
 
+                            // Kind-3: upsert follow list (social graph)
                             if ingested.event.kind == 3 {
                                 if let Err(e) = repo.upsert_follow_list(&ingested.event).await {
                                     tracing::error!(error = %e, event_id = %ingested.event.id, "failed to upsert follow list");
@@ -259,7 +258,7 @@ impl RelayIngester {
                                 tracing::info!(total = count, "events ingested");
                             }
                         }
-                        Ok(false) => {} // duplicate, skip
+                        Ok(false) => {} // duplicate or skipped
                         Err(e) => {
                             tracing::error!(error = %e, event_id = %ingested.event.id, "failed to insert event");
                         }

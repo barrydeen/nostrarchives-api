@@ -24,11 +24,52 @@ impl CrawlQueue {
         Self { pool }
     }
 
-    /// Seed the crawl queue from the follows table.
-    /// Inserts any pubkeys that appear as followed but don't yet have a crawl_state row.
-    /// Also updates follower counts and priority tiers for all existing rows.
+    /// Seed the crawl queue from WoT scores.
+    /// Seed the crawl queue from follows table, then upgrade tiers using WoT scores.
+    ///
+    /// Always seeds from raw follows first (ensures all followed authors are queued),
+    /// then upgrades priority tiers for authors that pass WoT. This avoids the
+    /// chicken-and-egg problem where WoT scores are sparse on a fresh database.
     pub async fn sync_from_follows(&self) -> Result<SyncStats, AppError> {
-        // Step 1: Insert new pubkeys from follows that aren't tracked yet
+        // Step 1: Always seed from raw follows (the complete follower graph)
+        let base_stats = self.sync_from_raw_follows().await?;
+
+        // Step 2: Upgrade tiers using WoT scores if available
+        let wot_upgraded = sqlx::query(
+            r#"
+            UPDATE crawl_state cs
+            SET
+                priority_tier = CASE
+                    WHEN ws.quality_followers >= 1000 THEN 1
+                    WHEN ws.quality_followers >= 100  THEN 2
+                    WHEN ws.quality_followers >= 21   THEN 3
+                    ELSE cs.priority_tier
+                END,
+                updated_at = NOW()
+            FROM wot_scores ws
+            WHERE cs.pubkey = ws.pubkey
+              AND ws.passes_wot = true
+              AND cs.priority_tier > CASE
+                    WHEN ws.quality_followers >= 1000 THEN 1
+                    WHEN ws.quality_followers >= 100  THEN 2
+                    WHEN ws.quality_followers >= 21   THEN 3
+                    ELSE 99
+                END
+            "#,
+        )
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+
+        if wot_upgraded > 0 {
+            tracing::info!(upgraded = wot_upgraded, "crawl queue: upgraded tiers from WoT scores");
+        }
+
+        Ok(base_stats)
+    }
+
+    /// Seed from raw follows table.
+    async fn sync_from_raw_follows(&self) -> Result<SyncStats, AppError> {
         let inserted = sqlx::query(
             r#"
             WITH follower_counts AS (
@@ -56,7 +97,6 @@ impl CrawlQueue {
         .await?
         .rows_affected() as i64;
 
-        // Step 2: Update follower counts + priority tiers for existing rows
         let updated = sqlx::query(
             r#"
             UPDATE crawl_state cs

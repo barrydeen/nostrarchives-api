@@ -231,7 +231,17 @@ impl NegentropySyncer {
                 "NOTICE" => {
                     let notice = arr.get(1).and_then(|v| v.as_str()).unwrap_or("");
                     tracing::warn!(relay = relay_url, "NOTICE: {notice}");
-                    // Continue — some relays send notices alongside normal messages
+                    // If the notice indicates negentropy is disabled/unsupported, treat as fatal
+                    let notice_lower = notice.to_lowercase();
+                    if notice_lower.contains("negentropy")
+                        || notice_lower.contains("neg-open")
+                        || notice_lower.contains("bad msg")
+                    {
+                        return Err(AppError::Internal(format!(
+                            "relay {relay_url} does not support negentropy: {notice}"
+                        )));
+                    }
+                    // Otherwise continue — some relays send benign notices
                 }
                 _ => {
                     // Ignore unknown messages
@@ -371,8 +381,9 @@ impl NegentropySyncer {
     /// Default time window size for chunked sync (24 hours in seconds).
     const DEFAULT_WINDOW_SECS: i64 = 86400;
 
-    /// All event kinds we crawl: notes, reposts, reactions, zaps.
-    pub const ALL_CRAWL_KINDS: &'static [i64] = &[1, 6, 7, 9735];
+    /// v2: Only sync kinds we actually store. Reactions/reposts (6/7/16) are
+    /// handled as counter increments via targeted #e queries, not negentropy bulk sync.
+    pub const ALL_CRAWL_KINDS: &'static [i64] = &[0, 1, 3, 9735, 10002];
 
     /// Run negentropy sync for a specific time window and set of kinds.
     pub async fn run_sync_window(

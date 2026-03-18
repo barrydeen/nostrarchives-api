@@ -29,13 +29,21 @@ pub async fn get_stats(State(state): State<AppState>) -> Result<Json<Value>, App
 
 /// Get follower cache statistics for monitoring.
 pub async fn get_follower_cache_stats(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
-    let stats = state.repo.follower_cache.stats().await;
+    let wot_stats = state.repo.wot_cache.stats().await;
+    let follower_stats = state.repo.follower_cache.stats().await;
     Ok(Json(json!({
-        "qualified_count": stats.qualified_count,
-        "threshold": stats.threshold,
-        "last_refresh_ago_secs": stats.last_refresh_ago.as_secs(),
-        "refresh_interval_secs": stats.refresh_interval.as_secs(),
-        "cache_hit_ratio": "N/A - cache always hits for known pubkeys"
+        "wot": {
+            "passing_count": wot_stats.passing_count,
+            "threshold": wot_stats.threshold,
+            "last_refresh_ago_secs": wot_stats.last_refresh_ago.as_secs(),
+            "refresh_interval_secs": wot_stats.refresh_interval.as_secs(),
+        },
+        "follower_cache": {
+            "qualified_count": follower_stats.qualified_count,
+            "threshold": follower_stats.threshold,
+            "last_refresh_ago_secs": follower_stats.last_refresh_ago.as_secs(),
+            "refresh_interval_secs": follower_stats.refresh_interval.as_secs(),
+        }
     })))
 }
 

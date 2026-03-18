@@ -120,9 +120,53 @@ impl HybridCrawler {
             }
         }
 
+        // 1b. Seed the crawl queue from follows/WoT
+        match self.queue.sync_from_follows().await {
+            Ok(stats) => {
+                tracing::info!(
+                    new = stats.new_pubkeys,
+                    updated = stats.updated_counts,
+                    "hybrid crawler: initial queue sync complete"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "hybrid crawler: initial queue sync failed");
+            }
+        }
+        if let Ok(n) = self.queue.sync_cursors_from_events().await {
+            if n > 0 {
+                tracing::info!(updated = n, "hybrid crawler: synced cursors from existing events");
+            }
+        }
+
         let this = Arc::new(self);
 
-        // 2. Spawn negentropy bulk sync task (if enabled)
+        // 2a. Spawn periodic queue re-sync (every 5 minutes)
+        {
+            let queue = this.queue.clone();
+            tokio::spawn(async move {
+                let mut tick = interval(Duration::from_secs(300));
+                tick.tick().await; // skip immediate
+                loop {
+                    tick.tick().await;
+                    match queue.sync_from_follows().await {
+                        Ok(stats) if stats.new_pubkeys > 0 => {
+                            tracing::info!(
+                                new = stats.new_pubkeys,
+                                updated = stats.updated_counts,
+                                "hybrid crawler: queue re-sync"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "hybrid crawler: queue re-sync failed");
+                        }
+                        _ => {}
+                    }
+                }
+            });
+        }
+
+        // 2b. Spawn negentropy bulk sync task (if enabled)
         let neg_handle = if this.config.negentropy_enabled {
             let crawler = Arc::clone(&this);
             let mut neg_shutdown = shutdown.subscribe();
@@ -280,11 +324,30 @@ impl HybridCrawler {
                     );
                 }
                 Err(e) => {
+                    let err_msg = e.to_string();
                     tracing::warn!(
                         relay = %relay_url,
-                        error = %e,
+                        error = %err_msg,
                         "negentropy cycle: sync failed"
                     );
+                    // If the relay doesn't actually support negentropy, mark it
+                    // so we don't waste time retrying every cycle
+                    if err_msg.contains("does not support negentropy")
+                        || err_msg.contains("negentropy disabled")
+                    {
+                        let caps = relay_caps::RelayCaps {
+                            relay_url: relay_url.clone(),
+                            supports_negentropy: false,
+                            max_limit: None,
+                            nip11: None,
+                            last_checked_at: chrono::Utc::now(),
+                        };
+                        let _ = relay_caps::upsert_relay_caps(&self.pool, &caps).await;
+                        tracing::info!(
+                            relay = %relay_url,
+                            "negentropy cycle: marked relay as non-negentropy"
+                        );
+                    }
                 }
             }
 
@@ -367,6 +430,7 @@ impl HybridCrawler {
             {
                 Ok(events) => {
                     let mut new_count = 0u64;
+                    let mut new_note_ids = Vec::new();
                     for event in &events {
                         match self.repo.insert_event(event, relay_url).await {
                             Ok(true) => {
@@ -374,6 +438,10 @@ impl HybridCrawler {
                                 self.cache
                                     .on_event_ingested(&event.pubkey, event.kind)
                                     .await;
+                                // Track note IDs for engagement backfill
+                                if event.kind == 1 {
+                                    new_note_ids.push(event.id.clone());
+                                }
                             }
                             Ok(false) => {} // duplicate
                             Err(e) => {
@@ -397,6 +465,27 @@ impl HybridCrawler {
                             total = total,
                             "targeted crawl: relay batch complete"
                         );
+                    }
+                    // Phase B: backfill engagement for newly discovered notes
+                    if !new_note_ids.is_empty() {
+                        match self.fetch_engagement_for_notes(relay_url, &new_note_ids).await {
+                            Ok(n) if n > 0 => {
+                                tracing::info!(
+                                    relay = %relay_url,
+                                    notes = new_note_ids.len(),
+                                    engagement_events = n,
+                                    "targeted crawl: engagement backfill complete"
+                                );
+                            }
+                            Err(e) => {
+                                tracing::debug!(
+                                    relay = %relay_url,
+                                    error = %e,
+                                    "targeted crawl: engagement backfill failed"
+                                );
+                            }
+                            _ => {}
+                        }
                     }
                 }
                 Err(e) => {
@@ -499,8 +588,6 @@ impl HybridCrawler {
 
         // Update crawl state for all authors in the batch
         for target in &batch {
-            // Mark as crawled even if we didn't find new events — the queue
-            // will schedule the next crawl based on priority tier.
             if let Err(e) = self.queue.mark_crawled(&target.pubkey, 0, None, None).await {
                 tracing::warn!(
                     pubkey = %target.pubkey,
@@ -509,6 +596,106 @@ impl HybridCrawler {
                 );
             }
         }
+    }
+
+    /// Phase B: Fetch engagement (reactions, reposts, zaps) for recently crawled notes.
+    /// Queries relays with `{"kinds": [6, 7, 16, 9735], "#e": [batch of note IDs]}`.
+    /// Reactions/reposts are processed as counter increments, zaps are fully stored.
+    async fn fetch_engagement_for_notes(
+        &self,
+        relay_url: &str,
+        note_ids: &[String],
+    ) -> Result<u64, String> {
+        if note_ids.is_empty() {
+            return Ok(0);
+        }
+
+        let connect_timeout = Duration::from_secs(10);
+        let msg_timeout = Duration::from_secs(15);
+
+        let (ws_stream, _) = timeout(connect_timeout, tokio_tungstenite::connect_async(relay_url))
+            .await
+            .map_err(|_| format!("connect timeout: {relay_url}"))?
+            .map_err(|e| format!("connect failed to {relay_url}: {e}"))?;
+
+        let (mut write, mut read) = ws_stream.split();
+
+        // Batch note IDs into chunks of 50 to avoid relay filter limits
+        let mut total_processed = 0u64;
+
+        for chunk in note_ids.chunks(50) {
+            let filter = serde_json::json!({
+                "kinds": [6, 7, 16, 9735],
+                "#e": chunk,
+                "limit": 5000,
+            });
+
+            let sub_id = format!("eng-{}", Uuid::new_v4().simple());
+            let req = serde_json::json!(["REQ", &sub_id, filter]);
+
+            write
+                .send(Message::Text(req.to_string().into()))
+                .await
+                .map_err(|e| format!("send REQ failed: {e}"))?;
+
+            loop {
+                match timeout(msg_timeout, read.next()).await {
+                    Ok(Some(Ok(Message::Text(text)))) => {
+                        let parsed: Value = match serde_json::from_str(&text) {
+                            Ok(v) => v,
+                            Err(_) => continue,
+                        };
+                        let arr = match parsed.as_array() {
+                            Some(a) if a.len() >= 2 => a,
+                            _ => continue,
+                        };
+
+                        match arr[0].as_str() {
+                            Some("EVENT") if arr.len() >= 3 => {
+                                if let Ok(event) =
+                                    serde_json::from_value::<NostrEvent>(arr[2].clone())
+                                {
+                                    // Process through insert_event which handles counter logic
+                                    match self.repo.insert_event(&event, relay_url).await {
+                                        Ok(true) => {
+                                            total_processed += 1;
+                                            self.cache
+                                                .on_event_ingested(&event.pubkey, event.kind)
+                                                .await;
+                                        }
+                                        Ok(false) => {} // duplicate or skipped
+                                        Err(e) => {
+                                            tracing::debug!(
+                                                error = %e,
+                                                "engagement backfill: insert failed"
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                            Some("EOSE") => break,
+                            Some("CLOSED") | Some("NOTICE") => break,
+                            _ => {}
+                        }
+                    }
+                    Ok(Some(Ok(Message::Ping(data)))) => {
+                        let _ = write.send(Message::Pong(data)).await;
+                    }
+                    Ok(Some(Ok(Message::Close(_)))) | Ok(None) => break,
+                    Ok(Some(Err(e))) => return Err(format!("ws error: {e}")),
+                    Err(_) => break,
+                    _ => {}
+                }
+            }
+
+            // Close subscription
+            let close_msg = serde_json::json!(["CLOSE", &sub_id]);
+            let _ = write
+                .send(Message::Text(close_msg.to_string().into()))
+                .await;
+        }
+
+        Ok(total_processed)
     }
 
     /// Fetch kind-1 notes for specific authors from a specific relay.

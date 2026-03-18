@@ -80,6 +80,22 @@ async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
             "013_profile_tab_optimizations",
             include_str!("../../migrations/013_profile_tab_optimizations.sql"),
         ),
+        (
+            "014_v2_counter_columns",
+            include_str!("../../migrations/014_v2_counter_columns.sql"),
+        ),
+        (
+            "015_seen_events",
+            include_str!("../../migrations/015_seen_events.sql"),
+        ),
+        (
+            "016_wot_scores",
+            include_str!("../../migrations/016_wot_scores.sql"),
+        ),
+        (
+            "017_update_profile_search",
+            include_str!("../../migrations/017_update_profile_search.sql"),
+        ),
     ];
 
     for (name, sql) in migrations {
