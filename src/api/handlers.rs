@@ -90,17 +90,9 @@ pub async fn get_event_by_id(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, AppError> {
-    // First check if we have it in DB
     match state.repo.get_event_by_id(&id).await? {
         Some(event) => Ok(Json(serde_json::to_value(event).unwrap())),
-        None => {
-            // If on-demand fetch is enabled, try to fetch from relays
-            if let Ok(Some(event)) = state.fetcher.fetch_event_by_id(&id, &[]).await {
-                Ok(Json(serde_json::to_value(event).unwrap()))
-            } else {
-                Err(AppError::NotFound("event not found".into()))
-            }
-        }
+        None => Err(AppError::NotFound("event not found".into())),
     }
 }
 
@@ -114,18 +106,7 @@ pub async fn get_note_detail(
     let limit = q.limit.unwrap_or(50).min(200);
     match state.repo.get_note_detail(&id, limit).await? {
         Some(detail) => Ok(Json(detail)),
-        None => {
-            // Try to fetch the note from relays
-            if let Ok(Some(_)) = state.fetcher.fetch_event_by_id(&id, &[]).await {
-                // Re-query after fetching
-                match state.repo.get_note_detail(&id, limit).await? {
-                    Some(detail) => Ok(Json(detail)),
-                    None => Err(AppError::NotFound("event not found".into())),
-                }
-            } else {
-                Err(AppError::NotFound("event not found".into()))
-            }
-        }
+        None => Err(AppError::NotFound("event not found".into())),
     }
 }
 
@@ -137,21 +118,8 @@ pub async fn get_event_thread(
 ) -> Result<Json<Value>, AppError> {
     let limit = q.limit.unwrap_or(50).min(500);
     match state.repo.get_thread(&id, limit).await? {
-        Some(thread) => {
-            Ok(Json(serde_json::to_value(thread).unwrap()))
-        },
-        None => {
-            // Try to fetch the main event first
-            if let Ok(Some(_)) = state.fetcher.fetch_event_by_id(&id, &[]).await {
-                // Re-query after fetching
-                match state.repo.get_thread(&id, limit).await? {
-                    Some(thread) => Ok(Json(serde_json::to_value(thread).unwrap())),
-                    None => Err(AppError::NotFound("event not found".into())),
-                }
-            } else {
-                Err(AppError::NotFound("event not found".into()))
-            }
-        }
+        Some(thread) => Ok(Json(serde_json::to_value(thread).unwrap())),
+        None => Err(AppError::NotFound("event not found".into())),
     }
 }
 
@@ -198,22 +166,6 @@ pub async fn get_social_graph(
     let followers_offset = q.followers_offset.unwrap_or(0).max(0);
 
     let (follows_count, followers_count) = state.repo.follow_counts(&pubkey).await?;
-    
-    // If both counts are 0, try fetching the contact list from relays
-    let (follows_count, followers_count) = if follows_count == 0 && followers_count == 0 {
-        if let Ok(count) = state.fetcher.fetch_author_content(&pubkey, &[]).await {
-            if count > 0 {
-                // Re-query after fetching
-                state.repo.follow_counts(&pubkey).await?
-            } else {
-                (follows_count, followers_count)
-            }
-        } else {
-            (follows_count, followers_count)
-        }
-    } else {
-        (follows_count, followers_count)
-    };
     
     let follows = state
         .repo
@@ -294,27 +246,6 @@ pub async fn get_profiles_metadata(
                 warn!(pubkey = %row.pubkey, %error, "failed to parse metadata content");
             }
         }
-    }
-
-    // Fire-and-forget: fetch missing profiles in the background so they're
-    // available on the next request.  Never block the HTTP response on relay I/O.
-    let missing_pubkeys: Vec<String> = unique_pubkeys
-        .iter()
-        .filter(|&pubkey| !metadata_map.contains_key(pubkey))
-        .cloned()
-        .collect();
-
-    if !missing_pubkeys.is_empty() {
-        let fetcher = state.fetcher.clone();
-        tokio::spawn(async move {
-            if let Err(e) = fetcher.ensure_profiles(&missing_pubkeys).await {
-                tracing::warn!(
-                    count = missing_pubkeys.len(),
-                    error = %e,
-                    "background profile fetch failed"
-                );
-            }
-        });
     }
 
     let profiles = ordered_pubkeys
@@ -1135,22 +1066,6 @@ pub async fn get_profile_notes(
 
     let (events, total) = state.repo.profile_notes(&pubkey, limit, offset, sort).await?;
 
-    // If result is empty and offset is 0, try fetching author content from relays
-    let (events, total) = if events.is_empty() && offset == 0 {
-        if let Ok(count) = state.fetcher.fetch_author_content(&pubkey, &[]).await {
-            if count > 0 {
-                // Re-query after fetching content
-                state.repo.profile_notes(&pubkey, limit, offset, sort).await?
-            } else {
-                (events, total)
-            }
-        } else {
-            (events, total)
-        }
-    } else {
-        (events, total)
-    };
-
     let event_ids: Vec<String> = events.iter().map(|e| e.id.clone()).collect();
     let interactions = state.repo.batch_get_interactions(&event_ids).await?;
 
@@ -1198,22 +1113,6 @@ pub async fn get_profile_replies(
     }
 
     let (events, total) = state.repo.profile_replies(&pubkey, limit, offset, sort).await?;
-
-    // If result is empty and offset is 0, try fetching author content from relays
-    let (events, total) = if events.is_empty() && offset == 0 {
-        if let Ok(count) = state.fetcher.fetch_author_content(&pubkey, &[]).await {
-            if count > 0 {
-                // Re-query after fetching content
-                state.repo.profile_replies(&pubkey, limit, offset, sort).await?
-            } else {
-                (events, total)
-            }
-        } else {
-            (events, total)
-        }
-    } else {
-        (events, total)
-    };
 
     let event_ids: Vec<String> = events.iter().map(|e| e.id.clone()).collect();
     let interactions = state.repo.batch_get_interactions(&event_ids).await?;
