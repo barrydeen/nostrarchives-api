@@ -435,9 +435,18 @@ impl HybridCrawler {
             // ── Phase A: Recent notes (since newest_seen_at) ──
             // For authors we've seen before, only fetch what's new.
             // For new authors, this fetches the most recent batch.
-            let since_ts = group_pubkeys.iter().filter_map(|pk| {
-                target_map.get(pk).and_then(|t| t.newest_seen_at)
-            }).min(); // Use the oldest newest_seen_at so we don't miss any
+            // If ANY author in the group has no newest_seen_at (never crawled),
+            // skip the since filter entirely so new authors get a full initial fetch.
+            let all_have_cursor = group_pubkeys.iter().all(|pk| {
+                target_map.get(pk).map_or(false, |t| t.newest_seen_at.is_some())
+            });
+            let since_ts = if all_have_cursor {
+                group_pubkeys.iter().filter_map(|pk| {
+                    target_map.get(pk).and_then(|t| t.newest_seen_at)
+                }).min()
+            } else {
+                None
+            };
 
             tracing::info!(
                 relay = %relay_url,
@@ -620,9 +629,16 @@ impl HybridCrawler {
                 }
 
                 // Recent pass for unrouted
-                let since_ts = unrouted.iter().filter_map(|pk| {
-                    target_map.get(pk).and_then(|t| t.newest_seen_at)
-                }).min();
+                let all_have_cursor = unrouted.iter().all(|pk| {
+                    target_map.get(pk).map_or(false, |t| t.newest_seen_at.is_some())
+                });
+                let since_ts = if all_have_cursor {
+                    unrouted.iter().filter_map(|pk| {
+                        target_map.get(pk).and_then(|t| t.newest_seen_at)
+                    }).min()
+                } else {
+                    None
+                };
 
                 match self
                     .fetch_authors_from_relay(
