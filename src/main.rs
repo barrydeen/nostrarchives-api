@@ -107,6 +107,12 @@ async fn main() {
 
     let repo = db::repository::EventRepository::new(pool.clone(), follower_cache, wot_cache);
 
+    // Backfill zero-amount zaps with bolt11 parsing (one-time startup task)
+    match repo.backfill_zero_amount_zaps().await {
+        Ok(count) => tracing::info!(updated_zaps = count, "zap amount backfill completed"),
+        Err(e) => tracing::warn!(error = %e, "zap amount backfill failed"),
+    }
+
     if cfg.social_graph_bootstrap {
         // Skip bootstrap if the social graph is already populated (e.g. from a previous run).
         let existing_follows: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM follow_lists")

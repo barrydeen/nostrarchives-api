@@ -524,6 +524,20 @@ pub struct ListingQuery {
 }
 
 #[derive(Debug, serde::Deserialize)]
+pub struct ProfileTabQuery {
+    pub limit: Option<i64>,
+    pub offset: Option<i64>,
+    pub sort: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct ProfileZapsQuery {
+    pub limit: Option<i64>,
+    pub offset: Option<i64>,
+    pub sort: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
 pub struct TopZappersQuery {
     pub direction: Option<String>,
     pub limit: Option<i64>,
@@ -888,20 +902,21 @@ pub async fn advanced_note_search(
 pub async fn get_profile_notes(
     State(state): State<AppState>,
     Path(pubkey): Path<String>,
-    Query(q): Query<ListingQuery>,
+    Query(q): Query<ProfileTabQuery>,
 ) -> Result<Json<Value>, AppError> {
     let pubkey = normalize_pubkey(&pubkey)?;
     let limit = clamp_profile_tab_limit(q.limit);
     let offset = clamp_offset(q.offset);
+    let sort = q.sort.as_deref().unwrap_or("recent");
 
-    let cache_key = format!("profile:notes:{pubkey}:{limit}:{offset}");
+    let cache_key = format!("profile:notes:{pubkey}:{limit}:{offset}:{sort}");
     if let Some(cached) = state.cache.get_json(&cache_key).await {
         if let Ok(val) = serde_json::from_str::<Value>(&cached) {
             return Ok(Json(val));
         }
     }
 
-    let (events, total) = state.repo.profile_notes(&pubkey, limit, offset).await?;
+    let (events, total) = state.repo.profile_notes(&pubkey, limit, offset, sort).await?;
 
     let event_ids: Vec<String> = events.iter().map(|e| e.id.clone()).collect();
     let interactions = state.repo.batch_get_interactions(&event_ids).await?;
@@ -935,20 +950,21 @@ pub async fn get_profile_notes(
 pub async fn get_profile_replies(
     State(state): State<AppState>,
     Path(pubkey): Path<String>,
-    Query(q): Query<ListingQuery>,
+    Query(q): Query<ProfileTabQuery>,
 ) -> Result<Json<Value>, AppError> {
     let pubkey = normalize_pubkey(&pubkey)?;
     let limit = clamp_profile_tab_limit(q.limit);
     let offset = clamp_offset(q.offset);
+    let sort = q.sort.as_deref().unwrap_or("recent");
 
-    let cache_key = format!("profile:replies:{pubkey}:{limit}:{offset}");
+    let cache_key = format!("profile:replies:{pubkey}:{limit}:{offset}:{sort}");
     if let Some(cached) = state.cache.get_json(&cache_key).await {
         if let Ok(val) = serde_json::from_str::<Value>(&cached) {
             return Ok(Json(val));
         }
     }
 
-    let (events, total) = state.repo.profile_replies(&pubkey, limit, offset).await?;
+    let (events, total) = state.repo.profile_replies(&pubkey, limit, offset, sort).await?;
 
     let event_ids: Vec<String> = events.iter().map(|e| e.id.clone()).collect();
     let interactions = state.repo.batch_get_interactions(&event_ids).await?;
@@ -982,20 +998,21 @@ pub async fn get_profile_replies(
 pub async fn get_profile_zaps_sent(
     State(state): State<AppState>,
     Path(pubkey): Path<String>,
-    Query(q): Query<ListingQuery>,
+    Query(q): Query<ProfileZapsQuery>,
 ) -> Result<Json<Value>, AppError> {
     let pubkey = normalize_pubkey(&pubkey)?;
     let limit = clamp_profile_tab_limit(q.limit);
     let offset = clamp_offset(q.offset);
+    let sort = q.sort.as_deref().unwrap_or("recent");
 
-    let cache_key = format!("profile:zaps_sent:{pubkey}:{limit}:{offset}");
+    let cache_key = format!("profile:zaps_sent:{pubkey}:{limit}:{offset}:{sort}");
     if let Some(cached) = state.cache.get_json(&cache_key).await {
         if let Ok(val) = serde_json::from_str::<Value>(&cached) {
             return Ok(Json(val));
         }
     }
 
-    let (entries, total, profile_rows) = state.repo.profile_zaps_sent(&pubkey, limit, offset).await?;
+    let (entries, total, profile_rows) = state.repo.profile_zaps_sent(&pubkey, limit, offset, sort).await?;
     let profiles = build_profiles_map(profile_rows);
 
     let zaps: Vec<Value> = entries
@@ -1027,13 +1044,14 @@ pub async fn get_profile_zaps_sent(
 pub async fn get_profile_zaps_received(
     State(state): State<AppState>,
     Path(pubkey): Path<String>,
-    Query(q): Query<ListingQuery>,
+    Query(q): Query<ProfileZapsQuery>,
 ) -> Result<Json<Value>, AppError> {
     let pubkey = normalize_pubkey(&pubkey)?;
     let limit = clamp_profile_tab_limit(q.limit);
     let offset = clamp_offset(q.offset);
+    let sort = q.sort.as_deref().unwrap_or("recent");
 
-    let cache_key = format!("profile:zaps_recv:{pubkey}:{limit}:{offset}");
+    let cache_key = format!("profile:zaps_recv:{pubkey}:{limit}:{offset}:{sort}");
     if let Some(cached) = state.cache.get_json(&cache_key).await {
         if let Ok(val) = serde_json::from_str::<Value>(&cached) {
             return Ok(Json(val));
@@ -1042,7 +1060,7 @@ pub async fn get_profile_zaps_received(
 
     let (entries, total, profile_rows) = state
         .repo
-        .profile_zaps_received(&pubkey, limit, offset)
+        .profile_zaps_received(&pubkey, limit, offset, sort)
         .await?;
     let profiles = build_profiles_map(profile_rows);
 

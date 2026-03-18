@@ -273,6 +273,17 @@ impl EventRepository {
             }
         }
 
+        // If amount is still 0, try to parse from bolt11 tag
+        if amount_msats == 0 {
+            if let Some(bolt11_tag) = event.tags.iter().find(|t| t.len() >= 2 && t[0] == "bolt11") {
+                if let Some(bolt11) = bolt11_tag.get(1) {
+                    if let Some(parsed_amount) = self.parse_bolt11_amount(bolt11) {
+                        amount_msats = parsed_amount;
+                    }
+                }
+            }
+        }
+
         sqlx::query(
             "UPDATE events SET zap_count = zap_count + 1, zap_amount_msats = zap_amount_msats + $2 WHERE id = $1",
         )
@@ -569,6 +580,84 @@ impl EventRepository {
         Ok(())
     }
 
+    /// Parse amount from bolt11 invoice string.
+    /// Format: lnbc<amount><multiplier>1<separator>...
+    /// Multipliers: m (milli=10^-3), u (micro=10^-6), n (nano=10^-9), p (pico=10^-12)
+    /// Amount is in BTC, convert to msats (1 BTC = 100_000_000_000 msats)
+    fn parse_bolt11_amount(&self, bolt11: &str) -> Option<i64> {
+        use regex::Regex;
+        
+        let re = Regex::new(r"lnbc(\d+)([munp])1").ok()?;
+        let captures = re.captures(bolt11)?;
+        
+        let amount_str = captures.get(1)?.as_str();
+        let amount: u64 = amount_str.parse().ok()?;
+        
+        let multiplier = captures.get(2)?.as_str();
+        let btc_amount = match multiplier {
+            "m" => amount as f64 * 1e-3,  // milli
+            "u" => amount as f64 * 1e-6,  // micro
+            "n" => amount as f64 * 1e-9,  // nano
+            "p" => amount as f64 * 1e-12, // pico
+            _ => return None,
+        };
+        
+        // Convert BTC to msats (1 BTC = 100_000_000_000 msats)
+        let msats = (btc_amount * 100_000_000_000.0) as i64;
+        Some(msats)
+    }
+
+    /// Backfill zero-amount zaps by parsing bolt11 tags from corresponding events.
+    /// This should be called once at startup to fix historical data.
+    pub async fn backfill_zero_amount_zaps(&self) -> Result<i32, AppError> {
+        tracing::info!("Starting backfill of zero-amount zaps...");
+        
+        let rows = sqlx::query(
+            r#"
+            SELECT zm.event_id, e.tags
+            FROM zap_metadata zm
+            JOIN events e ON zm.event_id = e.id
+            WHERE zm.amount_msats = 0
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut updated_count = 0;
+        
+        for row in rows {
+            let event_id: String = row.get("event_id");
+            let tags: serde_json::Value = row.get("tags");
+            
+            if let Some(tags_array) = tags.as_array() {
+                // Find bolt11 tag
+                for tag in tags_array {
+                    if let Some(tag_array) = tag.as_array() {
+                        if tag_array.len() >= 2 && tag_array[0].as_str() == Some("bolt11") {
+                            if let Some(bolt11) = tag_array[1].as_str() {
+                                if let Some(amount_msats) = self.parse_bolt11_amount(bolt11) {
+                                    sqlx::query(
+                                        "UPDATE zap_metadata SET amount_msats = $1 WHERE event_id = $2"
+                                    )
+                                    .bind(amount_msats)
+                                    .bind(&event_id)
+                                    .execute(&self.pool)
+                                    .await?;
+                                    
+                                    updated_count += 1;
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        tracing::info!("Backfill complete: updated {} zero-amount zaps", updated_count);
+        Ok(updated_count)
+    }
+
     /// Extract zap metadata from a kind-9735 zap receipt's embedded zap request.
     /// The "description" tag contains a JSON-encoded kind-9734 event whose tags
     /// include ["amount", "<msats>"]. We persist normalized zap metadata for fast profile queries.
@@ -600,6 +689,17 @@ impl EventRepository {
                                 break;
                             }
                         }
+                    }
+                }
+            }
+        }
+
+        // If amount is still 0, try to parse from bolt11 tag
+        if amount_msats == 0 {
+            if let Some(bolt11_tag) = event.tags.iter().find(|t| t.len() >= 2 && t[0] == "bolt11") {
+                if let Some(bolt11) = bolt11_tag.get(1) {
+                    if let Some(parsed_amount) = self.parse_bolt11_amount(bolt11) {
+                        amount_msats = parsed_amount;
                     }
                 }
             }
@@ -2406,6 +2506,7 @@ impl EventRepository {
         pubkey: &str,
         limit: i64,
         offset: i64,
+        sort: &str,
     ) -> Result<(Vec<StoredEvent>, i64), AppError> {
         let total: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM events WHERE pubkey = $1 AND kind = 1 AND NOT is_reply",
@@ -2414,20 +2515,30 @@ impl EventRepository {
         .fetch_one(&self.pool)
         .await?;
 
-        let events = sqlx::query_as::<_, StoredEvent>(
+        let order_clause = match sort {
+            "likes" => "ORDER BY reaction_count DESC, created_at DESC",
+            "zaps" => "ORDER BY zap_amount_msats DESC, created_at DESC",
+            "reposts" => "ORDER BY repost_count DESC, created_at DESC",
+            _ => "ORDER BY created_at DESC", // "recent" or default
+        };
+
+        let query = format!(
             r#"
             SELECT id, pubkey, created_at, kind, content, sig, tags, raw, relay_url, received_at
             FROM events
             WHERE pubkey = $1 AND kind = 1 AND NOT is_reply
-            ORDER BY created_at DESC
+            {}
             LIMIT $2 OFFSET $3
             "#,
-        )
-        .bind(pubkey)
-        .bind(limit)
-        .bind(offset)
-        .fetch_all(&self.pool)
-        .await?;
+            order_clause
+        );
+
+        let events = sqlx::query_as::<_, StoredEvent>(&query)
+            .bind(pubkey)
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&self.pool)
+            .await?;
 
         Ok((events, total))
     }
@@ -2438,6 +2549,7 @@ impl EventRepository {
         pubkey: &str,
         limit: i64,
         offset: i64,
+        sort: &str,
     ) -> Result<(Vec<StoredEvent>, i64), AppError> {
         let total: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM events WHERE pubkey = $1 AND kind = 1 AND is_reply",
@@ -2446,20 +2558,30 @@ impl EventRepository {
         .fetch_one(&self.pool)
         .await?;
 
-        let events = sqlx::query_as::<_, StoredEvent>(
+        let order_clause = match sort {
+            "likes" => "ORDER BY reaction_count DESC, created_at DESC",
+            "zaps" => "ORDER BY zap_amount_msats DESC, created_at DESC",
+            "reposts" => "ORDER BY repost_count DESC, created_at DESC",
+            _ => "ORDER BY created_at DESC", // "recent" or default
+        };
+
+        let query = format!(
             r#"
             SELECT id, pubkey, created_at, kind, content, sig, tags, raw, relay_url, received_at
             FROM events
             WHERE pubkey = $1 AND kind = 1 AND is_reply
-            ORDER BY created_at DESC
+            {}
             LIMIT $2 OFFSET $3
             "#,
-        )
-        .bind(pubkey)
-        .bind(limit)
-        .bind(offset)
-        .fetch_all(&self.pool)
-        .await?;
+            order_clause
+        );
+
+        let events = sqlx::query_as::<_, StoredEvent>(&query)
+            .bind(pubkey)
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&self.pool)
+            .await?;
 
         Ok((events, total))
     }
@@ -2470,6 +2592,7 @@ impl EventRepository {
         pubkey: &str,
         limit: i64,
         offset: i64,
+        sort: &str,
     ) -> Result<(Vec<super::models::ProfileZapEntry>, i64, Vec<ProfileRow>), AppError> {
         let total: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM zap_metadata WHERE sender_pubkey = $1",
@@ -2478,7 +2601,12 @@ impl EventRepository {
         .fetch_one(&self.pool)
         .await?;
 
-        let rows = sqlx::query(
+        let order_clause = match sort {
+            "amount" => "ORDER BY zm.amount_msats DESC",
+            _ => "ORDER BY zm.created_at DESC", // "recent" or default
+        };
+
+        let query = format!(
             r#"
             SELECT
                 e.id, e.pubkey, e.created_at, e.kind, e.content, e.sig, e.tags, e.raw, e.relay_url, e.received_at,
@@ -2488,10 +2616,13 @@ impl EventRepository {
             FROM zap_metadata zm
             JOIN events e ON e.id = zm.event_id
             WHERE zm.sender_pubkey = $1
-            ORDER BY zm.created_at DESC
+            {}
             LIMIT $2 OFFSET $3
             "#,
-        )
+            order_clause
+        );
+
+        let rows = sqlx::query(&query)
         .bind(pubkey)
         .bind(limit)
         .bind(offset)
@@ -2544,6 +2675,7 @@ impl EventRepository {
         pubkey: &str,
         limit: i64,
         offset: i64,
+        sort: &str,
     ) -> Result<(Vec<super::models::ProfileZapEntry>, i64, Vec<ProfileRow>), AppError> {
         let total: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM zap_metadata WHERE recipient_pubkey = $1",
@@ -2552,7 +2684,12 @@ impl EventRepository {
         .fetch_one(&self.pool)
         .await?;
 
-        let rows = sqlx::query(
+        let order_clause = match sort {
+            "amount" => "ORDER BY zm.amount_msats DESC",
+            _ => "ORDER BY zm.created_at DESC", // "recent" or default
+        };
+
+        let query = format!(
             r#"
             SELECT
                 e.id, e.pubkey, e.created_at, e.kind, e.content, e.sig, e.tags, e.raw, e.relay_url, e.received_at,
@@ -2562,10 +2699,13 @@ impl EventRepository {
             FROM zap_metadata zm
             JOIN events e ON e.id = zm.event_id
             WHERE zm.recipient_pubkey = $1
-            ORDER BY zm.created_at DESC
+            {}
             LIMIT $2 OFFSET $3
             "#,
-        )
+            order_clause
+        );
+
+        let rows = sqlx::query(&query)
         .bind(pubkey)
         .bind(limit)
         .bind(offset)
