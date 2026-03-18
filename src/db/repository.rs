@@ -1660,7 +1660,8 @@ impl EventRepository {
             .collect())
     }
 
-    /// Most liked authors: authors whose notes received the most reactions (kind=7) in the timeframe.
+    /// Most liked authors: authors whose kind=1 notes have the highest reaction_count.
+    /// Reactions (kind=7) are stored as counter increments on the note, not as separate events.
     pub async fn most_liked_authors(
         &self,
         range: &str,
@@ -1672,12 +1673,10 @@ impl EventRepository {
         let rows = if since == 0 {
             sqlx::query_as::<_, (String, i64)>(
                 r#"
-                SELECT e.pubkey, COUNT(*)::bigint as like_count
-                FROM events r
-                JOIN event_tags rt ON rt.event_id = r.id AND rt.tag_name = 'e'
-                JOIN events e ON e.id = rt.tag_value AND e.kind = 1
-                WHERE r.kind = 7
-                GROUP BY e.pubkey
+                SELECT pubkey, SUM(reaction_count)::bigint AS like_count
+                FROM events
+                WHERE kind = 1 AND reaction_count > 0
+                GROUP BY pubkey
                 ORDER BY like_count DESC
                 LIMIT $1 OFFSET $2
                 "#,
@@ -1689,12 +1688,10 @@ impl EventRepository {
         } else {
             sqlx::query_as::<_, (String, i64)>(
                 r#"
-                SELECT e.pubkey, COUNT(*)::bigint as like_count
-                FROM events r
-                JOIN event_tags rt ON rt.event_id = r.id AND rt.tag_name = 'e'
-                JOIN events e ON e.id = rt.tag_value AND e.kind = 1
-                WHERE r.kind = 7 AND r.created_at >= $1
-                GROUP BY e.pubkey
+                SELECT pubkey, SUM(reaction_count)::bigint AS like_count
+                FROM events
+                WHERE kind = 1 AND reaction_count > 0 AND created_at >= $1
+                GROUP BY pubkey
                 ORDER BY like_count DESC
                 LIMIT $2 OFFSET $3
                 "#,
@@ -1715,7 +1712,8 @@ impl EventRepository {
             .collect())
     }
 
-    /// Most shared authors: authors whose notes received the most reposts (kind=6) in the timeframe.
+    /// Most shared authors: authors whose kind=1 notes have the highest repost_count.
+    /// Reposts (kind=6/16) are stored as counter increments on the note, not as separate events.
     pub async fn most_shared_authors(
         &self,
         range: &str,
@@ -1727,12 +1725,10 @@ impl EventRepository {
         let rows = if since == 0 {
             sqlx::query_as::<_, (String, i64)>(
                 r#"
-                SELECT e.pubkey, COUNT(*)::bigint as repost_count
-                FROM events r
-                JOIN event_tags rt ON rt.event_id = r.id AND rt.tag_name = 'e'
-                JOIN events e ON e.id = rt.tag_value AND e.kind = 1
-                WHERE r.kind = 6
-                GROUP BY e.pubkey
+                SELECT pubkey, SUM(repost_count)::bigint AS repost_count
+                FROM events
+                WHERE kind = 1 AND repost_count > 0
+                GROUP BY pubkey
                 ORDER BY repost_count DESC
                 LIMIT $1 OFFSET $2
                 "#,
@@ -1744,12 +1740,10 @@ impl EventRepository {
         } else {
             sqlx::query_as::<_, (String, i64)>(
                 r#"
-                SELECT e.pubkey, COUNT(*)::bigint as repost_count
-                FROM events r
-                JOIN event_tags rt ON rt.event_id = r.id AND rt.tag_name = 'e'
-                JOIN events e ON e.id = rt.tag_value AND e.kind = 1
-                WHERE r.kind = 6 AND r.created_at >= $1
-                GROUP BY e.pubkey
+                SELECT pubkey, SUM(repost_count)::bigint AS repost_count
+                FROM events
+                WHERE kind = 1 AND repost_count > 0 AND created_at >= $1
+                GROUP BY pubkey
                 ORDER BY repost_count DESC
                 LIMIT $2 OFFSET $3
                 "#,
