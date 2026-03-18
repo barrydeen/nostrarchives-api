@@ -296,28 +296,25 @@ pub async fn get_profiles_metadata(
         }
     }
 
-    // Check which pubkeys still don't have metadata and try to fetch them
+    // Fire-and-forget: fetch missing profiles in the background so they're
+    // available on the next request.  Never block the HTTP response on relay I/O.
     let missing_pubkeys: Vec<String> = unique_pubkeys
         .iter()
         .filter(|&pubkey| !metadata_map.contains_key(pubkey))
         .cloned()
         .collect();
-    
+
     if !missing_pubkeys.is_empty() {
-        if let Ok(_) = state.fetcher.ensure_profiles(&missing_pubkeys).await {
-            // Re-query after fetching
-            let new_rows = state.repo.latest_profile_metadata(&missing_pubkeys).await?;
-            for row in new_rows {
-                match serde_json::from_str::<Value>(&row.content) {
-                    Ok(value) => {
-                        metadata_map.insert(row.pubkey.clone(), value);
-                    }
-                    Err(error) => {
-                        warn!(pubkey = %row.pubkey, %error, "failed to parse metadata content");
-                    }
-                }
+        let fetcher = state.fetcher.clone();
+        tokio::spawn(async move {
+            if let Err(e) = fetcher.ensure_profiles(&missing_pubkeys).await {
+                tracing::warn!(
+                    count = missing_pubkeys.len(),
+                    error = %e,
+                    "background profile fetch failed"
+                );
             }
-        }
+        });
     }
 
     let profiles = ordered_pubkeys
