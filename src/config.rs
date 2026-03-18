@@ -29,6 +29,9 @@ pub struct Config {
     pub follower_cache_refresh_secs: u64,
     pub wot_threshold: i64,
     pub wot_refresh_secs: u64,
+    pub ondemand_fetch_enabled: bool,
+    pub ondemand_fetch_timeout_ms: u64,
+    pub ondemand_fetch_max_relays: usize,
 }
 
 impl Config {
@@ -171,6 +174,20 @@ impl Config {
             .and_then(|v| v.parse().ok())
             .unwrap_or(900); // Default: refresh every 15 min
 
+        let ondemand_fetch_enabled = env::var("ONDEMAND_FETCH_ENABLED")
+            .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(true);
+
+        let ondemand_fetch_timeout_ms = env::var("ONDEMAND_FETCH_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(5000);
+
+        let ondemand_fetch_max_relays = env::var("ONDEMAND_FETCH_MAX_RELAYS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(3);
+
         Self {
             database_url,
             redis_url,
@@ -199,6 +216,9 @@ impl Config {
             follower_cache_refresh_secs,
             wot_threshold,
             wot_refresh_secs,
+            ondemand_fetch_enabled,
+            ondemand_fetch_timeout_ms,
+            ondemand_fetch_max_relays,
         }
     }
 }

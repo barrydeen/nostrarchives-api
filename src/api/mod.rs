@@ -4,6 +4,7 @@ use axum::middleware;
 use axum::routing::{get, post};
 use axum::Router;
 use std::net::IpAddr;
+use std::sync::Arc;
 use std::time::Duration;
 use tower_http::cors::CorsLayer;
 
@@ -11,6 +12,7 @@ use crate::cache::StatsCache;
 use crate::crawler::queue::CrawlQueue;
 use crate::db::repository::EventRepository;
 use crate::ratelimit::{rate_limit_middleware, RateLimiter};
+use crate::relay::fetcher::RelayFetcher;
 
 /// Shared state available to all handlers.
 #[derive(Clone)]
@@ -18,6 +20,7 @@ pub struct AppState {
     pub repo: EventRepository,
     pub cache: StatsCache,
     pub crawl_queue: Option<CrawlQueue>,
+    pub fetcher: Arc<RelayFetcher>,
 }
 
 async fn cache_control_middleware(
