@@ -305,6 +305,7 @@ async fn main() {
         stats_cache.clone(),
         cfg.ondemand_fetch_timeout_ms,
         cfg.ondemand_fetch_max_relays,
+        cfg.ondemand_fetch_enabled,
     ));
 
     // HTTP API

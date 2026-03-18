@@ -993,6 +993,25 @@ pub async fn search_suggest(
 async fn resolve_entity(input: &str, state: &AppState) -> Result<Option<Value>, AppError> {
     // Check for NIP-19 encoded entities
     if let Some(entity) = nip19::decode(input) {
+        match &entity {
+            nip19::NostrEntity::Event { id, relays, .. } => {
+                // Try to fetch the event if not in DB, using relay hints
+                if state.repo.get_event_by_id(id).await?.is_none() {
+                    if let Ok(Some(_)) = state.fetcher.fetch_event_by_id(id, relays).await {
+                        tracing::info!(event_id = %id, "fetched event from relay hints");
+                    }
+                }
+            }
+            nip19::NostrEntity::Profile { pubkey, relays } => {
+                // Try to fetch profile metadata if not in DB, using relay hints
+                let profile_rows = state.repo.latest_profile_metadata(&[pubkey.clone()]).await?;
+                if profile_rows.is_empty() {
+                    if let Ok(Some(_)) = state.fetcher.fetch_profile_metadata(pubkey, relays).await {
+                        tracing::info!(pubkey = %pubkey, "fetched profile from relay hints");
+                    }
+                }
+            }
+        }
         return Ok(Some(serde_json::to_value(entity).unwrap()));
     }
 
@@ -1004,6 +1023,24 @@ async fn resolve_entity(input: &str, state: &AppState) -> Result<Option<Value>, 
                 _ => json!({ "type": "profile", "pubkey": id }),
             };
             return Ok(Some(resolved));
+        }
+        
+        // If not found in DB, try to fetch assuming it could be either an event or pubkey
+        // Since it's ambiguous, try event first, then profile
+        if state.repo.get_event_by_id(input).await?.is_none() {
+            if let Ok(Some(_)) = state.fetcher.fetch_event_by_id(input, &[]).await {
+                tracing::info!(id = %input, "fetched hex event from relays");
+                return Ok(Some(json!({ "type": "event", "id": input })));
+            }
+        }
+        
+        // Try as profile if event fetch failed or didn't exist
+        let profile_rows = state.repo.latest_profile_metadata(&[input.to_string()]).await?;
+        if profile_rows.is_empty() {
+            if let Ok(Some(_)) = state.fetcher.fetch_profile_metadata(input, &[]).await {
+                tracing::info!(pubkey = %input, "fetched hex profile from relays");
+                return Ok(Some(json!({ "type": "profile", "pubkey": input })));
+            }
         }
     }
 

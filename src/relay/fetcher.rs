@@ -27,6 +27,7 @@ pub struct RelayFetcher {
     default_relays: Vec<String>,
     timeout_ms: u64,
     max_relays: usize,
+    enabled: bool,
     /// Inflight request coalescing to avoid duplicate fetches
     inflight: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
 }
@@ -39,6 +40,7 @@ impl RelayFetcher {
         cache: StatsCache,
         timeout_ms: u64,
         max_relays: usize,
+        enabled: bool,
     ) -> Self {
         Self {
             repo,
@@ -47,6 +49,7 @@ impl RelayFetcher {
             default_relays,
             timeout_ms,
             max_relays,
+            enabled,
             inflight: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -57,6 +60,9 @@ impl RelayFetcher {
         id: &str,
         relay_hints: &[String],
     ) -> Result<Option<StoredEvent>, AppError> {
+        if !self.enabled {
+            return Ok(None);
+        }
         let cache_key = format!("fetch:miss:event:{}", id);
 
         // Check negative cache first
@@ -139,6 +145,9 @@ impl RelayFetcher {
         pubkey: &str,
         relay_hints: &[String],
     ) -> Result<Option<Value>, AppError> {
+        if !self.enabled {
+            return Ok(None);
+        }
         let cache_key = format!("fetch:miss:profile:{}", pubkey);
 
         // Check negative cache first
@@ -226,6 +235,9 @@ impl RelayFetcher {
         pubkey: &str,
         relay_hints: &[String],
     ) -> Result<i64, AppError> {
+        if !self.enabled {
+            return Ok(0);
+        }
         let cache_key = format!("fetch:miss:author:{}", pubkey);
 
         // Check negative cache first
@@ -313,7 +325,7 @@ impl RelayFetcher {
 
     /// Check which pubkeys are missing metadata and batch-fetch them.
     pub async fn ensure_profiles(&self, pubkeys: &[String]) -> Result<(), AppError> {
-        if pubkeys.is_empty() {
+        if !self.enabled || pubkeys.is_empty() {
             return Ok(());
         }
 
