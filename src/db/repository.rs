@@ -8,11 +8,13 @@ use super::models::{
 };
 use crate::error::AppError;
 use crate::follower_cache::FollowerCache;
+use crate::wot_cache::WotCache;
 
 #[derive(Clone)]
 pub struct EventRepository {
     pool: PgPool,
     pub follower_cache: FollowerCache,
+    pub wot_cache: WotCache,
 }
 
 #[derive(Debug, Clone)]
@@ -33,8 +35,8 @@ pub struct ProfileRow {
 }
 
 impl EventRepository {
-    pub fn new(pool: PgPool, follower_cache: FollowerCache) -> Self {
-        Self { pool, follower_cache }
+    pub fn new(pool: PgPool, follower_cache: FollowerCache, wot_cache: WotCache) -> Self {
+        Self { pool, follower_cache, wot_cache }
     }
 
     /// Return a clone of the underlying connection pool.
@@ -42,27 +44,73 @@ impl EventRepository {
         self.pool.clone()
     }
 
-    /// Insert a new event. Returns true if the event was inserted (not a duplicate).
+    /// Insert a new event with kind-based routing.
+    ///
+    /// v2 branching:
+    /// - Kind 0 (metadata): Store if author passes WoT OR we already have their events
+    /// - Kind 1 (note): WoT check. Store event, insert refs, increment reply_count on target
+    /// - Kind 3 (contact list): ALWAYS process for social graph (upsert-only, one per pubkey)
+    /// - Kind 6/16 (repost): Counter-only. Increment repost_count, do NOT store event
+    /// - Kind 7 (reaction): Counter-only. Increment reaction_count, do NOT store event
+    /// - Kind 9735 (zap): ALWAYS store regardless of WoT. Increment zap counters on target
+    /// - Kind 10002 (relay list): ALWAYS process. Upsert-only, one per pubkey
     pub async fn insert_event(
         &self,
         event: &NostrEvent,
         relay_url: &str,
     ) -> Result<bool, AppError> {
-        // Check follower threshold for content events (skip profile/follow list events)
-        // We need profiles (kind 0) and follow lists (kind 3) to build the social graph
-        let skip_threshold_check = matches!(event.kind, 0 | 3);
-        
-        if !skip_threshold_check {
-            if !self.follower_cache.meets_threshold(&event.pubkey).await? {
-                tracing::debug!(
-                    pubkey = %event.pubkey, 
-                    kind = event.kind,
-                    "Skipping event from author below follower threshold"
-                );
-                return Ok(false); // Return false to indicate not inserted
+        match event.kind {
+            // Kind 6/7/16: counter-only, never stored as full events
+            6 | 16 => {
+                return self.process_repost_as_counter(event).await;
+            }
+            7 => {
+                return self.process_reaction_as_counter(event).await;
+            }
+            // Kind 0 (metadata): store if WoT passes, or follower cache passes, or we already have their events
+            0 => {
+                if !self.passes_quality_check(&event.pubkey).await? {
+                    let has_events: bool = sqlx::query_scalar(
+                        "SELECT EXISTS(SELECT 1 FROM events WHERE pubkey = $1 LIMIT 1)",
+                    )
+                    .bind(&event.pubkey)
+                    .fetch_one(&self.pool)
+                    .await?;
+                    if !has_events {
+                        return Ok(false);
+                    }
+                }
+            }
+            // Kind 3 (contact list): always process for social graph
+            3 => { /* always allow */ }
+            // Kind 9735 (zap): always store, bypass WoT
+            9735 => { /* always allow */ }
+            // Kind 10002 (relay list): always process
+            10002 => { /* always allow */ }
+            // Kind 1 (note) and others: require quality check
+            _ => {
+                if !self.passes_quality_check(&event.pubkey).await? {
+                    tracing::debug!(
+                        pubkey = %event.pubkey,
+                        kind = event.kind,
+                        "Skipping event from author not passing quality check"
+                    );
+                    return Ok(false);
+                }
             }
         }
 
+        // For kind-3: upsert-only (keep only latest per pubkey)
+        if event.kind == 3 {
+            return self.upsert_kind3_event(event, relay_url).await;
+        }
+
+        // For kind-10002: upsert-only (keep only latest per pubkey)
+        if event.kind == 10002 {
+            return self.upsert_relay_list_event(event, relay_url).await;
+        }
+
+        // Standard storage for kinds 0, 1, 9735, etc.
         let raw = serde_json::to_value(event).unwrap_or_default();
         let tags_json = serde_json::to_value(&event.tags).unwrap_or_default();
 
@@ -86,15 +134,281 @@ impl EventRepository {
         let inserted = result.rows_affected() > 0;
 
         if inserted {
-            self.insert_refs(event).await?;
-            // For zap receipts (kind 9735), extract the amount from the embedded
-            // zap request in the "description" tag (NIP-57).
+            // Only insert refs for kind-1 (notes)
+            if event.kind == 1 {
+                self.insert_refs(event).await?;
+            }
+            // For zap receipts, extract metadata and increment counters
             if event.kind == 9735 {
                 self.extract_zap_metadata(event).await?;
+                self.increment_zap_counters(event).await?;
             }
         }
 
         Ok(inserted)
+    }
+
+    /// Check if a pubkey passes quality filtering.
+    ///
+    /// Uses a layered approach:
+    /// 1. If WoT cache is populated (steady state): use two-level WoT check
+    /// 2. If WoT cache is empty/bootstrapping: fall back to follower cache (v1 behavior)
+    ///
+    /// This prevents the cold-start problem where an empty WoT cache rejects
+    /// every kind-1 note on a fresh database.
+    async fn passes_quality_check(&self, pubkey: &str) -> Result<bool, AppError> {
+        // Try WoT first (strict, two-level check)
+        if self.wot_cache.passes_wot(pubkey).await? {
+            return Ok(true);
+        }
+
+        // Fall back to follower cache (permissive, allows unknown pubkeys)
+        self.follower_cache.meets_threshold(pubkey).await
+    }
+
+    /// Process a repost (kind 6/16) as a counter increment only.
+    /// Does NOT store the repost event. Uses seen_events for dedup.
+    async fn process_repost_as_counter(&self, event: &NostrEvent) -> Result<bool, AppError> {
+        let target_id = event
+            .tags
+            .iter()
+            .find(|t| t.len() >= 2 && t[0] == "e")
+            .and_then(|t| t.get(1))
+            .cloned();
+
+        let Some(target_id) = target_id else {
+            return Ok(false);
+        };
+
+        // Dedup via seen_events
+        if self.check_seen(&event.id).await? {
+            return Ok(false);
+        }
+
+        // Increment counter on target event
+        let updated = sqlx::query(
+            "UPDATE events SET repost_count = repost_count + 1 WHERE id = $1",
+        )
+        .bind(&target_id)
+        .execute(&self.pool)
+        .await?;
+
+        if updated.rows_affected() > 0 {
+            self.mark_seen(&event.id, event.kind as i16, &target_id, event.created_at)
+                .await?;
+            return Ok(true);
+        }
+
+        Ok(false)
+    }
+
+    /// Process a reaction (kind 7) as a counter increment only.
+    /// Does NOT store the reaction event. Uses seen_events for dedup.
+    async fn process_reaction_as_counter(&self, event: &NostrEvent) -> Result<bool, AppError> {
+        let target_id = event
+            .tags
+            .iter()
+            .rev()
+            .find(|t| t.len() >= 2 && t[0] == "e")
+            .and_then(|t| t.get(1))
+            .cloned();
+
+        let Some(target_id) = target_id else {
+            return Ok(false);
+        };
+
+        // Dedup via seen_events
+        if self.check_seen(&event.id).await? {
+            return Ok(false);
+        }
+
+        // Increment counter on target event
+        let updated = sqlx::query(
+            "UPDATE events SET reaction_count = reaction_count + 1 WHERE id = $1",
+        )
+        .bind(&target_id)
+        .execute(&self.pool)
+        .await?;
+
+        if updated.rows_affected() > 0 {
+            self.mark_seen(&event.id, event.kind as i16, &target_id, event.created_at)
+                .await?;
+            return Ok(true);
+        }
+
+        Ok(false)
+    }
+
+    /// Increment zap_count and zap_amount_msats on the target event for a zap receipt.
+    async fn increment_zap_counters(&self, event: &NostrEvent) -> Result<(), AppError> {
+        let target_id = event
+            .tags
+            .iter()
+            .find(|t| t.len() >= 2 && t[0] == "e")
+            .and_then(|t| t.get(1))
+            .cloned();
+
+        let Some(target_id) = target_id else {
+            return Ok(());
+        };
+
+        // Extract amount from the description tag (zap request)
+        let mut amount_msats: i64 = 0;
+        if let Some(desc_tag) = event.tags.iter().find(|t| t.len() >= 2 && t[0] == "description")
+        {
+            if let Ok(zap_request) = serde_json::from_str::<serde_json::Value>(&desc_tag[1]) {
+                if let Some(tags) = zap_request.get("tags").and_then(|t| t.as_array()) {
+                    for tag in tags {
+                        let Some(arr) = tag.as_array() else { continue };
+                        if arr.len() >= 2 && arr[0].as_str() == Some("amount") {
+                            if let Some(raw) = arr[1].as_str() {
+                                if let Ok(parsed) = raw.parse::<i64>() {
+                                    amount_msats = parsed;
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        sqlx::query(
+            "UPDATE events SET zap_count = zap_count + 1, zap_amount_msats = zap_amount_msats + $2 WHERE id = $1",
+        )
+        .bind(&target_id)
+        .bind(amount_msats)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Check if an event ID has already been processed (seen_events dedup).
+    async fn check_seen(&self, event_id: &str) -> Result<bool, AppError> {
+        let exists: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM seen_events WHERE event_id = $1)")
+                .bind(event_id)
+                .fetch_one(&self.pool)
+                .await?;
+        Ok(exists)
+    }
+
+    /// Record an event as seen in the dedup table.
+    async fn mark_seen(
+        &self,
+        event_id: &str,
+        kind: i16,
+        target_id: &str,
+        created_at: i64,
+    ) -> Result<(), AppError> {
+        sqlx::query(
+            "INSERT INTO seen_events (event_id, kind, target_id, created_at)
+             VALUES ($1, $2, $3, $4)
+             ON CONFLICT (event_id) DO NOTHING",
+        )
+        .bind(event_id)
+        .bind(kind)
+        .bind(target_id)
+        .bind(created_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Upsert a kind-3 event: keep only the latest per pubkey in the events table.
+    async fn upsert_kind3_event(
+        &self,
+        event: &NostrEvent,
+        relay_url: &str,
+    ) -> Result<bool, AppError> {
+        // Check if we have a newer kind-3 from this pubkey
+        let existing: Option<(i64,)> = sqlx::query_as(
+            "SELECT created_at FROM events WHERE pubkey = $1 AND kind = 3 ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(&event.pubkey)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        if let Some((existing_ts,)) = existing {
+            if existing_ts >= event.created_at {
+                return Ok(false); // We have a newer one
+            }
+            // Delete the old one
+            sqlx::query("DELETE FROM events WHERE pubkey = $1 AND kind = 3")
+                .bind(&event.pubkey)
+                .execute(&self.pool)
+                .await?;
+        }
+
+        // Insert the new one
+        let raw = serde_json::to_value(event).unwrap_or_default();
+        let tags_json = serde_json::to_value(&event.tags).unwrap_or_default();
+
+        sqlx::query(
+            "INSERT INTO events (id, pubkey, created_at, kind, content, sig, tags, raw, relay_url)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+             ON CONFLICT (id) DO NOTHING",
+        )
+        .bind(&event.id)
+        .bind(&event.pubkey)
+        .bind(event.created_at)
+        .bind(event.kind as i32)
+        .bind(&event.content)
+        .bind(&event.sig)
+        .bind(&tags_json)
+        .bind(&raw)
+        .bind(relay_url)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(true)
+    }
+
+    /// Upsert a kind-10002 relay list event: keep only the latest per pubkey.
+    async fn upsert_relay_list_event(
+        &self,
+        event: &NostrEvent,
+        relay_url: &str,
+    ) -> Result<bool, AppError> {
+        let existing: Option<(i64,)> = sqlx::query_as(
+            "SELECT created_at FROM events WHERE pubkey = $1 AND kind = 10002 ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(&event.pubkey)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        if let Some((existing_ts,)) = existing {
+            if existing_ts >= event.created_at {
+                return Ok(false);
+            }
+            sqlx::query("DELETE FROM events WHERE pubkey = $1 AND kind = 10002")
+                .bind(&event.pubkey)
+                .execute(&self.pool)
+                .await?;
+        }
+
+        let raw = serde_json::to_value(event).unwrap_or_default();
+        let tags_json = serde_json::to_value(&event.tags).unwrap_or_default();
+
+        sqlx::query(
+            "INSERT INTO events (id, pubkey, created_at, kind, content, sig, tags, raw, relay_url)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+             ON CONFLICT (id) DO NOTHING",
+        )
+        .bind(&event.id)
+        .bind(&event.pubkey)
+        .bind(event.created_at)
+        .bind(event.kind as i32)
+        .bind(&event.content)
+        .bind(&event.sig)
+        .bind(&tags_json)
+        .bind(&raw)
+        .bind(relay_url)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(true)
     }
 
     /// Upsert the social graph edges for a follow list (kind 3) event.
@@ -170,14 +484,14 @@ impl EventRepository {
     }
 
     /// Extract event references from tags and insert into event_refs.
-    ///
-    /// Reference types are determined by a combination of event kind and tag markers:
-    /// - Kind 1 (note): `e` tags become reply/root/mention based on NIP-10 markers
-    /// - Kind 7 (reaction): `e` tags become reaction refs
-    /// - Kind 6 (repost): `e` tags become repost refs
-    /// - Kind 9735 (zap receipt): `e` tags become zap refs
-    /// - Other kinds: `e` tags become mention refs
+    /// v2: Only processes kind-1 note refs (reply/root/mention).
+    /// Reactions, reposts, and zaps are handled as counter increments instead.
     async fn insert_refs(&self, event: &NostrEvent) -> Result<(), AppError> {
+        // v2: only insert refs for kind-1 notes
+        if event.kind != 1 {
+            return Ok(());
+        }
+
         let e_tags: Vec<&Vec<String>> = event
             .tags
             .iter()
@@ -189,35 +503,27 @@ impl EventRepository {
         }
 
         let mut has_reply_ref = false;
+        let mut reply_target_id: Option<String> = None;
 
         for tag in &e_tags {
             let target_id = &tag[1];
             let relay_hint = tag.get(2).filter(|s| !s.is_empty()).cloned();
             let marker = tag.get(3).map(|s| s.as_str());
 
-            let ref_type = match event.kind {
-                7 => "reaction",
-                6 | 16 => "repost",
-                9735 => "zap",
-                1 | 42 => {
-                    // NIP-10 marker-based classification
-                    match marker {
-                        Some("root") => "root",
-                        Some("reply") => "reply",
-                        Some("mention") => "mention",
-                        None => {
-                            // Legacy positional: single e-tag = reply, first of many = root, last = reply
-                            if e_tags.len() == 1 {
-                                "reply"
-                            } else if std::ptr::eq(*tag, *e_tags.first().unwrap()) {
-                                "root"
-                            } else if std::ptr::eq(*tag, *e_tags.last().unwrap()) {
-                                "reply"
-                            } else {
-                                "mention"
-                            }
-                        }
-                        _ => "mention",
+            let ref_type = match marker {
+                Some("root") => "root",
+                Some("reply") => "reply",
+                Some("mention") => "mention",
+                None => {
+                    // Legacy positional: single e-tag = reply, first of many = root, last = reply
+                    if e_tags.len() == 1 {
+                        "reply"
+                    } else if std::ptr::eq(*tag, *e_tags.first().unwrap()) {
+                        "root"
+                    } else if std::ptr::eq(*tag, *e_tags.last().unwrap()) {
+                        "reply"
+                    } else {
+                        "mention"
                     }
                 }
                 _ => "mention",
@@ -225,6 +531,10 @@ impl EventRepository {
 
             if ref_type == "reply" || ref_type == "root" {
                 has_reply_ref = true;
+                // Track the reply target for counter increment
+                if ref_type == "reply" || (ref_type == "root" && reply_target_id.is_none()) {
+                    reply_target_id = Some(target_id.clone());
+                }
             }
 
             sqlx::query(
@@ -246,6 +556,14 @@ impl EventRepository {
                 .bind(&event.id)
                 .execute(&self.pool)
                 .await?;
+
+            // v2: increment reply_count on the target event
+            if let Some(ref target_id) = reply_target_id {
+                sqlx::query("UPDATE events SET reply_count = reply_count + 1 WHERE id = $1")
+                    .bind(target_id)
+                    .execute(&self.pool)
+                    .await?;
+            }
         }
 
         Ok(())
@@ -564,42 +882,38 @@ impl EventRepository {
     }
 
     /// Get interaction counts for an event.
+    /// v2: reads directly from counter columns on the events table.
     pub async fn get_interactions(&self, event_id: &str) -> Result<EventInteractions, AppError> {
-        let row = sqlx::query_as::<_, (i64, i64, i64, i64, i64)>(
+        let row = sqlx::query_as::<_, (i32, i32, i32, i32, i64)>(
             r#"
-            SELECT
-                COUNT(*) FILTER (WHERE r.ref_type IN ('reply', 'root')) AS replies,
-                COUNT(*) FILTER (WHERE r.ref_type = 'reaction') AS reactions,
-                COUNT(*) FILTER (WHERE r.ref_type = 'repost') AS reposts,
-                COUNT(*) FILTER (WHERE r.ref_type = 'zap') AS zaps,
-                COALESCE(
-                    SUM(
-                        CASE
-                            WHEN r.ref_type = 'zap' THEN COALESCE(zm.amount_msats, 0)
-                            ELSE 0
-                        END
-                    ),
-                    0
-                )::bigint AS zap_total_msats
-            FROM event_refs r
-            LEFT JOIN zap_metadata zm ON zm.event_id = r.source_event_id
-            WHERE r.target_event_id = $1
+            SELECT reaction_count, repost_count, reply_count, zap_count, zap_amount_msats
+            FROM events WHERE id = $1
             "#,
         )
         .bind(event_id)
-        .fetch_one(&self.pool)
+        .fetch_optional(&self.pool)
         .await?;
 
-        Ok(EventInteractions {
-            replies: row.0,
-            reactions: row.1,
-            reposts: row.2,
-            zaps: row.3,
-            zap_sats: row.4 / 1000,
-        })
+        match row {
+            Some((reactions, reposts, replies, zaps, zap_msats)) => Ok(EventInteractions {
+                replies: replies as i64,
+                reactions: reactions as i64,
+                reposts: reposts as i64,
+                zaps: zaps as i64,
+                zap_sats: zap_msats / 1000,
+            }),
+            None => Ok(EventInteractions {
+                replies: 0,
+                reactions: 0,
+                reposts: 0,
+                zaps: 0,
+                zap_sats: 0,
+            }),
+        }
     }
 
     /// Batch-fetch engagement stats for multiple events by ID.
+    /// v2: reads directly from counter columns.
     pub async fn batch_get_interactions(
         &self,
         event_ids: &[String],
@@ -610,17 +924,9 @@ impl EventRepository {
 
         let rows = sqlx::query(
             r#"
-            SELECT
-                r.target_event_id AS event_id,
-                COUNT(*) FILTER (WHERE r.ref_type IN ('reply', 'root')) AS replies,
-                COUNT(*) FILTER (WHERE r.ref_type = 'reaction') AS reactions,
-                COUNT(*) FILTER (WHERE r.ref_type = 'repost') AS reposts,
-                COUNT(*) FILTER (WHERE r.ref_type = 'zap') AS zaps,
-                COALESCE(SUM(CASE WHEN r.ref_type = 'zap' THEN COALESCE(zm.amount_msats, 0) ELSE 0 END), 0)::bigint AS zap_total_msats
-            FROM event_refs r
-            LEFT JOIN zap_metadata zm ON zm.event_id = r.source_event_id
-            WHERE r.target_event_id = ANY($1)
-            GROUP BY r.target_event_id
+            SELECT id, reaction_count, repost_count, reply_count, zap_count, zap_amount_msats
+            FROM events
+            WHERE id = ANY($1)
             "#,
         )
         .bind(event_ids)
@@ -629,15 +935,15 @@ impl EventRepository {
 
         let mut map = std::collections::HashMap::new();
         for row in rows {
-            let eid: String = row.try_get("event_id")?;
-            let zap_msats: i64 = row.try_get("zap_total_msats")?;
+            let eid: String = row.try_get("id")?;
+            let zap_msats: i64 = row.try_get("zap_amount_msats")?;
             map.insert(
                 eid,
                 EventInteractions {
-                    replies: row.try_get("replies")?,
-                    reactions: row.try_get("reactions")?,
-                    reposts: row.try_get("reposts")?,
-                    zaps: row.try_get("zaps")?,
+                    replies: row.try_get::<i32, _>("reply_count")? as i64,
+                    reactions: row.try_get::<i32, _>("reaction_count")? as i64,
+                    reposts: row.try_get::<i32, _>("repost_count")? as i64,
+                    zaps: row.try_get::<i32, _>("zap_count")? as i64,
                     zap_sats: zap_msats / 1000,
                 },
             );
@@ -694,7 +1000,9 @@ impl EventRepository {
         Ok(events)
     }
 
-    /// Get the full thread context for an event: parent chain, interactions, and related events.
+    /// Get the full thread context for an event: parent chain, interactions, and reply events.
+    /// v2: reactions and reposts are counts-only (empty vecs for API compat).
+    /// Zaps are still returned as full events since they're always stored.
     pub async fn get_thread(
         &self,
         event_id: &str,
@@ -705,15 +1013,8 @@ impl EventRepository {
             None => return Ok(None),
         };
 
-        // Run all independent queries in parallel
-        let (
-            refs_result,
-            interactions_result,
-            replies_result,
-            reactions_result,
-            reposts_result,
-            zaps_result,
-        ) = tokio::join!(
+        // Run independent queries in parallel
+        let (refs_result, interactions_result, replies_result, zaps_result) = tokio::join!(
             // Find root and parent from this event's outgoing refs
             sqlx::query_as::<_, EventRef>(
                 "SELECT source_event_id, target_event_id, ref_type, relay_hint, created_at
@@ -724,16 +1025,12 @@ impl EventRepository {
             .fetch_all(&self.pool),
             self.get_interactions(event_id),
             self.get_referencing_events_multi(event_id, &["reply", "root"], limit),
-            self.get_referencing_events(event_id, "reaction", limit),
-            self.get_referencing_events(event_id, "repost", limit),
             self.get_referencing_events(event_id, "zap", limit),
         );
 
         let refs = refs_result?;
         let interactions = interactions_result?;
         let replies = replies_result?;
-        let reactions = reactions_result?;
-        let reposts = reposts_result?;
         let zaps = zaps_result?;
 
         let root_id = refs
@@ -751,8 +1048,8 @@ impl EventRepository {
             parent_id,
             interactions,
             replies,
-            reactions,
-            reposts,
+            reactions: vec![], // v2: counts-only, no individual reaction events stored
+            reposts: vec![],   // v2: counts-only, no individual repost events stored
             zaps,
         }))
     }
@@ -822,10 +1119,8 @@ impl EventRepository {
 
 
 
-    /// Two-phase optimized trending query:
-    /// Phase 1: Find top target_event_ids by primary metric using (ref_type, created_at) index.
-    /// Phase 2: Fetch full engagement stats only for those top events.
-    /// Returns ranked events with full engagement + author profiles.
+    /// Top notes ranked by a specific metric, using counter columns directly.
+    /// v2: massive perf improvement -- no more subquery joins through event_refs.
     pub async fn top_notes_unified(
         &self,
         ref_type: &str,
@@ -833,77 +1128,41 @@ impl EventRepository {
         limit: i64,
         offset: i64,
     ) -> Result<(Vec<RankedEvent>, Vec<ProfileRow>), AppError> {
-        let rows = sqlx::query(
+        // Map API ref_type to counter column
+        let order_col = match ref_type {
+            "reaction" => "reaction_count",
+            "repost" => "repost_count",
+            "reply" => "reply_count",
+            "zap" => "zap_amount_msats",
+            _ => "reaction_count",
+        };
+
+        let sql = format!(
             r#"
-            WITH credible_actors AS (
-                SELECT followed_pubkey AS pubkey
-                FROM follows
-                GROUP BY followed_pubkey
-                HAVING COUNT(*) >= 10
-            ),
-            -- Phase 1: rank by primary metric only (uses idx_event_refs_reftype_created)
-            -- Zap ranking counts ALL senders (real money); other metrics filter to credible actors
-            primary_metric AS (
-                SELECT
-                    r.target_event_id,
-                    -- Count DISTINCT authors so bot/thread chains don't inflate rankings
-                    COUNT(DISTINCT src.pubkey) AS metric_count,
-                    CASE WHEN $1 = 'zap' THEN
-                        COALESCE(SUM(COALESCE(zm.amount_msats, 0)), 0)::bigint
-                    ELSE 0::bigint END AS zap_total_msats
-                FROM event_refs r
-                JOIN events src ON src.id = r.source_event_id
-                LEFT JOIN credible_actors ca ON ca.pubkey = src.pubkey
-                LEFT JOIN zap_metadata zm
-                    ON $1 = 'zap'
-                    AND zm.event_id = r.source_event_id
-                WHERE (r.ref_type = $1 OR ($1 = 'reply' AND r.ref_type = 'root'))
-                  AND ($2::bigint IS NULL OR r.created_at >= $2)
-                  AND ($1 = 'zap' OR ca.pubkey IS NOT NULL)
-                GROUP BY r.target_event_id
-                ORDER BY
-                    CASE WHEN $1 = 'zap' THEN
-                        COALESCE(SUM(COALESCE(zm.amount_msats, 0)), 0)::bigint
-                    ELSE COUNT(DISTINCT src.pubkey)
-                    END DESC
-                LIMIT $3 OFFSET $4
-            ),
-            -- Phase 2: full engagement only for top N events
-            full_engagement AS (
-                SELECT
-                    r.target_event_id,
-                    COUNT(DISTINCT src2.pubkey) FILTER (WHERE r.ref_type = 'reaction') AS reactions,
-                    COUNT(DISTINCT src2.pubkey) FILTER (WHERE r.ref_type IN ('reply', 'root')) AS replies,
-                    COUNT(DISTINCT src2.pubkey) FILTER (WHERE r.ref_type = 'repost')   AS reposts,
-                    COALESCE(SUM(
-                        CASE WHEN r.ref_type = 'zap' THEN COALESCE(zm.amount_msats, 0) ELSE 0 END
-                    ), 0)::bigint AS zap_total_msats
-                FROM event_refs r
-                JOIN events src2 ON src2.id = r.source_event_id
-                LEFT JOIN zap_metadata zm ON zm.event_id = r.source_event_id
-                WHERE r.target_event_id IN (SELECT target_event_id FROM primary_metric)
-                GROUP BY r.target_event_id
-            )
             SELECT
                 e.id, e.pubkey, e.created_at, e.kind, e.content, e.sig,
                 e.tags, e.raw, e.relay_url, e.received_at,
-                pm.metric_count,
-                pm.zap_total_msats AS primary_zap_msats,
-                fe.reactions, fe.replies, fe.reposts, fe.zap_total_msats
-            FROM primary_metric pm
-            JOIN events e ON e.id = pm.target_event_id AND e.kind = 1
-            LEFT JOIN full_engagement fe ON fe.target_event_id = pm.target_event_id
-            ORDER BY
-                CASE WHEN $1 = 'zap' THEN pm.zap_total_msats ELSE pm.metric_count END DESC,
-                e.created_at DESC
-            "#,
-        )
-        .bind(ref_type)
-        .bind(since)
-        .bind(limit)
-        .bind(offset)
-        .fetch_all(&self.pool)
-        .await?;
+                e.reaction_count::bigint AS reactions,
+                e.repost_count::bigint AS reposts,
+                e.reply_count::bigint AS replies,
+                e.zap_count::bigint AS zaps,
+                e.zap_amount_msats,
+                {order_col}::bigint AS metric_count
+            FROM events e
+            WHERE e.kind = 1
+              AND ($1::bigint IS NULL OR e.created_at >= $1)
+              AND {order_col} > 0
+            ORDER BY {order_col} DESC, e.created_at DESC
+            LIMIT $2 OFFSET $3
+            "#
+        );
+
+        let rows = sqlx::query(&sql)
+            .bind(since)
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&self.pool)
+            .await?;
 
         let is_zap = ref_type == "zap";
 
@@ -926,7 +1185,7 @@ impl EventRepository {
                     received_at: row.try_get("received_at")?,
                 };
                 let count: i64 = row.try_get("metric_count")?;
-                let zap_msats: i64 = row.try_get("zap_total_msats")?;
+                let zap_msats: i64 = row.try_get("zap_amount_msats")?;
                 let total_sats = if is_zap { Some(zap_msats / 1000) } else { None };
                 Ok(RankedEvent {
                     event,
@@ -940,7 +1199,6 @@ impl EventRepository {
             })
             .collect::<Result<Vec<_>, _>>()?;
 
-        // Batch-fetch profiles for all note authors
         let unique_pubkeys: Vec<String> = {
             let mut seen = HashSet::new();
             pubkeys
@@ -955,6 +1213,7 @@ impl EventRepository {
 
     /// Trending notes: composite score combining zaps (1 point per sat), reposts (1000),
     /// replies (500), and reactions (100). 24h window.
+    /// v2: reads directly from counter columns -- no event_refs joins needed.
     pub async fn trending_notes(
         &self,
         limit: i64,
@@ -962,55 +1221,25 @@ impl EventRepository {
     ) -> Result<Vec<TrendingNote>, AppError> {
         let since = chrono::Utc::now().timestamp() - 86400;
 
-        // Two-phase approach for speed:
-        // Phase 1: Find top target_event_ids by distinct-author engagement count
-        //          using idx_event_refs_reftype_created. No expensive joins.
-        // Phase 2: Compute full engagement breakdown only for those top N.
         let rows = sqlx::query(
             r#"
-            WITH top_candidates AS (
-                SELECT
-                    r.target_event_id,
-                    COUNT(DISTINCT src.pubkey) AS unique_engagers
-                FROM event_refs r
-                JOIN events src ON src.id = r.source_event_id
-                WHERE r.ref_type IN ('reaction', 'reply', 'root', 'repost', 'zap')
-                  AND r.created_at >= $1
-                GROUP BY r.target_event_id
-                ORDER BY unique_engagers DESC
-                LIMIT 200
-            ),
-            full_engagement AS (
-                SELECT
-                    r.target_event_id,
-                    COUNT(DISTINCT src2.pubkey) FILTER (WHERE r.ref_type = 'reaction') AS reaction_count,
-                    COUNT(DISTINCT src2.pubkey) FILTER (WHERE r.ref_type IN ('reply', 'root')) AS reply_count,
-                    COUNT(DISTINCT src2.pubkey) FILTER (WHERE r.ref_type = 'repost') AS repost_count,
-                    COALESCE(SUM(
-                        CASE WHEN r.ref_type = 'zap' THEN COALESCE(zm.amount_msats, 0) ELSE 0 END
-                    ), 0)::bigint AS zap_total_msats
-                FROM event_refs r
-                JOIN events src2 ON src2.id = r.source_event_id
-                LEFT JOIN zap_metadata zm ON zm.event_id = r.source_event_id
-                WHERE r.target_event_id IN (SELECT target_event_id FROM top_candidates)
-                GROUP BY r.target_event_id
-            )
             SELECT
                 e.id, e.pubkey, e.created_at, e.kind, e.content, e.sig, e.tags, e.raw,
                 e.relay_url, e.received_at,
-                (COALESCE(fe.zap_total_msats, 0) / 1000)::bigint AS zap_sats,
-                COALESCE(fe.repost_count, 0)::bigint AS repost_count,
-                COALESCE(fe.reply_count, 0)::bigint AS reply_count,
-                COALESCE(fe.reaction_count, 0)::bigint AS reaction_count,
+                (e.zap_amount_msats / 1000)::bigint AS zap_sats,
+                e.repost_count::bigint AS repost_count,
+                e.reply_count::bigint AS reply_count,
+                e.reaction_count::bigint AS reaction_count,
                 (
-                    COALESCE(fe.zap_total_msats, 0) / 1000
-                    + COALESCE(fe.repost_count, 0) * 1000
-                    + COALESCE(fe.reply_count, 0) * 500
-                    + COALESCE(fe.reaction_count, 0) * 100
+                    e.zap_amount_msats / 1000
+                    + e.repost_count * 1000
+                    + e.reply_count * 500
+                    + e.reaction_count * 100
                 )::bigint AS score
-            FROM top_candidates tc
-            JOIN events e ON e.id = tc.target_event_id AND e.kind = 1
-            LEFT JOIN full_engagement fe ON fe.target_event_id = tc.target_event_id
+            FROM events e
+            WHERE e.kind = 1
+              AND e.created_at >= $1
+              AND (e.reaction_count + e.repost_count + e.reply_count + e.zap_count) > 0
             ORDER BY score DESC, e.created_at DESC
             LIMIT $2 OFFSET $3
             "#,
@@ -1358,11 +1587,7 @@ impl EventRepository {
     }
 
     /// Search notes with full-text search, ranked by relevance and engagement.
-    ///
-    /// Ranking algorithm:
-    /// - FTS relevance (ts_rank): ×1000
-    /// - Engagement score: ln(weighted_engagement + 1) × 10
-    /// - Recency bonus: +50 for <24h, +25 for <7d
+    /// v2: uses counter columns instead of event_refs join.
     pub async fn search_notes(
         &self,
         query: &str,
@@ -1375,6 +1600,7 @@ impl EventRepository {
                 SELECT
                     e.id, e.pubkey, e.created_at, e.kind, e.content, e.sig,
                     e.tags, e.raw, e.relay_url, e.received_at,
+                    e.reaction_count, e.reply_count, e.repost_count, e.zap_count,
                     ts_rank(e.content_tsv, query) AS text_rank
                 FROM events e, plainto_tsquery('english', $1) query
                 WHERE e.kind = 1 AND e.content_tsv @@ query
@@ -1384,17 +1610,17 @@ impl EventRepository {
             SELECT
                 r.id, r.pubkey, r.created_at, r.kind, r.content, r.sig,
                 r.tags, r.raw, r.relay_url, r.received_at,
-                COALESCE(eng.reaction_count, 0)::bigint AS reactions,
-                COALESCE(eng.reply_count, 0)::bigint AS replies,
-                COALESCE(eng.repost_count, 0)::bigint AS reposts,
-                COALESCE(eng.zap_count, 0)::bigint AS zaps,
+                r.reaction_count::bigint AS reactions,
+                r.reply_count::bigint AS replies,
+                r.repost_count::bigint AS reposts,
+                r.zap_count::bigint AS zaps,
                 (
                     r.text_rank * 1000 +
                     LN(
-                        COALESCE(eng.reaction_count, 0) * 100 +
-                        COALESCE(eng.reply_count, 0) * 500 +
-                        COALESCE(eng.repost_count, 0) * 1000 +
-                        COALESCE(eng.zap_count, 0) * 2000 + 1
+                        r.reaction_count * 100 +
+                        r.reply_count * 500 +
+                        r.repost_count * 1000 +
+                        r.zap_count * 2000 + 1
                     ) * 10 +
                     CASE
                         WHEN r.created_at > EXTRACT(EPOCH FROM NOW())::bigint - 86400 THEN 50
@@ -1403,15 +1629,6 @@ impl EventRepository {
                     END
                 )::float8 AS rank_score
             FROM ranked r
-            LEFT JOIN LATERAL (
-                SELECT
-                    COUNT(*) FILTER (WHERE ref_type = 'reaction') AS reaction_count,
-                    COUNT(*) FILTER (WHERE ref_type IN ('reply', 'root')) AS reply_count,
-                    COUNT(*) FILTER (WHERE ref_type = 'repost') AS repost_count,
-                    COUNT(*) FILTER (WHERE ref_type = 'zap') AS zap_count
-                FROM event_refs
-                WHERE target_event_id = r.id
-            ) eng ON TRUE
             ORDER BY rank_score DESC
             LIMIT $2 OFFSET $3
             "#,
@@ -1483,6 +1700,8 @@ impl EventRepository {
     ///
     /// Returns a JSON object with: event, root_id, parent_id, stats, replies, profiles.
     /// Uses CTEs so Postgres does all the heavy lifting in one query plan.
+    /// Fetch everything the note detail page needs.
+    /// v2: stats come from counter columns, no event_refs aggregate for stats.
     pub async fn get_note_detail(
         &self,
         event_id: &str,
@@ -1492,7 +1711,8 @@ impl EventRepository {
             r#"
             WITH target AS (
                 SELECT id, pubkey, created_at, kind, content, sig, tags,
-                       relay_url, received_at
+                       relay_url, received_at,
+                       reaction_count, repost_count, reply_count, zap_count
                 FROM events
                 WHERE id = $1
             ),
@@ -1503,15 +1723,6 @@ impl EventRepository {
                 FROM event_refs
                 WHERE source_event_id = $1
                   AND ref_type IN ('root', 'reply')
-            ),
-            stats AS (
-                SELECT
-                    COUNT(*) FILTER (WHERE ref_type IN ('reply', 'root')) AS replies,
-                    COUNT(*) FILTER (WHERE ref_type = 'reaction') AS reactions,
-                    COUNT(*) FILTER (WHERE ref_type = 'repost')   AS reposts,
-                    COUNT(*) FILTER (WHERE ref_type = 'zap')      AS zaps
-                FROM event_refs
-                WHERE target_event_id = $1
             ),
             reply_events AS (
                 SELECT e.id, e.pubkey, e.created_at, e.kind, e.content,
@@ -1551,11 +1762,11 @@ impl EventRepository {
                 'root_id',   (SELECT root_id          FROM thread_refs),
                 'parent_id', (SELECT parent_id        FROM thread_refs),
                 'stats',     (SELECT json_build_object(
-                                 'replies',   replies,
-                                 'reactions', reactions,
-                                 'reposts',  reposts,
-                                 'zaps',     zaps
-                             ) FROM stats),
+                                 'replies',   reply_count,
+                                 'reactions', reaction_count,
+                                 'reposts',  repost_count,
+                                 'zaps',     zap_count
+                             ) FROM target),
                 'replies',   COALESCE(
                     (SELECT json_agg(row_to_json(re) ORDER BY re.created_at DESC)
                      FROM reply_events re), '[]'::json
@@ -1572,7 +1783,6 @@ impl EventRepository {
         .fetch_one(&self.pool)
         .await?;
 
-        // If the event doesn't exist, the 'event' field will be JSON null
         if row.0.get("event").map_or(true, |v| v.is_null()) {
             return Ok(None);
         }
@@ -1648,22 +1858,10 @@ impl EventRepository {
         // Build count query
         let count_sql = format!("SELECT COUNT(*) FROM events e WHERE {where_clause}");
 
-        // Build data query — engagement stats always needed for response fields
-        let engagement_join = r#"LEFT JOIN LATERAL (
-                SELECT
-                    COUNT(*) FILTER (WHERE ref_type = 'reaction') AS reaction_count,
-                    COUNT(*) FILTER (WHERE ref_type IN ('reply', 'root')) AS reply_count,
-                    COUNT(*) FILTER (WHERE ref_type = 'repost') AS repost_count,
-                    COUNT(*) FILTER (WHERE ref_type = 'zap') AS zap_count,
-                    COALESCE(SUM(CASE WHEN ref_type = 'zap' THEN COALESCE(zm.amount_msats, 0) ELSE 0 END), 0)::bigint AS zap_total_msats
-                FROM event_refs er2
-                LEFT JOIN zap_metadata zm ON zm.event_id = er2.source_event_id
-                WHERE er2.target_event_id = e.id
-            ) eng ON TRUE"#;
-
+        // v2: engagement stats from counter columns directly, no LATERAL join needed
         let order_clause = match order {
             "oldest" => "e.created_at ASC",
-            "engagement" => "(COALESCE(eng.reaction_count, 0) * 1 + COALESCE(eng.reply_count, 0) * 5 + COALESCE(eng.repost_count, 0) * 10 + COALESCE(eng.zap_count, 0) * 20) DESC, e.created_at DESC",
+            "engagement" => "(e.reaction_count * 1 + e.reply_count * 5 + e.repost_count * 10 + e.zap_count * 20) DESC, e.created_at DESC",
             _ => "e.created_at DESC", // newest (default)
         };
 
@@ -1671,12 +1869,11 @@ impl EventRepository {
             r#"SELECT
                 e.id, e.pubkey, e.created_at, e.kind, e.content, e.sig,
                 e.tags, e.raw, e.relay_url, e.received_at,
-                COALESCE(eng.reaction_count, 0)::bigint AS reactions,
-                COALESCE(eng.reply_count, 0)::bigint AS replies,
-                COALESCE(eng.repost_count, 0)::bigint AS reposts,
-                (COALESCE(eng.zap_total_msats, 0) / 1000)::bigint AS zap_sats
+                e.reaction_count::bigint AS reactions,
+                e.reply_count::bigint AS replies,
+                e.repost_count::bigint AS reposts,
+                (e.zap_amount_msats / 1000)::bigint AS zap_sats
             FROM events e
-            {engagement_join}
             WHERE {where_clause}
             ORDER BY {order_clause}
             LIMIT ${param_idx} OFFSET ${}"#,
@@ -1792,6 +1989,7 @@ impl EventRepository {
 
     /// Search notes and return raw kind-1 events, ranked by FTS relevance + engagement.
     /// Used by the NIP-50 WebSocket search relay.
+    /// v2: uses counter columns instead of event_refs join.
     pub async fn search_notes_as_events(
         &self,
         query: &str,
@@ -1803,6 +2001,7 @@ impl EventRepository {
                 SELECT
                     e.id, e.pubkey, e.created_at, e.kind, e.content, e.sig,
                     e.tags, e.raw, e.relay_url, e.received_at,
+                    e.reaction_count, e.reply_count, e.repost_count, e.zap_count,
                     ts_rank(e.content_tsv, query) AS text_rank
                 FROM events e, plainto_tsquery('english', $1) query
                 WHERE e.kind = 1 AND e.content_tsv @@ query
@@ -1813,22 +2012,13 @@ impl EventRepository {
                 r.id, r.pubkey, r.created_at, r.kind, r.content, r.sig,
                 r.tags, r.raw, r.relay_url, r.received_at
             FROM ranked r
-            LEFT JOIN LATERAL (
-                SELECT
-                    COUNT(*) FILTER (WHERE ref_type = 'reaction') AS reaction_count,
-                    COUNT(*) FILTER (WHERE ref_type IN ('reply', 'root')) AS reply_count,
-                    COUNT(*) FILTER (WHERE ref_type = 'repost') AS repost_count,
-                    COUNT(*) FILTER (WHERE ref_type = 'zap') AS zap_count
-                FROM event_refs
-                WHERE target_event_id = r.id
-            ) eng ON TRUE
             ORDER BY (
                 r.text_rank * 1000 +
                 LN(
-                    COALESCE(eng.reaction_count, 0) * 100 +
-                    COALESCE(eng.reply_count, 0) * 500 +
-                    COALESCE(eng.repost_count, 0) * 1000 +
-                    COALESCE(eng.zap_count, 0) * 2000 + 1
+                    r.reaction_count * 100 +
+                    r.reply_count * 500 +
+                    r.repost_count * 1000 +
+                    r.zap_count * 2000 + 1
                 ) * 10 +
                 CASE
                     WHEN r.created_at > EXTRACT(EPOCH FROM NOW())::bigint - 86400 THEN 50
@@ -1885,11 +2075,14 @@ impl EventRepository {
             return Ok((Vec::new(), Vec::new()));
         }
 
+        // v2: engagement from counter columns, no event_refs join needed
         let rows = sqlx::query(
             r#"
             WITH tagged_notes AS (
                 SELECT DISTINCT e.id, e.pubkey, e.created_at, e.kind, e.content, e.sig,
-                       e.tags, e.raw, e.relay_url, e.received_at
+                       e.tags, e.raw, e.relay_url, e.received_at,
+                       e.reaction_count, e.repost_count, e.reply_count,
+                       e.zap_count, e.zap_amount_msats
                 FROM events e,
                      jsonb_array_elements(e.tags) AS tag_elem
                 WHERE e.kind = 1
@@ -1897,36 +2090,21 @@ impl EventRepository {
                   AND LOWER(tag_elem->>1) = ANY($1)
                 ORDER BY e.created_at DESC
                 LIMIT 200
-            ),
-            engagement AS (
-                SELECT
-                    r.target_event_id,
-                    COUNT(*) FILTER (WHERE r.ref_type = 'reaction')::bigint AS reaction_count,
-                    COUNT(*) FILTER (WHERE r.ref_type IN ('reply', 'root'))::bigint AS reply_count,
-                    COUNT(*) FILTER (WHERE r.ref_type = 'repost')::bigint AS repost_count,
-                    COALESCE(SUM(
-                        CASE WHEN r.ref_type = 'zap' THEN COALESCE(zm.amount_msats, 0) ELSE 0 END
-                    ), 0)::bigint AS zap_total_msats
-                FROM event_refs r
-                LEFT JOIN zap_metadata zm ON zm.event_id = r.source_event_id
-                WHERE r.target_event_id IN (SELECT id FROM tagged_notes)
-                GROUP BY r.target_event_id
             )
             SELECT
                 tn.id, tn.pubkey, tn.created_at, tn.kind, tn.content, tn.sig,
                 tn.tags, tn.raw, tn.relay_url, tn.received_at,
-                (COALESCE(eng.zap_total_msats, 0) / 1000)::bigint AS zap_sats,
-                COALESCE(eng.repost_count, 0)::bigint AS repost_count,
-                COALESCE(eng.reply_count, 0)::bigint AS reply_count,
-                COALESCE(eng.reaction_count, 0)::bigint AS reaction_count,
+                (tn.zap_amount_msats / 1000)::bigint AS zap_sats,
+                tn.repost_count::bigint AS repost_count,
+                tn.reply_count::bigint AS reply_count,
+                tn.reaction_count::bigint AS reaction_count,
                 (
-                    COALESCE(eng.zap_total_msats, 0) / 1000
-                    + COALESCE(eng.repost_count, 0) * 1000
-                    + COALESCE(eng.reply_count, 0) * 500
-                    + COALESCE(eng.reaction_count, 0) * 100
+                    tn.zap_amount_msats / 1000
+                    + tn.repost_count * 1000
+                    + tn.reply_count * 500
+                    + tn.reaction_count * 100
                 )::bigint AS score
             FROM tagged_notes tn
-            LEFT JOIN engagement eng ON eng.target_event_id = tn.id
             ORDER BY score DESC, tn.created_at DESC
             LIMIT $2 OFFSET $3
             "#,
@@ -2036,9 +2214,9 @@ impl EventRepository {
             SELECT LOWER(tag_elem->>1)                    AS client_name,
                    COUNT(DISTINCT e.id)::bigint           AS note_count,
                    COUNT(DISTINCT e.pubkey)::bigint       AS user_count
-            FROM events e,
+            FROM events e
+            JOIN profile_search ps ON ps.pubkey = e.pubkey AND ps.follower_count >= 1,
                  jsonb_array_elements(e.tags) AS tag_elem
-            JOIN profile_search ps ON ps.pubkey = e.pubkey AND ps.follower_count >= 1
             WHERE tag_elem->>0 = 'client'
               AND e.kind = 1
               AND LENGTH(tag_elem->>1) BETWEEN 1 AND 100

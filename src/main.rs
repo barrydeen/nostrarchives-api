@@ -9,6 +9,7 @@ mod nip19;
 mod ratelimit;
 mod relay;
 mod social;
+mod wot_cache;
 mod ws;
 
 use std::collections::HashSet;
@@ -81,26 +82,61 @@ async fn main() {
         .expect("failed to connect to database");
     tracing::info!("database connected, migrations applied");
 
-    // Follower cache for high-performance threshold checking
+    // Follower cache for high-performance threshold checking (legacy, kept for stats endpoint)
     let follower_cache = follower_cache::FollowerCache::new(
         pool.clone(),
         cfg.min_follower_threshold,
         cfg.follower_cache_refresh_secs,
     );
-    
+
     // Initialize the cache on startup
     if let Err(e) = follower_cache.initialize().await {
         tracing::warn!(error = %e, "Failed to initialize follower cache, continuing anyway");
     }
 
-    let repo = db::repository::EventRepository::new(pool.clone(), follower_cache);
+    // Web of Trust cache: two-level follower quality check
+    let wot_cache = wot_cache::WotCache::new(
+        pool.clone(),
+        cfg.wot_threshold,
+        cfg.wot_refresh_secs,
+    );
+
+    if let Err(e) = wot_cache.initialize().await {
+        tracing::warn!(error = %e, "Failed to initialize WoT cache, continuing anyway");
+    }
+
+    let repo = db::repository::EventRepository::new(pool.clone(), follower_cache, wot_cache);
 
     if cfg.social_graph_bootstrap {
-        let builder_repo = repo.clone();
-        let builder_relays = relay_urls.clone();
-        tokio::spawn(async move {
-            social::builder::bootstrap_social_graph(builder_repo, builder_relays).await;
-        });
+        // Skip bootstrap if the social graph is already populated (e.g. from a previous run).
+        let existing_follows: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM follow_lists")
+            .fetch_one(&pool)
+            .await
+            .unwrap_or((0,));
+
+        if existing_follows.0 >= 100 {
+            tracing::info!(
+                follow_lists = existing_follows.0,
+                "social graph already populated, skipping bootstrap"
+            );
+        } else {
+            // Bootstrap blocks startup so the social graph is built before
+            // the crawler tries to seed its queue from WoT scores.
+            social::builder::bootstrap_social_graph(repo.clone(), relay_urls.clone()).await;
+
+            // Refresh WoT cache now that we have follow data
+            tracing::info!("refreshing WoT cache after social graph bootstrap");
+            if let Err(e) = repo.wot_cache.initialize().await {
+                tracing::warn!(error = %e, "WoT cache refresh after bootstrap failed");
+            }
+
+            // Refresh profile_search materialized view so client leaderboard/search works
+            tracing::info!("refreshing profile_search after social graph bootstrap");
+            match repo.refresh_profile_search().await {
+                Ok(()) => tracing::info!("profile_search refreshed after bootstrap"),
+                Err(e) => tracing::warn!(error = %e, "profile_search refresh after bootstrap failed"),
+            }
+        }
     } else {
         tracing::info!("social graph bootstrap disabled");
     }

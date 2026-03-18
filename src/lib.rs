@@ -6,3 +6,4 @@ pub mod error;
 pub mod follower_cache;
 pub mod nip19;
 pub mod relay;
+pub mod wot_cache;
