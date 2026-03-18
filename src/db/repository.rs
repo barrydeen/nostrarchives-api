@@ -3,8 +3,9 @@ use std::collections::HashSet;
 use sqlx::{PgPool, Row};
 
 use super::models::{
-    DailyStats, EventInteractions, EventQuery, EventRef, EventThread, KindCount, NewUser,
-    NostrEvent, StoredEvent, TrendingNote, TrendingUser,
+    DailyStats, EventInteractions, EventQuery, EventRef, EventThread, KindCount, 
+    MostLikedAuthor, MostSharedAuthor, NewUser, NostrEvent, StoredEvent, TopPoster, 
+    TrendingNote, TrendingUser,
 };
 use crate::error::AppError;
 use crate::follower_cache::FollowerCache;
@@ -32,6 +33,29 @@ pub struct RankedEvent {
 pub struct ProfileRow {
     pub pubkey: String,
     pub content: String,
+}
+
+/// Convert a range string to a timestamp for filtering.
+fn range_to_since(range: &str) -> i64 {
+    let now = chrono::Utc::now().timestamp();
+    match range {
+        "today" => now - 86400,
+        "7d" => now - 7 * 86400,
+        "30d" => now - 30 * 86400,
+        "all" => 0,
+        _ => now - 7 * 86400,
+    }
+}
+
+/// Calculate cache TTL in seconds based on range.
+fn range_cache_ttl(range: &str) -> u64 {
+    match range {
+        "today" => 300,    // 5 min
+        "7d" => 1800,      // 30 min
+        "30d" => 3600,     // 1 hour
+        "all" => 86400,    // 1 day
+        _ => 1800,         // default to 30 min
+    }
 }
 
 impl EventRepository {
@@ -1485,47 +1509,138 @@ impl EventRepository {
         })
     }
 
-    /// Top zappers: users ranked by total sats sent or received in the last 24h.
+    /// Top zappers: users ranked by total sats sent or received in the specified timeframe.
     pub async fn top_zappers(
         &self,
         direction: &str,
+        range: &str,
         limit: i64,
         offset: i64,
     ) -> Result<Vec<super::models::TopZapper>, AppError> {
-        let since = chrono::Utc::now().timestamp() - 86400;
+        let since = range_to_since(range);
 
         let rows = if direction == "sent" {
             // Sender pubkey is inside the embedded zap request JSON (description tag)
-            sqlx::query_as::<_, (String, i64, i64)>(
+            if since == 0 {
+                sqlx::query_as::<_, (String, i64, i64)>(
+                    r#"
+                    SELECT sender_pubkey AS pubkey,
+                           (SUM(amount_msats) / 1000)::bigint AS total_sats,
+                           COUNT(*)::bigint AS zap_count
+                    FROM zap_metadata
+                    WHERE sender_pubkey IS NOT NULL AND sender_pubkey != ''
+                    GROUP BY sender_pubkey
+                    ORDER BY total_sats DESC
+                    LIMIT $1 OFFSET $2
+                    "#,
+                )
+                .bind(limit)
+                .bind(offset)
+                .fetch_all(&self.pool)
+                .await?
+            } else {
+                sqlx::query_as::<_, (String, i64, i64)>(
+                    r#"
+                    SELECT sender_pubkey AS pubkey,
+                           (SUM(amount_msats) / 1000)::bigint AS total_sats,
+                           COUNT(*)::bigint AS zap_count
+                    FROM zap_metadata
+                    WHERE sender_pubkey IS NOT NULL AND sender_pubkey != ''
+                      AND created_at >= $1
+                    GROUP BY sender_pubkey
+                    ORDER BY total_sats DESC
+                    LIMIT $2 OFFSET $3
+                    "#,
+                )
+                .bind(since)
+                .bind(limit)
+                .bind(offset)
+                .fetch_all(&self.pool)
+                .await?
+            }
+        } else {
+            // Received: recipient is the p tag on the zap receipt
+            if since == 0 {
+                sqlx::query_as::<_, (String, i64, i64)>(
+                    r#"
+                    SELECT recipient_pubkey AS pubkey,
+                           (SUM(amount_msats) / 1000)::bigint AS total_sats,
+                           COUNT(*)::bigint AS zap_count
+                    FROM zap_metadata
+                    WHERE recipient_pubkey IS NOT NULL AND recipient_pubkey != ''
+                    GROUP BY recipient_pubkey
+                    ORDER BY total_sats DESC
+                    LIMIT $1 OFFSET $2
+                    "#,
+                )
+                .bind(limit)
+                .bind(offset)
+                .fetch_all(&self.pool)
+                .await?
+            } else {
+                sqlx::query_as::<_, (String, i64, i64)>(
+                    r#"
+                    SELECT recipient_pubkey AS pubkey,
+                           (SUM(amount_msats) / 1000)::bigint AS total_sats,
+                           COUNT(*)::bigint AS zap_count
+                    FROM zap_metadata
+                    WHERE recipient_pubkey IS NOT NULL AND recipient_pubkey != ''
+                      AND created_at >= $1
+                    GROUP BY recipient_pubkey
+                    ORDER BY total_sats DESC
+                    LIMIT $2 OFFSET $3
+                    "#,
+                )
+                .bind(since)
+                .bind(limit)
+                .bind(offset)
+                .fetch_all(&self.pool)
+                .await?
+            }
+        };
+
+        Ok(rows
+            .into_iter()
+            .map(|(pubkey, total_sats, zap_count)| super::models::TopZapper {
+                pubkey,
+                total_sats,
+                zap_count,
+            })
+            .collect())
+    }
+
+    /// Top posters: authors ranked by number of kind=1 notes published in the timeframe.
+    pub async fn top_posters(
+        &self,
+        range: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<super::models::TopPoster>, AppError> {
+        let since = range_to_since(range);
+
+        let rows = if since == 0 {
+            sqlx::query_as::<_, (String, i64)>(
                 r#"
-                SELECT sender_pubkey AS pubkey,
-                       (SUM(amount_msats) / 1000)::bigint AS total_sats,
-                       COUNT(*)::bigint AS zap_count
-                FROM zap_metadata
-                WHERE sender_pubkey IS NOT NULL AND sender_pubkey != ''
-                  AND created_at >= $1
-                GROUP BY sender_pubkey
-                ORDER BY total_sats DESC
-                LIMIT $2 OFFSET $3
+                SELECT pubkey, COUNT(*) as note_count
+                FROM events
+                WHERE kind = 1
+                GROUP BY pubkey
+                ORDER BY note_count DESC
+                LIMIT $1 OFFSET $2
                 "#,
             )
-            .bind(since)
             .bind(limit)
             .bind(offset)
             .fetch_all(&self.pool)
             .await?
         } else {
-            // Received: recipient is the p tag on the zap receipt
-            sqlx::query_as::<_, (String, i64, i64)>(
+            sqlx::query_as::<_, (String, i64)>(
                 r#"
-                SELECT recipient_pubkey AS pubkey,
-                       (SUM(amount_msats) / 1000)::bigint AS total_sats,
-                       COUNT(*)::bigint AS zap_count
-                FROM zap_metadata
-                WHERE recipient_pubkey IS NOT NULL AND recipient_pubkey != ''
-                  AND created_at >= $1
-                GROUP BY recipient_pubkey
-                ORDER BY total_sats DESC
+                SELECT pubkey, COUNT(*) as note_count
+                FROM events
+                WHERE kind = 1 AND created_at >= $1
+                GROUP BY pubkey
+                ORDER BY note_count DESC
                 LIMIT $2 OFFSET $3
                 "#,
             )
@@ -1538,10 +1653,119 @@ impl EventRepository {
 
         Ok(rows
             .into_iter()
-            .map(|(pubkey, total_sats, zap_count)| super::models::TopZapper {
+            .map(|(pubkey, note_count)| super::models::TopPoster {
                 pubkey,
-                total_sats,
-                zap_count,
+                note_count,
+            })
+            .collect())
+    }
+
+    /// Most liked authors: authors whose notes received the most reactions (kind=7) in the timeframe.
+    pub async fn most_liked_authors(
+        &self,
+        range: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<super::models::MostLikedAuthor>, AppError> {
+        let since = range_to_since(range);
+
+        let rows = if since == 0 {
+            sqlx::query_as::<_, (String, i64)>(
+                r#"
+                SELECT e.pubkey, COUNT(*)::bigint as like_count
+                FROM events r
+                JOIN event_tags rt ON rt.event_id = r.id AND rt.tag_name = 'e'
+                JOIN events e ON e.id = rt.tag_value AND e.kind = 1
+                WHERE r.kind = 7
+                GROUP BY e.pubkey
+                ORDER BY like_count DESC
+                LIMIT $1 OFFSET $2
+                "#,
+            )
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            sqlx::query_as::<_, (String, i64)>(
+                r#"
+                SELECT e.pubkey, COUNT(*)::bigint as like_count
+                FROM events r
+                JOIN event_tags rt ON rt.event_id = r.id AND rt.tag_name = 'e'
+                JOIN events e ON e.id = rt.tag_value AND e.kind = 1
+                WHERE r.kind = 7 AND r.created_at >= $1
+                GROUP BY e.pubkey
+                ORDER BY like_count DESC
+                LIMIT $2 OFFSET $3
+                "#,
+            )
+            .bind(since)
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&self.pool)
+            .await?
+        };
+
+        Ok(rows
+            .into_iter()
+            .map(|(pubkey, like_count)| super::models::MostLikedAuthor {
+                pubkey,
+                like_count,
+            })
+            .collect())
+    }
+
+    /// Most shared authors: authors whose notes received the most reposts (kind=6) in the timeframe.
+    pub async fn most_shared_authors(
+        &self,
+        range: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<super::models::MostSharedAuthor>, AppError> {
+        let since = range_to_since(range);
+
+        let rows = if since == 0 {
+            sqlx::query_as::<_, (String, i64)>(
+                r#"
+                SELECT e.pubkey, COUNT(*)::bigint as repost_count
+                FROM events r
+                JOIN event_tags rt ON rt.event_id = r.id AND rt.tag_name = 'e'
+                JOIN events e ON e.id = rt.tag_value AND e.kind = 1
+                WHERE r.kind = 6
+                GROUP BY e.pubkey
+                ORDER BY repost_count DESC
+                LIMIT $1 OFFSET $2
+                "#,
+            )
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            sqlx::query_as::<_, (String, i64)>(
+                r#"
+                SELECT e.pubkey, COUNT(*)::bigint as repost_count
+                FROM events r
+                JOIN event_tags rt ON rt.event_id = r.id AND rt.tag_name = 'e'
+                JOIN events e ON e.id = rt.tag_value AND e.kind = 1
+                WHERE r.kind = 6 AND r.created_at >= $1
+                GROUP BY e.pubkey
+                ORDER BY repost_count DESC
+                LIMIT $2 OFFSET $3
+                "#,
+            )
+            .bind(since)
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&self.pool)
+            .await?
+        };
+
+        Ok(rows
+            .into_iter()
+            .map(|(pubkey, repost_count)| super::models::MostSharedAuthor {
+                pubkey,
+                repost_count,
             })
             .collect())
     }
