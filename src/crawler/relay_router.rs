@@ -13,6 +13,7 @@ pub struct RelayPreference {
 }
 
 /// Maps pubkeys to their preferred relay URLs based on NIP-65 relay lists.
+#[derive(Clone)]
 pub struct RelayRouter {
     pool: PgPool,
 }

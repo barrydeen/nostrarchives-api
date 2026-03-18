@@ -14,6 +14,7 @@ mod ws;
 
 use std::collections::HashSet;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use tokio::signal;
 use tokio::sync::broadcast;
 
@@ -295,11 +296,24 @@ async fn main() {
         }
     });
 
+    // Initialize on-demand relay fetcher
+    let relay_router = crawler::relay_router::RelayRouter::new(pool.clone());
+    let fetcher = Arc::new(relay::fetcher::RelayFetcher::new(
+        repo.clone(),
+        relay_router,
+        cfg.relay_urls.clone(),
+        stats_cache.clone(),
+        cfg.ondemand_fetch_timeout_ms,
+        cfg.ondemand_fetch_max_relays,
+        cfg.ondemand_fetch_enabled,
+    ));
+
     // HTTP API
     let state = api::AppState {
         repo,
         cache: stats_cache,
         crawl_queue,
+        fetcher,
     };
 
     // WebSocket relay (NIP-50 search endpoint)
