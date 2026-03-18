@@ -289,34 +289,6 @@ async fn main() {
         }
     });
 
-    // Background: clean up old seen_events entries (30+ days) to prevent unbounded growth.
-    let cleanup_pool = pool.clone();
-    tokio::spawn(async move {
-        // Run daily
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(86400));
-        // Skip the immediate first tick, wait 1 hour before first cleanup
-        tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
-        loop {
-            interval.tick().await;
-            let cutoff = chrono::Utc::now().timestamp() - (30 * 86400);
-            match sqlx::query("DELETE FROM seen_events WHERE created_at < $1")
-                .bind(cutoff)
-                .execute(&cleanup_pool)
-                .await
-            {
-                Ok(result) => {
-                    if result.rows_affected() > 0 {
-                        tracing::info!(
-                            deleted = result.rows_affected(),
-                            "cleaned up old seen_events entries"
-                        );
-                    }
-                }
-                Err(e) => tracing::warn!("seen_events cleanup failed: {e}"),
-            }
-        }
-    });
-
     // HTTP API
     let state = api::AppState {
         repo,
