@@ -15,7 +15,6 @@ use crate::db::models::{NostrEvent, StoredEvent};
 use crate::db::repository::EventRepository;
 use crate::error::AppError;
 
-const FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 const NEGATIVE_CACHE_TTL: u64 = 300; // 5 minutes
 
 /// On-demand relay fetcher service for pulling specific data from relays
@@ -301,7 +300,8 @@ impl RelayFetcher {
         for event in events {
             if event.pubkey == pubkey {
                 match self.repo.insert_event(&event, "on-demand").await {
-                    Ok(_) => stored_count += 1,
+                    Ok(true) => stored_count += 1,
+                    Ok(false) => {} // duplicate, already stored
                     Err(e) => {
                         tracing::warn!(
                             pubkey = %event.pubkey,
@@ -363,7 +363,8 @@ impl RelayFetcher {
         for event in events {
             if event.kind == 0 && pubkeys.contains(&event.pubkey) {
                 match self.repo.insert_event(&event, "on-demand").await {
-                    Ok(_) => stored_count += 1,
+                    Ok(true) => stored_count += 1,
+                    Ok(false) => {} // duplicate
                     Err(e) => {
                         tracing::warn!(
                             pubkey = %event.pubkey,
@@ -431,19 +432,20 @@ impl RelayFetcher {
     }
 
     /// Fetch events from multiple relays with the given filter.
+    /// Stops early once results are found (no need to query all relays).
     async fn fetch_from_relays(
         &self,
         relays: &[String],
         filter: Value,
     ) -> Result<Vec<NostrEvent>, AppError> {
         let timeout_duration = Duration::from_millis(self.timeout_ms);
-        let mut all_events = Vec::new();
 
         for relay_url in relays {
             match self.fetch_from_relay(relay_url, &filter, timeout_duration).await {
-                Ok(events) => {
-                    all_events.extend(events);
+                Ok(events) if !events.is_empty() => {
+                    return Ok(events);
                 }
+                Ok(_) => {} // empty, try next relay
                 Err(e) => {
                     tracing::warn!(
                         relay = relay_url,
@@ -454,7 +456,7 @@ impl RelayFetcher {
             }
         }
 
-        Ok(all_events)
+        Ok(vec![])
     }
 
     /// Connect to a single relay and fetch events matching the filter.

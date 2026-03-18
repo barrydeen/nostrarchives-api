@@ -138,25 +138,6 @@ pub async fn get_event_thread(
     let limit = q.limit.unwrap_or(50).min(500);
     match state.repo.get_thread(&id, limit).await? {
         Some(thread) => {
-            // Check if we have missing parent/root events and try to fetch them
-            let mut missing_ids = Vec::new();
-            if let Some(parent_id) = &thread.parent_id {
-                if state.repo.get_event_by_id(parent_id).await?.is_none() {
-                    missing_ids.push(parent_id.clone());
-                }
-            }
-            if let Some(root_id) = &thread.root_id {
-                if root_id != thread.parent_id.as_ref().unwrap_or(&String::new()) &&
-                   state.repo.get_event_by_id(root_id).await?.is_none() {
-                    missing_ids.push(root_id.clone());
-                }
-            }
-
-            // Fetch missing events
-            for missing_id in missing_ids {
-                let _ = state.fetcher.fetch_event_by_id(&missing_id, &[]).await;
-            }
-
             Ok(Json(serde_json::to_value(thread).unwrap()))
         },
         None => {
@@ -1024,24 +1005,8 @@ async fn resolve_entity(input: &str, state: &AppState) -> Result<Option<Value>, 
             };
             return Ok(Some(resolved));
         }
-        
-        // If not found in DB, try to fetch assuming it could be either an event or pubkey
-        // Since it's ambiguous, try event first, then profile
-        if state.repo.get_event_by_id(input).await?.is_none() {
-            if let Ok(Some(_)) = state.fetcher.fetch_event_by_id(input, &[]).await {
-                tracing::info!(id = %input, "fetched hex event from relays");
-                return Ok(Some(json!({ "type": "event", "id": input })));
-            }
-        }
-        
-        // Try as profile if event fetch failed or didn't exist
-        let profile_rows = state.repo.latest_profile_metadata(&[input.to_string()]).await?;
-        if profile_rows.is_empty() {
-            if let Ok(Some(_)) = state.fetcher.fetch_profile_metadata(input, &[]).await {
-                tracing::info!(pubkey = %input, "fetched hex profile from relays");
-                return Ok(Some(json!({ "type": "profile", "pubkey": input })));
-            }
-        }
+        // Raw hex is ambiguous (could be pubkey or event) and has no relay hints,
+        // so we don't trigger on-demand fetching here to avoid abuse.
     }
 
     Ok(None)
