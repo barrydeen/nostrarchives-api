@@ -15,9 +15,16 @@ use crate::db::models::NostrEvent;
 use crate::db::repository::EventRepository;
 
 use super::negentropy::NegentropySyncer;
-use super::queue::CrawlQueue;
+use super::queue::{CrawlQueue, CrawlTarget};
 use super::relay_caps;
 use super::relay_router::RelayRouter;
+
+/// Per-author crawl statistics tracked during a targeted crawl cycle.
+struct AuthorCrawlStats {
+    new_events: i64,
+    oldest_ts: Option<i64>,
+    newest_ts: Option<i64>,
+}
 
 /// Configuration for the hybrid crawler.
 #[derive(Debug, Clone)]
@@ -366,6 +373,9 @@ impl HybridCrawler {
     }
 
     /// Run one cycle of relay-list-aware targeted crawling.
+    /// Two phases per author:
+    ///   A) Recent: fetch new notes since `newest_seen_at`
+    ///   B) Backfill: walk backwards from `crawl_cursor` to fill history
     async fn targeted_crawl_cycle(&self) {
         // Take a batch from the crawl queue
         let batch = match self.queue.take_batch(self.config.legacy_batch_size).await {
@@ -379,6 +389,10 @@ impl HybridCrawler {
         if batch.is_empty() {
             return;
         }
+
+        // Build a map of pubkey -> crawl target for cursor lookups
+        let target_map: std::collections::HashMap<String, &CrawlTarget> =
+            batch.iter().map(|t| (t.pubkey.clone(), t)).collect();
 
         let pubkeys: Vec<String> = batch.iter().map(|t| t.pubkey.clone()).collect();
 
@@ -396,17 +410,15 @@ impl HybridCrawler {
             }
         };
 
+        // Track per-author stats across all relays
+        let mut author_stats: std::collections::HashMap<String, AuthorCrawlStats> =
+            std::collections::HashMap::new();
+
         // Track which authors got routed to a relay
         let mut routed_pubkeys: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         // Crawl each relay group
         for (relay_url, group_pubkeys) in &relay_groups {
-            tracing::info!(
-                relay = %relay_url,
-                authors = group_pubkeys.len(),
-                "targeted crawl: fetching from relay"
-            );
-
             for pk in group_pubkeys {
                 routed_pubkeys.insert(pk.clone());
             }
@@ -420,39 +432,32 @@ impl HybridCrawler {
                 continue;
             }
 
+            // ── Phase A: Recent notes (since newest_seen_at) ──
+            // For authors we've seen before, only fetch what's new.
+            // For new authors, this fetches the most recent batch.
+            let since_ts = group_pubkeys.iter().filter_map(|pk| {
+                target_map.get(pk).and_then(|t| t.newest_seen_at)
+            }).min(); // Use the oldest newest_seen_at so we don't miss any
+
+            tracing::info!(
+                relay = %relay_url,
+                authors = group_pubkeys.len(),
+                since = ?since_ts,
+                "targeted crawl: phase A (recent)"
+            );
+
             match self
                 .fetch_authors_from_relay(
                     relay_url,
                     group_pubkeys,
                     self.config.legacy_events_per_author,
+                    since_ts,
+                    None,
                 )
                 .await
             {
                 Ok(events) => {
-                    let mut new_count = 0u64;
-                    let mut new_note_ids = Vec::new();
-                    for event in &events {
-                        match self.repo.insert_event(event, relay_url).await {
-                            Ok(true) => {
-                                new_count += 1;
-                                self.cache
-                                    .on_event_ingested(&event.pubkey, event.kind)
-                                    .await;
-                                // Track note IDs for engagement backfill
-                                if event.kind == 1 {
-                                    new_note_ids.push(event.id.clone());
-                                }
-                            }
-                            Ok(false) => {} // duplicate
-                            Err(e) => {
-                                tracing::warn!(
-                                    event_id = %event.id,
-                                    error = %e,
-                                    "targeted crawl: insert failed"
-                                );
-                            }
-                        }
-                    }
+                    let (new_count, new_note_ids) = self.ingest_events(&events, relay_url, &mut author_stats).await;
                     if new_count > 0 {
                         let total = self
                             .total_events
@@ -463,10 +468,10 @@ impl HybridCrawler {
                             fetched = events.len(),
                             new = new_count,
                             total = total,
-                            "targeted crawl: relay batch complete"
+                            "targeted crawl: recent batch complete"
                         );
                     }
-                    // Phase B: backfill engagement for newly discovered notes
+                    // Engagement backfill for new notes
                     if !new_note_ids.is_empty() {
                         match self.fetch_engagement_for_notes(relay_url, &new_note_ids).await {
                             Ok(n) if n > 0 => {
@@ -492,14 +497,102 @@ impl HybridCrawler {
                     tracing::warn!(
                         relay = %relay_url,
                         error = %e,
-                        "targeted crawl: fetch failed"
+                        "targeted crawl: recent fetch failed"
                     );
                 }
             }
 
-            // Delay between relays
             if self.config.legacy_request_delay_ms > 0 {
                 sleep(Duration::from_millis(self.config.legacy_request_delay_ms)).await;
+            }
+
+            // ── Phase B: Historical backfill (until crawl_cursor) ──
+            // Walk backwards from the oldest event we've seen per author.
+            // Only for Tier 1-2 authors to limit relay load.
+            let backfill_pubkeys: Vec<String> = group_pubkeys
+                .iter()
+                .filter(|pk| {
+                    target_map.get(*pk).map_or(false, |t| {
+                        t.priority_tier <= 2 && t.crawl_cursor.is_some()
+                    })
+                })
+                .cloned()
+                .collect();
+
+            if !backfill_pubkeys.is_empty() {
+                // Use the max crawl_cursor as `until` (oldest event we have - fetch older)
+                let until_ts = backfill_pubkeys.iter().filter_map(|pk| {
+                    target_map.get(pk).and_then(|t| t.crawl_cursor)
+                }).max();
+
+                if let Some(until) = until_ts {
+                    tracing::info!(
+                        relay = %relay_url,
+                        authors = backfill_pubkeys.len(),
+                        until = until,
+                        "targeted crawl: phase B (backfill)"
+                    );
+
+                    match self
+                        .fetch_authors_from_relay(
+                            relay_url,
+                            &backfill_pubkeys,
+                            self.config.legacy_events_per_author,
+                            None,
+                            Some(until),
+                        )
+                        .await
+                    {
+                        Ok(events) => {
+                            let (new_count, new_note_ids) = self.ingest_events(&events, relay_url, &mut author_stats).await;
+                            if new_count > 0 {
+                                let total = self
+                                    .total_events
+                                    .fetch_add(new_count, Ordering::Relaxed)
+                                    + new_count;
+                                tracing::info!(
+                                    relay = %relay_url,
+                                    fetched = events.len(),
+                                    new = new_count,
+                                    total = total,
+                                    "targeted crawl: backfill batch complete"
+                                );
+                            }
+                            // Engagement backfill for historical notes too
+                            if !new_note_ids.is_empty() {
+                                match self.fetch_engagement_for_notes(relay_url, &new_note_ids).await {
+                                    Ok(n) if n > 0 => {
+                                        tracing::info!(
+                                            relay = %relay_url,
+                                            notes = new_note_ids.len(),
+                                            engagement_events = n,
+                                            "targeted crawl: historical engagement backfill complete"
+                                        );
+                                    }
+                                    Err(e) => {
+                                        tracing::debug!(
+                                            relay = %relay_url,
+                                            error = %e,
+                                            "targeted crawl: historical engagement backfill failed"
+                                        );
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                relay = %relay_url,
+                                error = %e,
+                                "targeted crawl: backfill fetch failed"
+                            );
+                        }
+                    }
+
+                    if self.config.legacy_request_delay_ms > 0 {
+                        sleep(Duration::from_millis(self.config.legacy_request_delay_ms)).await;
+                    }
+                }
             }
         }
 
@@ -526,34 +619,23 @@ impl HybridCrawler {
                     continue;
                 }
 
+                // Recent pass for unrouted
+                let since_ts = unrouted.iter().filter_map(|pk| {
+                    target_map.get(pk).and_then(|t| t.newest_seen_at)
+                }).min();
+
                 match self
                     .fetch_authors_from_relay(
                         relay_url,
                         &unrouted,
                         self.config.legacy_events_per_author,
+                        since_ts,
+                        None,
                     )
                     .await
                 {
                     Ok(events) => {
-                        let mut new_count = 0u64;
-                        for event in &events {
-                            match self.repo.insert_event(event, relay_url).await {
-                                Ok(true) => {
-                                    new_count += 1;
-                                    self.cache
-                                        .on_event_ingested(&event.pubkey, event.kind)
-                                        .await;
-                                }
-                                Ok(false) => {}
-                                Err(e) => {
-                                    tracing::warn!(
-                                        event_id = %event.id,
-                                        error = %e,
-                                        "targeted crawl: fallback insert failed"
-                                    );
-                                }
-                            }
-                        }
+                        let (new_count, _) = self.ingest_events(&events, relay_url, &mut author_stats).await;
                         if new_count > 0 {
                             let total = self
                                 .total_events
@@ -586,9 +668,13 @@ impl HybridCrawler {
             }
         }
 
-        // Update crawl state for all authors in the batch
+        // Update crawl state for all authors in the batch with actual per-author stats
         for target in &batch {
-            if let Err(e) = self.queue.mark_crawled(&target.pubkey, 0, None, None).await {
+            let stats = author_stats.get(&target.pubkey);
+            let notes_found = stats.map_or(0, |s| s.new_events);
+            let oldest = stats.and_then(|s| s.oldest_ts);
+            let newest = stats.and_then(|s| s.newest_ts);
+            if let Err(e) = self.queue.mark_crawled(&target.pubkey, notes_found, oldest, newest).await {
                 tracing::warn!(
                     pubkey = %target.pubkey,
                     error = %e,
@@ -596,6 +682,57 @@ impl HybridCrawler {
                 );
             }
         }
+    }
+
+    /// Ingest events into the database and track per-author stats.
+    /// Returns (new_insert_count, new_note_ids_for_engagement).
+    async fn ingest_events(
+        &self,
+        events: &[NostrEvent],
+        relay_url: &str,
+        author_stats: &mut std::collections::HashMap<String, AuthorCrawlStats>,
+    ) -> (u64, Vec<String>) {
+        let mut new_count = 0u64;
+        let mut new_note_ids = Vec::new();
+
+        for event in events {
+            match self.repo.insert_event(event, relay_url).await {
+                Ok(true) => {
+                    new_count += 1;
+                    self.cache
+                        .on_event_ingested(&event.pubkey, event.kind)
+                        .await;
+                    if event.kind == 1 {
+                        new_note_ids.push(event.id.clone());
+                    }
+                    // Update per-author stats
+                    let entry = author_stats.entry(event.pubkey.clone()).or_insert(AuthorCrawlStats {
+                        new_events: 0,
+                        oldest_ts: None,
+                        newest_ts: None,
+                    });
+                    entry.new_events += 1;
+                    entry.oldest_ts = Some(match entry.oldest_ts {
+                        Some(old) if old < event.created_at => old,
+                        _ => event.created_at,
+                    });
+                    entry.newest_ts = Some(match entry.newest_ts {
+                        Some(new) if new > event.created_at => new,
+                        _ => event.created_at,
+                    });
+                }
+                Ok(false) => {} // duplicate
+                Err(e) => {
+                    tracing::warn!(
+                        event_id = %event.id,
+                        error = %e,
+                        "targeted crawl: insert failed"
+                    );
+                }
+            }
+        }
+
+        (new_count, new_note_ids)
     }
 
     /// Phase B: Fetch engagement (reactions, reposts, zaps) for recently crawled notes.
@@ -699,12 +836,14 @@ impl HybridCrawler {
     }
 
     /// Fetch kind-1 notes for specific authors from a specific relay.
-    /// Sends a single REQ with all authors batched together.
+    /// Supports optional `since`/`until` for cursor-based pagination.
     async fn fetch_authors_from_relay(
         &self,
         relay_url: &str,
         pubkeys: &[String],
         events_per_author: i64,
+        since: Option<i64>,
+        until: Option<i64>,
     ) -> Result<Vec<NostrEvent>, String> {
         if pubkeys.is_empty() {
             return Ok(vec![]);
@@ -722,11 +861,17 @@ impl HybridCrawler {
 
         // Batch authors into a single filter (relays support author arrays)
         let limit = (events_per_author * pubkeys.len() as i64).min(5000);
-        let filter = serde_json::json!({
+        let mut filter = serde_json::json!({
             "kinds": [1],
             "authors": pubkeys,
             "limit": limit,
         });
+        if let Some(s) = since {
+            filter["since"] = serde_json::json!(s);
+        }
+        if let Some(u) = until {
+            filter["until"] = serde_json::json!(u);
+        }
 
         let sub_id = format!("hc-{}", Uuid::new_v4().simple());
         let req = serde_json::json!(["REQ", &sub_id, filter]);
