@@ -1675,7 +1675,7 @@ impl EventRepository {
                 SELECT e.pubkey, COUNT(*)::bigint as like_count
                 FROM events r
                 JOIN event_tags rt ON rt.event_id = r.id AND rt.tag_name = 'e'
-                JOIN events e ON e.event_id = rt.tag_value AND e.kind = 1
+                JOIN events e ON e.id = rt.tag_value AND e.kind = 1
                 WHERE r.kind = 7
                 GROUP BY e.pubkey
                 ORDER BY like_count DESC
@@ -1692,7 +1692,7 @@ impl EventRepository {
                 SELECT e.pubkey, COUNT(*)::bigint as like_count
                 FROM events r
                 JOIN event_tags rt ON rt.event_id = r.id AND rt.tag_name = 'e'
-                JOIN events e ON e.event_id = rt.tag_value AND e.kind = 1
+                JOIN events e ON e.id = rt.tag_value AND e.kind = 1
                 WHERE r.kind = 7 AND r.created_at >= $1
                 GROUP BY e.pubkey
                 ORDER BY like_count DESC
@@ -1730,7 +1730,7 @@ impl EventRepository {
                 SELECT e.pubkey, COUNT(*)::bigint as repost_count
                 FROM events r
                 JOIN event_tags rt ON rt.event_id = r.id AND rt.tag_name = 'e'
-                JOIN events e ON e.event_id = rt.tag_value AND e.kind = 1
+                JOIN events e ON e.id = rt.tag_value AND e.kind = 1
                 WHERE r.kind = 6
                 GROUP BY e.pubkey
                 ORDER BY repost_count DESC
@@ -1747,7 +1747,7 @@ impl EventRepository {
                 SELECT e.pubkey, COUNT(*)::bigint as repost_count
                 FROM events r
                 JOIN event_tags rt ON rt.event_id = r.id AND rt.tag_name = 'e'
-                JOIN events e ON e.event_id = rt.tag_value AND e.kind = 1
+                JOIN events e ON e.id = rt.tag_value AND e.kind = 1
                 WHERE r.kind = 6 AND r.created_at >= $1
                 GROUP BY e.pubkey
                 ORDER BY repost_count DESC
