@@ -439,7 +439,7 @@ pub async fn get_trending_users(
     Ok(Json(response))
 }
 
-/// Top zappers by sats sent or received in last 24h.
+/// Top zappers by sats sent or received in the specified timeframe.
 pub async fn get_top_zappers(
     State(state): State<AppState>,
     Query(q): Query<TopZappersQuery>,
@@ -450,24 +450,142 @@ pub async fn get_top_zappers(
             "direction must be 'sent' or 'received'".into(),
         ));
     }
+    let range = q.range.as_deref().unwrap_or("7d");
     let limit = clamp_listing_limit(q.limit);
     let offset = clamp_offset(q.offset);
 
-    let cache_key = format!("home:zappers:{direction}:{limit}:{offset}");
+    let cache_key = format!("home:zappers:{direction}:{range}:{limit}:{offset}");
     if let Some(cached) = state.cache.get_json(&cache_key).await {
         if let Ok(val) = serde_json::from_str::<Value>(&cached) {
             return Ok(Json(val));
         }
     }
 
-    let zappers = state.repo.top_zappers(direction, limit, offset).await?;
+    let zappers = state.repo.top_zappers(direction, range, limit, offset).await?;
     let response = json!({
         "direction": direction,
+        "range": range,
         "zappers": zappers,
     });
 
     if let Ok(json_str) = serde_json::to_string(&response) {
-        state.cache.set_json(&cache_key, &json_str, 300).await;
+        // Calculate TTL based on range
+        let ttl = match range {
+            "today" => 300,    // 5 min
+            "7d" => 1800,      // 30 min
+            "30d" => 3600,     // 1 hour
+            "all" => 86400,    // 1 day
+            _ => 1800,         // default to 30 min
+        };
+        state.cache.set_json(&cache_key, &json_str, ttl).await;
+    }
+
+    Ok(Json(response))
+}
+
+/// Top posters: authors ranked by number of kind=1 notes published in the timeframe.
+pub async fn get_top_posters(
+    State(state): State<AppState>,
+    Query(q): Query<AnalyticsLeaderboardQuery>,
+) -> Result<Json<Value>, AppError> {
+    let range = q.range.as_deref().unwrap_or("7d");
+    let limit = clamp_listing_limit(q.limit);
+    let offset = clamp_offset(q.offset);
+
+    let cache_key = format!("analytics:top_posters:{range}:{limit}:{offset}");
+    if let Some(cached) = state.cache.get_json(&cache_key).await {
+        if let Ok(val) = serde_json::from_str::<Value>(&cached) {
+            return Ok(Json(val));
+        }
+    }
+
+    let authors = state.repo.top_posters(range, limit, offset).await?;
+    let response = json!({
+        "range": range,
+        "authors": authors,
+    });
+
+    if let Ok(json_str) = serde_json::to_string(&response) {
+        let ttl = match range {
+            "today" => 300,    // 5 min
+            "7d" => 1800,      // 30 min
+            "30d" => 3600,     // 1 hour
+            "all" => 86400,    // 1 day
+            _ => 1800,         // default to 30 min
+        };
+        state.cache.set_json(&cache_key, &json_str, ttl).await;
+    }
+
+    Ok(Json(response))
+}
+
+/// Most liked authors: authors whose notes received the most reactions (kind=7) in the timeframe.
+pub async fn get_most_liked_authors(
+    State(state): State<AppState>,
+    Query(q): Query<AnalyticsLeaderboardQuery>,
+) -> Result<Json<Value>, AppError> {
+    let range = q.range.as_deref().unwrap_or("7d");
+    let limit = clamp_listing_limit(q.limit);
+    let offset = clamp_offset(q.offset);
+
+    let cache_key = format!("analytics:most_liked:{range}:{limit}:{offset}");
+    if let Some(cached) = state.cache.get_json(&cache_key).await {
+        if let Ok(val) = serde_json::from_str::<Value>(&cached) {
+            return Ok(Json(val));
+        }
+    }
+
+    let authors = state.repo.most_liked_authors(range, limit, offset).await?;
+    let response = json!({
+        "range": range,
+        "authors": authors,
+    });
+
+    if let Ok(json_str) = serde_json::to_string(&response) {
+        let ttl = match range {
+            "today" => 300,    // 5 min
+            "7d" => 1800,      // 30 min
+            "30d" => 3600,     // 1 hour
+            "all" => 86400,    // 1 day
+            _ => 1800,         // default to 30 min
+        };
+        state.cache.set_json(&cache_key, &json_str, ttl).await;
+    }
+
+    Ok(Json(response))
+}
+
+/// Most shared authors: authors whose notes received the most reposts (kind=6) in the timeframe.
+pub async fn get_most_shared_authors(
+    State(state): State<AppState>,
+    Query(q): Query<AnalyticsLeaderboardQuery>,
+) -> Result<Json<Value>, AppError> {
+    let range = q.range.as_deref().unwrap_or("7d");
+    let limit = clamp_listing_limit(q.limit);
+    let offset = clamp_offset(q.offset);
+
+    let cache_key = format!("analytics:most_shared:{range}:{limit}:{offset}");
+    if let Some(cached) = state.cache.get_json(&cache_key).await {
+        if let Ok(val) = serde_json::from_str::<Value>(&cached) {
+            return Ok(Json(val));
+        }
+    }
+
+    let authors = state.repo.most_shared_authors(range, limit, offset).await?;
+    let response = json!({
+        "range": range,
+        "authors": authors,
+    });
+
+    if let Ok(json_str) = serde_json::to_string(&response) {
+        let ttl = match range {
+            "today" => 300,    // 5 min
+            "7d" => 1800,      // 30 min
+            "30d" => 3600,     // 1 hour
+            "all" => 86400,    // 1 day
+            _ => 1800,         // default to 30 min
+        };
+        state.cache.set_json(&cache_key, &json_str, ttl).await;
     }
 
     Ok(Json(response))
@@ -540,6 +658,14 @@ pub struct ProfileZapsQuery {
 #[derive(Debug, serde::Deserialize)]
 pub struct TopZappersQuery {
     pub direction: Option<String>,
+    pub range: Option<String>,
+    pub limit: Option<i64>,
+    pub offset: Option<i64>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct AnalyticsLeaderboardQuery {
+    pub range: Option<String>,
     pub limit: Option<i64>,
     pub offset: Option<i64>,
 }

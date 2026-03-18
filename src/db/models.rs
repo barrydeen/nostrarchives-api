@@ -219,3 +219,24 @@ pub struct ZapAggregate {
     pub total_sats: i64,
     pub zap_count: i64,
 }
+
+/// Analytics leaderboard: authors ranked by note count.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TopPoster {
+    pub pubkey: String,
+    pub note_count: i64,
+}
+
+/// Analytics leaderboard: authors ranked by reactions received.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MostLikedAuthor {
+    pub pubkey: String,
+    pub like_count: i64,
+}
+
+/// Analytics leaderboard: authors ranked by reposts received.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MostSharedAuthor {
+    pub pubkey: String,
+    pub repost_count: i64,
+}
