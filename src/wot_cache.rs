@@ -145,6 +145,16 @@ impl WotCache {
         Ok(())
     }
 
+    /// Check a batch of pubkeys against the in-memory cache in one lock acquisition.
+    /// Does not trigger a refresh — for use in hot post-fetch filtering paths.
+    pub async fn retain_passing(&self, pubkeys: &[String]) -> std::collections::HashSet<String> {
+        if self.threshold == 0 {
+            return pubkeys.iter().cloned().collect();
+        }
+        let cache = self.passing_pubkeys.read().await;
+        pubkeys.iter().filter(|pk| cache.contains(*pk)).cloned().collect()
+    }
+
     /// Get cache statistics for monitoring.
     pub async fn stats(&self) -> WotCacheStats {
         let passing_count = self.passing_pubkeys.read().await.len();

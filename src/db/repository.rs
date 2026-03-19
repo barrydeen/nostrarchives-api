@@ -1351,7 +1351,6 @@ impl EventRepository {
                 e.zap_amount_msats,
                 {order_col}::bigint AS metric_count
             FROM events e
-            JOIN wot_scores w ON w.pubkey = e.pubkey AND w.quality_followers >= 20
             WHERE e.kind = 1
               AND ($1::bigint IS NULL OR e.created_at >= $1)
               AND {order_col} > 0
@@ -1362,19 +1361,19 @@ impl EventRepository {
 
         let rows = sqlx::query(&sql)
             .bind(since)
-            .bind(limit)
+            .bind(limit * 4)
             .bind(offset)
             .fetch_all(&self.pool)
             .await?;
 
         let is_zap = ref_type == "zap";
 
-        let mut pubkeys = Vec::new();
-        let events: Vec<RankedEvent> = rows
+        let mut all_pubkeys = Vec::new();
+        let all_events: Vec<RankedEvent> = rows
             .into_iter()
             .map(|row| -> Result<RankedEvent, sqlx::Error> {
                 let pubkey: String = row.try_get("pubkey")?;
-                pubkeys.push(pubkey.clone());
+                all_pubkeys.push(pubkey.clone());
                 let event = StoredEvent {
                     id: row.try_get("id")?,
                     pubkey,
@@ -1401,6 +1400,15 @@ impl EventRepository {
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
+
+        let passing = self.wot_cache.retain_passing(&all_pubkeys).await;
+        let mut pubkeys = Vec::new();
+        let events: Vec<RankedEvent> = all_events
+            .into_iter()
+            .filter(|e| passing.contains(&e.event.pubkey))
+            .take(limit as usize)
+            .inspect(|e| pubkeys.push(e.event.pubkey.clone()))
+            .collect();
 
         let unique_pubkeys: Vec<String> = {
             let mut seen = HashSet::new();
@@ -1440,7 +1448,6 @@ impl EventRepository {
                     + e.reaction_count * 100
                 )::bigint AS score
             FROM events e
-            JOIN wot_scores w ON w.pubkey = e.pubkey AND w.quality_followers >= 20
             WHERE e.kind = 1
               AND e.created_at >= $1
               AND (e.reaction_count + e.repost_count + e.reply_count + e.zap_count) > 0
@@ -1449,12 +1456,12 @@ impl EventRepository {
             "#,
         )
         .bind(since)
-        .bind(limit)
+        .bind(limit * 4)
         .bind(offset)
         .fetch_all(&self.pool)
         .await?;
 
-        let notes = rows
+        let all_notes = rows
             .into_iter()
             .map(|row| -> Result<TrendingNote, sqlx::Error> {
                 let event = StoredEvent {
@@ -1478,7 +1485,15 @@ impl EventRepository {
                     reactions: row.try_get("reaction_count")?,
                 })
             })
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Result<Vec<TrendingNote>, _>>()?;
+
+        let all_pubkeys: Vec<String> = all_notes.iter().map(|n| n.event.pubkey.clone()).collect();
+        let passing = self.wot_cache.retain_passing(&all_pubkeys).await;
+        let notes: Vec<TrendingNote> = all_notes
+            .into_iter()
+            .filter(|n| passing.contains(&n.event.pubkey))
+            .take(limit as usize)
+            .collect();
 
         Ok(notes)
     }
