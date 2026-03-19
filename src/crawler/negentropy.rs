@@ -564,7 +564,7 @@ impl NegentropySyncer {
     ) -> Result<SyncStats, AppError> {
         let now = chrono::Utc::now().timestamp();
         let initial = window_secs.unwrap_or(Self::DEFAULT_WINDOW_SECS);
-        let (stats, _final_window) = self
+        let (stats, _final_window, _final_cursor) = self
             .run_sync_windowed_from(relay_url, &[1], now, initial, max_windows)
             .await?;
         Ok(stats)
@@ -591,7 +591,7 @@ impl NegentropySyncer {
         start_cursor: i64,
         initial_window_secs: i64,
         max_windows: usize,
-    ) -> Result<(SyncStats, i64), AppError> {
+    ) -> Result<(SyncStats, i64, i64), AppError> {
         let start = Instant::now();
         let mut window = initial_window_secs.max(Self::DEFAULT_WINDOW_SECS);
         let min_window: i64 = 3600;
@@ -702,7 +702,7 @@ impl NegentropySyncer {
             events_fetched: total_fetched,
             events_inserted: total_inserted,
             duration_ms,
-        }, window))
+        }, window, cursor))
     }
 
     // -----------------------------------------------------------------------
@@ -806,25 +806,12 @@ impl NegentropySyncer {
                 )
                 .await
             {
-                Ok((stats, final_window)) => {
+                Ok((stats, final_window, final_cursor)) => {
                     total_discovered += stats.events_discovered;
                     total_fetched += stats.events_fetched;
                     total_inserted += stats.events_inserted;
 
-                    // Calculate where the cursor actually ended up.
-                    // We can't know exactly from SyncStats, but we can estimate
-                    // conservatively from windows done × average window size.
-                    // Actually, run_sync_windowed_from tracks cursor internally,
-                    // so we reconstruct from the final state.
-                    // For simplicity, re-derive: each window moves cursor back
-                    // by its window size. Since windows vary (exponential), we
-                    // just compute the total time covered.
-                    let time_covered = self.estimate_time_covered(
-                        resume_window,
-                        max_windows_per_kind,
-                        stats.events_discovered > 0,
-                    );
-                    let new_cursor = (backfill_cursor - time_covered).max(0);
+                    let new_cursor = final_cursor.max(0);
 
                     // Only mark fully backfilled when we've reached pre-Nostr era
                     let fully_done = new_cursor <= Self::NOSTR_EPOCH;
@@ -868,30 +855,6 @@ impl NegentropySyncer {
             events_inserted: total_inserted,
             duration_ms,
         })
-    }
-
-    /// Estimate total time covered by a windowed sync pass with exponential growth.
-    /// This mirrors the logic in `run_sync_windowed_from`: if events were found at
-    /// any point the window resets, otherwise it doubles each step.
-    fn estimate_time_covered(
-        &self,
-        initial_window: i64,
-        max_windows: usize,
-        found_any_events: bool,
-    ) -> i64 {
-        if found_any_events {
-            // Conservative: assume events found early, rest at base window
-            Self::DEFAULT_WINDOW_SECS * max_windows as i64
-        } else {
-            // All empty: exponential growth pattern
-            let mut total = 0i64;
-            let mut w = initial_window;
-            for _ in 0..max_windows {
-                total += w;
-                w = (w * 2).min(Self::MAX_WINDOW_SECS);
-            }
-            total
-        }
     }
 
     // -----------------------------------------------------------------------
