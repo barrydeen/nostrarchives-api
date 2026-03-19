@@ -1351,6 +1351,7 @@ impl EventRepository {
                 e.zap_amount_msats,
                 {order_col}::bigint AS metric_count
             FROM events e
+            JOIN wot_scores w ON w.pubkey = e.pubkey AND w.quality_followers >= 20
             WHERE e.kind = 1
               AND ($1::bigint IS NULL OR e.created_at >= $1)
               AND {order_col} > 0
@@ -1439,6 +1440,7 @@ impl EventRepository {
                     + e.reaction_count * 100
                 )::bigint AS score
             FROM events e
+            JOIN wot_scores w ON w.pubkey = e.pubkey AND w.quality_followers >= 20
             WHERE e.kind = 1
               AND e.created_at >= $1
               AND (e.reaction_count + e.repost_count + e.reply_count + e.zap_count) > 0
