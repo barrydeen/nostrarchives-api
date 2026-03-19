@@ -11,6 +11,7 @@ use tower_http::cors::CorsLayer;
 use crate::cache::StatsCache;
 use crate::crawler::queue::CrawlQueue;
 use crate::db::repository::EventRepository;
+use crate::profile_search_cache::ProfileSearchCache;
 use crate::ratelimit::{rate_limit_middleware, RateLimiter};
 use crate::relay::fetcher::RelayFetcher;
 
@@ -21,6 +22,7 @@ pub struct AppState {
     pub cache: StatsCache,
     pub crawl_queue: Option<CrawlQueue>,
     pub fetcher: Arc<RelayFetcher>,
+    pub profile_search_cache: ProfileSearchCache,
 }
 
 async fn cache_control_middleware(

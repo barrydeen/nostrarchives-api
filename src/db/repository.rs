@@ -1775,6 +1775,7 @@ impl EventRepository {
     /// - Follower influence: ln(followers + 1) * 100
     /// - Engagement influence: ln(engagement + 1) * 50
     /// - Recency bonus: +200 if active in last 7d, +100 if last 30d
+    #[allow(dead_code)]
     pub async fn search_profiles(
         &self,
         query: &str,
@@ -1845,6 +1846,7 @@ impl EventRepository {
 
     /// Lightweight profile suggestion for autocomplete.
     /// Prioritizes prefix matches, weighted by follower count + engagement.
+    #[allow(dead_code)]
     pub async fn suggest_profiles(
         &self,
         query: &str,
