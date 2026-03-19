@@ -31,6 +31,7 @@ pub async fn get_stats(State(state): State<AppState>) -> Result<Json<Value>, App
 pub async fn get_follower_cache_stats(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
     let wot_stats = state.repo.wot_cache.stats().await;
     let follower_stats = state.repo.follower_cache.stats().await;
+    let profile_search_stats = state.profile_search_cache.stats().await;
     Ok(Json(json!({
         "wot": {
             "passing_count": wot_stats.passing_count,
@@ -43,6 +44,11 @@ pub async fn get_follower_cache_stats(State(state): State<AppState>) -> Result<J
             "threshold": follower_stats.threshold,
             "last_refresh_ago_secs": follower_stats.last_refresh_ago.as_secs(),
             "refresh_interval_secs": follower_stats.refresh_interval.as_secs(),
+        },
+        "profile_search": {
+            "profile_count": profile_search_stats.profile_count,
+            "last_refresh_ago_secs": profile_search_stats.last_refresh_ago.as_secs(),
+            "refresh_interval_secs": profile_search_stats.refresh_interval.as_secs(),
         }
     })))
 }
@@ -810,7 +816,12 @@ pub async fn search(
     let include_notes = q.search_type == "all" || q.search_type == "notes";
 
     let profiles = if include_profiles {
-        Some(state.repo.search_profiles(&query, limit, offset).await?)
+        Some(
+            state
+                .profile_search_cache
+                .search_profiles(&query, limit, offset)
+                .await,
+        )
     } else {
         None
     };
@@ -872,24 +883,11 @@ pub async fn search_suggest(
         }
     }
 
-    // Check Redis cache
-    if let Some(cached) = state.cache.get_search_suggest(&query).await {
-        if let Ok(suggestions) = serde_json::from_str::<Vec<ProfileSearchResult>>(&cached) {
-            return Ok(Json(SuggestResponse {
-                query,
-                resolved: None,
-                suggestions,
-            }));
-        }
-    }
-
-    // Query DB
-    let suggestions = state.repo.suggest_profiles(&query, limit).await?;
-
-    // Cache result
-    if let Ok(json) = serde_json::to_string(&suggestions) {
-        state.cache.set_search_suggest(&query, &json).await;
-    }
+    // In-memory search — no DB or Redis needed
+    let suggestions = state
+        .profile_search_cache
+        .suggest_profiles(&query, limit)
+        .await;
 
     Ok(Json(SuggestResponse {
         query,

@@ -32,6 +32,7 @@ pub struct Config {
     pub ondemand_fetch_enabled: bool,
     pub ondemand_fetch_timeout_ms: u64,
     pub ondemand_fetch_max_relays: usize,
+    pub profile_search_cache_refresh_secs: u64,
 }
 
 impl Config {
@@ -188,6 +189,11 @@ impl Config {
             .and_then(|v| v.parse().ok())
             .unwrap_or(3);
 
+        let profile_search_cache_refresh_secs = env::var("PROFILE_SEARCH_CACHE_REFRESH_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(86400); // Default: 24 hours
+
         Self {
             database_url,
             redis_url,
@@ -219,6 +225,7 @@ impl Config {
             ondemand_fetch_enabled,
             ondemand_fetch_timeout_ms,
             ondemand_fetch_max_relays,
+            profile_search_cache_refresh_secs,
         }
     }
 }

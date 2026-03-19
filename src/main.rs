@@ -9,6 +9,7 @@ mod nip19;
 mod ratelimit;
 mod relay;
 mod social;
+mod profile_search_cache;
 mod wot_cache;
 mod ws;
 
@@ -323,12 +324,28 @@ async fn main() {
         cfg.ondemand_fetch_enabled,
     ));
 
+    // In-memory profile search cache (zero-DB-hit searches)
+    let profile_search_cache = profile_search_cache::ProfileSearchCache::new(
+        pool.clone(),
+        cfg.profile_search_cache_refresh_secs,
+    );
+    if let Err(e) = profile_search_cache.initialize().await {
+        tracing::warn!(error = %e, "Failed to initialize profile search cache, continuing anyway");
+    }
+    // Spawn background refresh (same interval as config, re-loads from profile_search MV)
+    profile_search_cache
+        .clone()
+        .spawn_refresh_loop(std::time::Duration::from_secs(
+            cfg.profile_search_cache_refresh_secs,
+        ));
+
     // HTTP API
     let state = api::AppState {
         repo,
         cache: stats_cache,
         crawl_queue,
         fetcher,
+        profile_search_cache,
     };
 
     // WebSocket relay (NIP-50 search endpoint)
