@@ -61,6 +61,8 @@ impl ProfileSearchCache {
     /// Start background refresh loop.
     pub fn spawn_refresh_loop(self, interval: Duration) {
         tokio::spawn(async move {
+            // Skip first tick (initialize() already loaded the cache on startup).
+            tokio::time::sleep(interval).await;
             let mut ticker = tokio::time::interval(interval);
             loop {
                 ticker.tick().await;
@@ -158,11 +160,15 @@ impl ProfileSearchCache {
 
         let profiles = self.profiles.read().await;
 
-        // Collect matching profiles with scores
-        let mut scored: Vec<(usize, f64)> = Vec::new();
+        // Cap: we only need offset+limit results.  For very broad queries
+        // (e.g. "a" matching 400k profiles), avoid sorting the entire set.
+        // Keep a bounded heap of the best candidates.
+        let needed = (offset + limit) as usize;
+        let max_candidates = needed.max(1000); // always evaluate at least 1k
+
+        let mut scored: Vec<(usize, f64)> = Vec::with_capacity(max_candidates);
 
         for (idx, p) in profiles.iter().enumerate() {
-            // Substring match on name, display_name, nip05
             let matches = p.name_lower.contains(&q)
                 || p.display_name_lower.contains(&q)
                 || p.nip05_lower.contains(&q);
@@ -172,10 +178,27 @@ impl ProfileSearchCache {
             }
 
             let score = rank_score(p, &q, now_epoch);
-            scored.push((idx, score));
+
+            if scored.len() < max_candidates {
+                scored.push((idx, score));
+            } else {
+                // Replace the worst entry if this one is better
+                if let Some(min_pos) = scored
+                    .iter()
+                    .enumerate()
+                    .min_by(|(_, a), (_, b)| {
+                        a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .map(|(i, _)| i)
+                {
+                    if score > scored[min_pos].1 {
+                        scored[min_pos] = (idx, score);
+                    }
+                }
+            }
         }
 
-        // Sort by score DESC, then follower_count DESC
+        // Sort the bounded set
         scored.sort_by(|a, b| {
             b.1.partial_cmp(&a.1)
                 .unwrap_or(std::cmp::Ordering::Equal)
@@ -186,7 +209,6 @@ impl ProfileSearchCache {
                 })
         });
 
-        // Apply offset + limit
         scored
             .into_iter()
             .skip(offset as usize)
@@ -220,10 +242,10 @@ impl ProfileSearchCache {
 
         let profiles = self.profiles.read().await;
 
-        let mut scored: Vec<(usize, f64)> = Vec::new();
+        let max_candidates = (limit as usize).max(200);
+        let mut scored: Vec<(usize, f64)> = Vec::with_capacity(max_candidates);
 
         for (idx, p) in profiles.iter().enumerate() {
-            // Match: substring on name/display_name/nip05 OR prefix on pubkey
             let matches = p.name_lower.contains(&q)
                 || p.display_name_lower.contains(&q)
                 || p.nip05_lower.contains(&q)
@@ -234,7 +256,21 @@ impl ProfileSearchCache {
             }
 
             let score = suggest_score(p, &q);
-            scored.push((idx, score));
+
+            if scored.len() < max_candidates {
+                scored.push((idx, score));
+            } else if let Some(min_pos) = scored
+                .iter()
+                .enumerate()
+                .min_by(|(_, a), (_, b)| {
+                    a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .map(|(i, _)| i)
+            {
+                if score > scored[min_pos].1 {
+                    scored[min_pos] = (idx, score);
+                }
+            }
         }
 
         scored.sort_by(|a, b| {
