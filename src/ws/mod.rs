@@ -25,12 +25,13 @@ enum FeedKind {
     /// Up-and-coming users feed — returns a NIP-51 kind 30000 people list.
     UpAndComing,
     /// Followers feed: returns kind-0 profiles for all followers of a pubkey.
-    Followers { pubkey: String },
+    /// Pubkey must be supplied as a single-entry `authors` filter in the REQ message.
+    Followers,
     /// Ranked notes feed: a specific pubkey's root notes or replies ordered by a metric.
-    /// pubkey: hex pubkey
     /// note_type: "root" | "replies"
     /// metric: "likes" | "reposts" | "zaps" | "replies"
-    RankedNotes { pubkey: String, note_type: String, metric: String },
+    /// Pubkey must be supplied as a single-entry `authors` filter in the REQ message.
+    RankedNotes { note_type: String, metric: String },
 }
 
 /// Build the WebSocket relay router.
@@ -45,12 +46,14 @@ pub fn router(state: AppState) -> Router {
         )
         // Up-and-coming users feed
         .route("/users/upandcoming", any(ws_upandcoming_handler))
-        // Followers feed: /profiles/{pubkey}/followers
-        .route("/profiles/{pubkey}/followers", any(ws_followers_handler))
-        // Ranked notes feeds: /profiles/{pubkey}/{note_type}/{metric}
+        // Followers feed: /profiles/followers
+        // Pubkey supplied via `authors` filter in the REQ message.
+        .route("/profiles/followers", any(ws_followers_handler))
+        // Ranked notes feeds: /profiles/{note_type}/{metric}
         // note_type: "root" or "replies"
         // metric: "likes", "reposts", "zaps", "replies"
-        .route("/profiles/{pubkey}/{note_type}/{metric}", any(ws_ranked_notes_handler))
+        // Pubkey supplied via `authors` filter in the REQ message.
+        .route("/profiles/{note_type}/{metric}", any(ws_ranked_notes_handler))
         .with_state(state)
 }
 
@@ -102,20 +105,17 @@ async fn ws_trending_handler(
 async fn ws_followers_handler(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
-    Path(pubkey): Path<String>,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| {
-        handle_connection(socket, state, FeedKind::Followers { pubkey })
-    })
+    ws.on_upgrade(move |socket| handle_connection(socket, state, FeedKind::Followers))
 }
 
 async fn ws_ranked_notes_handler(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
-    Path((pubkey, note_type, metric)): Path<(String, String, String)>,
+    Path((note_type, metric)): Path<(String, String)>,
 ) -> impl IntoResponse {
     ws.on_upgrade(move |socket| {
-        handle_connection(socket, state, FeedKind::RankedNotes { pubkey, note_type, metric })
+        handle_connection(socket, state, FeedKind::RankedNotes { note_type, metric })
     })
 }
 
@@ -218,11 +218,11 @@ async fn handle_req(arr: &[Value], state: &AppState, feed_kind: &FeedKind) -> Ve
         FeedKind::UpAndComing => {
             handle_upandcoming_req(&sub_id, &arr[2..], state).await
         }
-        FeedKind::Followers { pubkey } => {
-            handle_followers_req(&sub_id, &arr[2..], state, pubkey).await
+        FeedKind::Followers => {
+            handle_followers_req(&sub_id, &arr[2..], state).await
         }
-        FeedKind::RankedNotes { pubkey, note_type, metric } => {
-            handle_ranked_notes_req(&sub_id, &arr[2..], state, &pubkey, &note_type, &metric).await
+        FeedKind::RankedNotes { note_type, metric } => {
+            handle_ranked_notes_req(&sub_id, &arr[2..], state, &note_type, &metric).await
         }
     }
 }
@@ -725,29 +725,59 @@ async fn handle_upandcoming_req(
 }
 
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Extract exactly one hex pubkey from the `authors` field of the first filter.
+/// Returns `Err` with a human-readable notice string on any violation.
+fn extract_single_author(filters: &[Value]) -> Result<String, String> {
+    let filter = filters.first().unwrap_or(&Value::Null);
+    let authors = filter
+        .get("authors")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| "filter must include an `authors` array".to_string())?;
+
+    if authors.len() != 1 {
+        return Err(format!(
+            "`authors` must contain exactly one pubkey, got {}",
+            authors.len()
+        ));
+    }
+
+    let pubkey = authors[0]
+        .as_str()
+        .ok_or_else(|| "pubkey must be a string".to_string())?;
+
+    if pubkey.len() != 64 || !pubkey.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(format!("invalid pubkey: {pubkey}"));
+    }
+
+    Ok(pubkey.to_string())
+}
+
+// ---------------------------------------------------------------------------
 // Followers feed handler
 // ---------------------------------------------------------------------------
 
 /// Followers feed: returns kind-0 profile events for ALL followers of a pubkey.
 ///
 /// Protocol:
-///   Client: ["REQ", "<sub_id>", {}]
+///   Client: ["REQ", "<sub_id>", {"authors": ["<hex_pubkey>"]}]
 ///   Relay:  ["EVENT", "<sub_id>", <kind-0>] ... ["EOSE", "<sub_id>"]
 async fn handle_followers_req(
     sub_id: &str,
-    _filters: &[Value],
+    filters: &[Value],
     state: &AppState,
-    pubkey: &str,
 ) -> Vec<String> {
-    tracing::info!(sub_id = %sub_id, pubkey = %pubkey, "followers feed request");
+    // Extract exactly one author from the filter
+    let pubkey = match extract_single_author(filters) {
+        Ok(pk) => pk,
+        Err(msg) => return vec![notice(&msg), eose(sub_id)],
+    };
+    let pubkey = pubkey.as_str();
 
-    // Validate pubkey format
-    if pubkey.len() != 64 || !pubkey.chars().all(|c| c.is_ascii_hexdigit()) {
-        return vec![
-            notice(&format!("invalid pubkey: {pubkey}")),
-            eose(sub_id),
-        ];
-    }
+    tracing::info!(sub_id = %sub_id, pubkey = %pubkey, "followers feed request");
 
     // Cache key for this follower list
     let cache_key = format!("ws:followers:{pubkey}");
@@ -831,33 +861,32 @@ fn validate_ranking_metric(metric: &str) -> bool {
 /// Ranked notes feed: a pubkey's root notes or replies ordered by a specific metric.
 ///
 /// Routes:
-///   /profiles/{pubkey}/root/likes      — pubkey's root notes ordered by reaction_count
-///   /profiles/{pubkey}/root/reposts    — pubkey's root notes ordered by repost_count
-///   /profiles/{pubkey}/root/zaps       — pubkey's root notes ordered by zap_amount_msats
-///   /profiles/{pubkey}/root/replies    — pubkey's root notes ordered by reply_count
-///   /profiles/{pubkey}/replies/likes   — pubkey's replies ordered by reaction_count
-///   /profiles/{pubkey}/replies/reposts — pubkey's replies ordered by repost_count
-///   /profiles/{pubkey}/replies/zaps    — pubkey's replies ordered by zap_amount_msats
-///   /profiles/{pubkey}/replies/replies — pubkey's replies ordered by reply_count
+///   /profiles/root/likes      — pubkey's root notes ordered by reaction_count
+///   /profiles/root/reposts    — pubkey's root notes ordered by repost_count
+///   /profiles/root/zaps       — pubkey's root notes ordered by zap_amount_msats
+///   /profiles/root/replies    — pubkey's root notes ordered by reply_count
+///   /profiles/replies/likes   — pubkey's replies ordered by reaction_count
+///   /profiles/replies/reposts — pubkey's replies ordered by repost_count
+///   /profiles/replies/zaps    — pubkey's replies ordered by zap_amount_msats
+///   /profiles/replies/replies — pubkey's replies ordered by reply_count
 ///
 /// Protocol:
-///   Client: ["REQ", "<sub_id>", {"limit": 50}]
+///   Client: ["REQ", "<sub_id>", {"authors": ["<hex_pubkey>"], "limit": 50}]
 ///   Relay:  ["EVENT", "<sub_id>", <kind-1>] ... ["EOSE", "<sub_id>"]
 async fn handle_ranked_notes_req(
     sub_id: &str,
     filters: &[Value],
     state: &AppState,
-    pubkey: &str,
     note_type: &str,
     metric: &str,
 ) -> Vec<String> {
-    // Validate pubkey format
-    if pubkey.len() != 64 || !pubkey.chars().all(|c| c.is_ascii_hexdigit()) {
-        return vec![
-            notice(&format!("invalid pubkey: {pubkey}")),
-            eose(sub_id),
-        ];
-    }
+    // Extract exactly one author from the filter
+    let pubkey_owned = match extract_single_author(filters) {
+        Ok(pk) => pk,
+        Err(msg) => return vec![notice(&msg), eose(sub_id)],
+    };
+    let pubkey = pubkey_owned.as_str();
+
     // Validate note_type
     if !validate_note_type(note_type) {
         return vec![
