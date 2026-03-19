@@ -452,21 +452,37 @@ impl NegentropySyncer {
         max_windows: usize,
     ) -> Result<SyncStats, AppError> {
         let now = chrono::Utc::now().timestamp();
-        self.run_sync_windowed_from(relay_url, &[1], now, window_secs, max_windows)
-            .await
+        let initial = window_secs.unwrap_or(Self::DEFAULT_WINDOW_SECS);
+        let (stats, _final_window) = self
+            .run_sync_windowed_from(relay_url, &[1], now, initial, max_windows)
+            .await?;
+        Ok(stats)
     }
 
+    /// Earliest plausible Nostr timestamp (Jan 1 2020). Anything before this
+    /// means we've walked past all possible Nostr data.
+    const NOSTR_EPOCH: i64 = 1_577_836_800;
+
+    /// Maximum window size for exponential growth (180 days).
+    const MAX_WINDOW_SECS: i64 = 180 * 86400;
+
     /// Internal: walk backward from a cursor in time windows for specific kinds.
+    /// Uses exponential window growth: when a window finds 0 new events, double
+    /// the window size (people go days/months without posting). When events are
+    /// found, reset to the base window. Terminates only when cursor < NOSTR_EPOCH.
+    ///
+    /// Returns (SyncStats, final_window_secs) so callers can persist the window
+    /// size for resumption across cycles.
     async fn run_sync_windowed_from(
         &self,
         relay_url: &str,
         kinds: &[i64],
         start_cursor: i64,
-        window_secs: Option<i64>,
+        initial_window_secs: i64,
         max_windows: usize,
-    ) -> Result<SyncStats, AppError> {
+    ) -> Result<(SyncStats, i64), AppError> {
         let start = Instant::now();
-        let mut window = window_secs.unwrap_or(Self::DEFAULT_WINDOW_SECS);
+        let mut window = initial_window_secs.max(Self::DEFAULT_WINDOW_SECS);
         let min_window: i64 = 3600;
 
         let mut total_discovered = 0usize;
@@ -474,10 +490,9 @@ impl NegentropySyncer {
         let mut total_inserted = 0usize;
         let mut cursor = start_cursor;
         let mut windows_done = 0usize;
-        let mut consecutive_empty = 0usize;
 
-        while windows_done < max_windows && cursor > 0 {
-            let window_since = cursor - window;
+        while windows_done < max_windows && cursor > Self::NOSTR_EPOCH {
+            let window_since = (cursor - window).max(Self::NOSTR_EPOCH);
             let window_until = cursor;
 
             tracing::info!(
@@ -486,6 +501,7 @@ impl NegentropySyncer {
                 window = windows_done + 1,
                 since = window_since,
                 until = window_until,
+                window_days = window / 86400,
                 window_hours = window / 3600,
                 "starting sync window"
             );
@@ -501,17 +517,21 @@ impl NegentropySyncer {
                     windows_done += 1;
 
                     if stats.events_discovered == 0 {
-                        consecutive_empty += 1;
-                        if consecutive_empty >= 2 {
+                        // Empty window: exponentially grow to skip quiet periods
+                        let new_window = (window * 2).min(Self::MAX_WINDOW_SECS);
+                        if new_window != window {
                             tracing::info!(
                                 relay = relay_url,
                                 kinds = ?kinds,
-                                "2 consecutive empty windows — stopping backward crawl"
+                                old_days = window / 86400,
+                                new_days = new_window / 86400,
+                                "empty window — doubling window size"
                             );
-                            break;
                         }
+                        window = new_window;
                     } else {
-                        consecutive_empty = 0;
+                        // Found events: reset to base window for fine-grained crawling
+                        window = Self::DEFAULT_WINDOW_SECS;
                     }
 
                     cursor = window_since;
@@ -526,7 +546,7 @@ impl NegentropySyncer {
                                 window_secs = window,
                                 "window too small, skipping this range"
                             );
-                            cursor = window_since;
+                            cursor -= window;
                             windows_done += 1;
                             continue;
                         }
@@ -543,7 +563,7 @@ impl NegentropySyncer {
                             error = %e,
                             "sync window failed, skipping"
                         );
-                        cursor = window_since;
+                        cursor -= window;
                         windows_done += 1;
                     }
                 }
@@ -556,6 +576,8 @@ impl NegentropySyncer {
             relay = relay_url,
             kinds = ?kinds,
             windows = windows_done,
+            final_window_days = window / 86400,
+            cursor_reached = cursor,
             total_discovered = total_discovered,
             total_fetched = total_fetched,
             total_inserted = total_inserted,
@@ -563,13 +585,13 @@ impl NegentropySyncer {
             "windowed sync complete"
         );
 
-        Ok(SyncStats {
+        Ok((SyncStats {
             relay_url: relay_url.to_string(),
             events_discovered: total_discovered,
             events_fetched: total_fetched,
             events_inserted: total_inserted,
             duration_ms,
-        })
+        }, window))
     }
 
     // -----------------------------------------------------------------------
@@ -581,7 +603,8 @@ impl NegentropySyncer {
     /// where it left off. Each cycle:
     ///   1. Recent pass: sync last 24h for all kinds (catch new content)
     ///   2. Backfill pass: for each non-fully-backfilled kind, walk backward
-    ///      from the stored cursor for up to `max_windows_per_kind` windows
+    ///      from the stored cursor using exponential window growth to skip
+    ///      quiet periods efficiently
     pub async fn run_exhaustive_sync(
         &self,
         relay_url: &str,
@@ -648,6 +671,9 @@ impl NegentropySyncer {
                 recent_since
             };
 
+            // Resume with the persisted window size (exponential state survives across cycles)
+            let resume_window = state.current_window_secs.max(Self::DEFAULT_WINDOW_SECS);
+
             tracing::info!(
                 relay = relay_url,
                 kind = kind,
@@ -655,6 +681,7 @@ impl NegentropySyncer {
                 cursor_date = %chrono::DateTime::from_timestamp(backfill_cursor, 0)
                     .map(|d| d.format("%Y-%m-%d").to_string())
                     .unwrap_or_default(),
+                window_days = resume_window / 86400,
                 "starting backfill pass"
             );
 
@@ -663,33 +690,41 @@ impl NegentropySyncer {
                     relay_url,
                     kinds,
                     backfill_cursor,
-                    Some(Self::DEFAULT_WINDOW_SECS),
+                    resume_window,
                     max_windows_per_kind,
                 )
                 .await
             {
-                Ok(stats) => {
+                Ok((stats, final_window)) => {
                     total_discovered += stats.events_discovered;
                     total_fetched += stats.events_fetched;
                     total_inserted += stats.events_inserted;
 
-                    // Calculate where the cursor ended up
-                    let new_cursor =
-                        backfill_cursor - (Self::DEFAULT_WINDOW_SECS * max_windows_per_kind as i64);
-                    let new_empty = if stats.events_discovered == 0 {
-                        state.consecutive_empty_windows + max_windows_per_kind as i32
-                    } else {
-                        0
-                    };
+                    // Calculate where the cursor actually ended up.
+                    // We can't know exactly from SyncStats, but we can estimate
+                    // conservatively from windows done × average window size.
+                    // Actually, run_sync_windowed_from tracks cursor internally,
+                    // so we reconstruct from the final state.
+                    // For simplicity, re-derive: each window moves cursor back
+                    // by its window size. Since windows vary (exponential), we
+                    // just compute the total time covered.
+                    let time_covered = self.estimate_time_covered(
+                        resume_window,
+                        max_windows_per_kind,
+                        stats.events_discovered > 0,
+                    );
+                    let new_cursor = (backfill_cursor - time_covered).max(0);
 
-                    // If we've had 3+ consecutive empty windows, mark as fully backfilled
-                    let fully_done = new_empty >= 3 || new_cursor < 1_000_000_000; // before 2001
+                    // Only mark fully backfilled when we've reached pre-Nostr era
+                    let fully_done = new_cursor <= Self::NOSTR_EPOCH;
 
                     self.update_sync_state(relay_url, kind, |s| {
-                        s.oldest_synced_at = new_cursor.max(0);
+                        s.oldest_synced_at = new_cursor;
                         s.total_discovered += stats.events_discovered as i64;
                         s.total_inserted += stats.events_inserted as i64;
-                        s.consecutive_empty_windows = new_empty;
+                        s.current_window_secs = final_window;
+                        // Reset consecutive_empty — exponential windows handle gaps now
+                        s.consecutive_empty_windows = 0;
                         s.fully_backfilled = fully_done;
                     })
                     .await?;
@@ -698,7 +733,7 @@ impl NegentropySyncer {
                         tracing::info!(
                             relay = relay_url,
                             kind = kind,
-                            "marked as fully backfilled"
+                            "marked as fully backfilled (reached pre-Nostr epoch)"
                         );
                     }
                 }
@@ -724,6 +759,30 @@ impl NegentropySyncer {
         })
     }
 
+    /// Estimate total time covered by a windowed sync pass with exponential growth.
+    /// This mirrors the logic in `run_sync_windowed_from`: if events were found at
+    /// any point the window resets, otherwise it doubles each step.
+    fn estimate_time_covered(
+        &self,
+        initial_window: i64,
+        max_windows: usize,
+        found_any_events: bool,
+    ) -> i64 {
+        if found_any_events {
+            // Conservative: assume events found early, rest at base window
+            Self::DEFAULT_WINDOW_SECS * max_windows as i64
+        } else {
+            // All empty: exponential growth pattern
+            let mut total = 0i64;
+            let mut w = initial_window;
+            for _ in 0..max_windows {
+                total += w;
+                w = (w * 2).min(Self::MAX_WINDOW_SECS);
+            }
+            total
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Sync state persistence
     // -----------------------------------------------------------------------
@@ -734,7 +793,7 @@ impl NegentropySyncer {
         kind: i64,
     ) -> Result<SyncState, AppError> {
         let row = sqlx::query_as::<_, SyncStateRow>(
-            "SELECT oldest_synced_at, newest_synced_at, fully_backfilled, total_discovered, total_inserted, consecutive_empty_windows
+            "SELECT oldest_synced_at, newest_synced_at, fully_backfilled, total_discovered, total_inserted, consecutive_empty_windows, current_window_secs
              FROM negentropy_sync_state WHERE relay_url = $1 AND kind = $2",
         )
         .bind(relay_url)
@@ -749,6 +808,7 @@ impl NegentropySyncer {
             total_discovered: 0,
             total_inserted: 0,
             consecutive_empty_windows: 0,
+            current_window_secs: Self::DEFAULT_WINDOW_SECS,
         }))
     }
 
@@ -765,8 +825,8 @@ impl NegentropySyncer {
         f(&mut state);
 
         sqlx::query(
-            "INSERT INTO negentropy_sync_state (relay_url, kind, oldest_synced_at, newest_synced_at, fully_backfilled, total_discovered, total_inserted, consecutive_empty_windows, last_sync_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+            "INSERT INTO negentropy_sync_state (relay_url, kind, oldest_synced_at, newest_synced_at, fully_backfilled, total_discovered, total_inserted, consecutive_empty_windows, current_window_secs, last_sync_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
              ON CONFLICT (relay_url, kind) DO UPDATE SET
                oldest_synced_at = EXCLUDED.oldest_synced_at,
                newest_synced_at = EXCLUDED.newest_synced_at,
@@ -774,6 +834,7 @@ impl NegentropySyncer {
                total_discovered = EXCLUDED.total_discovered,
                total_inserted = EXCLUDED.total_inserted,
                consecutive_empty_windows = EXCLUDED.consecutive_empty_windows,
+               current_window_secs = EXCLUDED.current_window_secs,
                last_sync_at = NOW()",
         )
         .bind(relay_url)
@@ -784,6 +845,7 @@ impl NegentropySyncer {
         .bind(state.total_discovered)
         .bind(state.total_inserted)
         .bind(state.consecutive_empty_windows)
+        .bind(state.current_window_secs)
         .execute(&self.pool)
         .await?;
 
@@ -809,6 +871,7 @@ struct SyncState {
     total_discovered: i64,
     total_inserted: i64,
     consecutive_empty_windows: i32,
+    current_window_secs: i64,
 }
 
 #[derive(sqlx::FromRow)]
@@ -819,6 +882,7 @@ struct SyncStateRow {
     total_discovered: i64,
     total_inserted: i64,
     consecutive_empty_windows: i32,
+    current_window_secs: i64,
 }
 
 impl From<SyncStateRow> for SyncState {
@@ -830,6 +894,7 @@ impl From<SyncStateRow> for SyncState {
             total_discovered: r.total_discovered,
             total_inserted: r.total_inserted,
             consecutive_empty_windows: r.consecutive_empty_windows,
+            current_window_secs: r.current_window_secs,
         }
     }
 }
