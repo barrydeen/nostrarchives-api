@@ -61,25 +61,74 @@ impl NegentropySyncer {
         since: Option<i64>,
         until: Option<i64>,
     ) -> Result<SyncResult, AppError> {
-        // 1. Load local events matching the requested kinds + time window
-        let rows = if since.is_some() || until.is_some() {
-            let s = since.unwrap_or(0);
-            let u = until.unwrap_or(i64::MAX);
-            sqlx::query_as::<_, EventIdRow>(
-                "SELECT id, created_at FROM events WHERE kind = ANY($1) AND created_at >= $2 AND created_at < $3 ORDER BY created_at ASC, id ASC",
-            )
-            .bind(kinds)
-            .bind(s)
-            .bind(u)
-            .fetch_all(&self.pool)
-            .await?
-        } else {
-            sqlx::query_as::<_, EventIdRow>(
-                "SELECT id, created_at FROM events WHERE kind = ANY($1) ORDER BY created_at ASC, id ASC",
-            )
-            .bind(kinds)
-            .fetch_all(&self.pool)
-            .await?
+        self.sync_with_relay_filtered(relay_url, kinds, None, since, until).await
+    }
+
+    /// Per-author negentropy reconciliation. Syncs all events of the given kinds
+    /// for specific authors against a relay. No time window needed — the author
+    /// filter keeps the set small enough.
+    pub async fn sync_authors_with_relay(
+        &self,
+        relay_url: &str,
+        kinds: &[i64],
+        authors: &[String],
+    ) -> Result<SyncResult, AppError> {
+        self.sync_with_relay_filtered(relay_url, kinds, Some(authors), None, None).await
+    }
+
+    /// Core negentropy reconciliation with optional author and time filters.
+    async fn sync_with_relay_filtered(
+        &self,
+        relay_url: &str,
+        kinds: &[i64],
+        authors: Option<&[String]>,
+        since: Option<i64>,
+        until: Option<i64>,
+    ) -> Result<SyncResult, AppError> {
+        // 1. Load local events matching the requested filters
+        let rows = match (authors, since.is_some() || until.is_some()) {
+            (Some(pks), true) => {
+                let s = since.unwrap_or(0);
+                let u = until.unwrap_or(i64::MAX);
+                sqlx::query_as::<_, EventIdRow>(
+                    "SELECT id, created_at FROM events WHERE kind = ANY($1) AND pubkey = ANY($2) AND created_at >= $3 AND created_at < $4 ORDER BY created_at ASC, id ASC",
+                )
+                .bind(kinds)
+                .bind(pks)
+                .bind(s)
+                .bind(u)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            (Some(pks), false) => {
+                sqlx::query_as::<_, EventIdRow>(
+                    "SELECT id, created_at FROM events WHERE kind = ANY($1) AND pubkey = ANY($2) ORDER BY created_at ASC, id ASC",
+                )
+                .bind(kinds)
+                .bind(pks)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            (None, true) => {
+                let s = since.unwrap_or(0);
+                let u = until.unwrap_or(i64::MAX);
+                sqlx::query_as::<_, EventIdRow>(
+                    "SELECT id, created_at FROM events WHERE kind = ANY($1) AND created_at >= $2 AND created_at < $3 ORDER BY created_at ASC, id ASC",
+                )
+                .bind(kinds)
+                .bind(s)
+                .bind(u)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            (None, false) => {
+                sqlx::query_as::<_, EventIdRow>(
+                    "SELECT id, created_at FROM events WHERE kind = ANY($1) ORDER BY created_at ASC, id ASC",
+                )
+                .bind(kinds)
+                .fetch_all(&self.pool)
+                .await?
+            }
         };
 
         // 2. Build negentropy storage
@@ -100,6 +149,7 @@ impl NegentropySyncer {
         tracing::info!(
             relay = relay_url,
             local_events = rows.len(),
+            authors = authors.map_or(0, |a| a.len()),
             "starting negentropy reconciliation"
         );
 
@@ -120,6 +170,9 @@ impl NegentropySyncer {
         let sub_id = format!("neg-{}", uuid::Uuid::new_v4().as_simple());
         let kinds_json: Vec<serde_json::Value> = kinds.iter().map(|&k| serde_json::json!(k)).collect();
         let mut filter = serde_json::json!({"kinds": kinds_json});
+        if let Some(pks) = authors {
+            filter["authors"] = serde_json::json!(pks);
+        }
         if let Some(s) = since {
             filter["since"] = serde_json::json!(s);
         }
@@ -433,6 +486,64 @@ impl NegentropySyncer {
             inserted = events_inserted,
             duration_ms = duration_ms,
             "sync window complete"
+        );
+
+        Ok(SyncStats {
+            relay_url: relay_url.to_string(),
+            events_discovered,
+            events_fetched,
+            events_inserted,
+            duration_ms,
+        })
+    }
+
+    /// Per-author negentropy sync: reconcile + fetch + insert for specific authors.
+    /// No time window needed — the author filter keeps the set manageable.
+    pub async fn sync_authors(
+        &self,
+        relay_url: &str,
+        kinds: &[i64],
+        authors: &[String],
+    ) -> Result<SyncStats, AppError> {
+        let start = Instant::now();
+
+        let sync_result = self
+            .sync_authors_with_relay(relay_url, kinds, authors)
+            .await?;
+        let events_discovered = sync_result.need_ids.len();
+
+        let events = self
+            .fetch_missing_events(relay_url, &sync_result.need_ids)
+            .await?;
+        let events_fetched = events.len();
+
+        let mut events_inserted = 0usize;
+        for event in &events {
+            match self.repo.insert_event(event, relay_url).await {
+                Ok(true) => {
+                    events_inserted += 1;
+                    self.cache
+                        .on_event_ingested(&event.pubkey, event.kind)
+                        .await;
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::warn!(event_id = %event.id, "insert failed: {e}");
+                }
+            }
+        }
+
+        let duration_ms = start.elapsed().as_millis() as u64;
+
+        tracing::info!(
+            relay = relay_url,
+            kinds = ?kinds,
+            authors = authors.len(),
+            discovered = events_discovered,
+            fetched = events_fetched,
+            inserted = events_inserted,
+            duration_ms = duration_ms,
+            "per-author sync complete"
         );
 
         Ok(SyncStats {
