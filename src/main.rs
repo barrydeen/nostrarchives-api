@@ -5,6 +5,7 @@ mod crawler;
 mod db;
 mod error;
 mod follower_cache;
+mod indexer;
 mod nip19;
 mod ratelimit;
 mod relay;
@@ -392,6 +393,20 @@ async fn main() {
         tracing::info!(addr = %scheduler_addr, "scheduler relay enabled");
     } else {
         tracing::info!("scheduler relay disabled");
+    }
+
+    // Indexer relay (restricted: kinds 0, 3, 10002 only)
+    if cfg.indexer_enabled {
+        let indexer_addr: SocketAddr = cfg
+            .indexer_ws_listen_addr
+            .parse()
+            .expect("invalid indexer ws listen address");
+        let indexer_state = indexer::IndexerState::new(state.repo.clone());
+        let indexer_shutdown_rx = shutdown_tx.subscribe();
+        tokio::spawn(indexer::serve(indexer_state, indexer_addr, indexer_shutdown_rx));
+        tracing::info!(addr = %indexer_addr, "indexer relay enabled");
+    } else {
+        tracing::info!("indexer relay disabled");
     }
 
     let app = api::router(state).into_make_service_with_connect_info::<SocketAddr>();
