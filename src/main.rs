@@ -198,6 +198,7 @@ async fn main() {
                 legacy_poll_interval_secs: cfg.crawler_poll_interval_secs,
                 legacy_events_per_author: cfg.crawler_events_per_author,
                 fallback_relay_urls: cfg.relay_urls.clone(),
+                primary_negentropy_relay_urls: cfg.negentropy_relay_urls.clone(),
                 dry_run: cfg.crawler_dry_run,
             };
             let router = crawler::relay_router::RelayRouter::new(repo.pool());

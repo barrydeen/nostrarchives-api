@@ -25,6 +25,9 @@ pub struct Config {
     pub crawler_use_relay_lists: bool,
     pub crawler_max_relay_pool_size: usize,
     pub crawler_dry_run: bool,
+    /// Explicit list of negentropy-capable relays to try first for every per-author crawl.
+    /// If empty, falls back to all DB-known negentropy relays.
+    pub negentropy_relay_urls: Vec<String>,
     pub min_follower_threshold: i64,
     pub follower_cache_refresh_secs: u64,
     pub wot_threshold: i64,
@@ -159,6 +162,13 @@ impl Config {
             .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
             .unwrap_or(false);
 
+        let negentropy_relay_urls: Vec<String> = env::var("NEGENTROPY_RELAY_URLS")
+            .unwrap_or_default()
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+
         let min_follower_threshold = env::var("MIN_FOLLOWER_THRESHOLD")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -236,6 +246,7 @@ impl Config {
             crawler_use_relay_lists,
             crawler_max_relay_pool_size,
             crawler_dry_run,
+            negentropy_relay_urls,
             min_follower_threshold,
             follower_cache_refresh_secs,
             wot_threshold,

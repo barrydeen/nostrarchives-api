@@ -46,6 +46,9 @@ pub struct HybridCrawlerConfig {
     pub legacy_events_per_author: i64,
     /// Fallback relay URLs when authors have no NIP-65 data.
     pub fallback_relay_urls: Vec<String>,
+    /// Primary negentropy relay URLs tried for ALL authors before their specific write relays.
+    /// If empty, falls back to all DB-known negentropy relays.
+    pub primary_negentropy_relay_urls: Vec<String>,
     /// Dry run mode: log what would be fetched but don't insert.
     pub dry_run: bool,
 }
@@ -63,6 +66,7 @@ impl Default for HybridCrawlerConfig {
             legacy_poll_interval_secs: 30,
             legacy_events_per_author: 500,
             fallback_relay_urls: vec![],
+            primary_negentropy_relay_urls: vec![],
             dry_run: false,
         }
     }
@@ -372,10 +376,23 @@ impl HybridCrawler {
         );
     }
 
+    /// Get primary negentropy relay URLs for per-author syncs.
+    /// Uses explicitly configured URLs if set; otherwise falls back to all
+    /// DB-known negentropy-capable relays discovered during capability probing.
+    async fn primary_negentropy_relays(&self) -> Vec<String> {
+        if !self.config.primary_negentropy_relay_urls.is_empty() {
+            return self.config.primary_negentropy_relay_urls.clone();
+        }
+        relay_caps::get_negentropy_relays(&self.pool)
+            .await
+            .unwrap_or_default()
+    }
+
     /// Run one cycle of relay-list-aware targeted crawling.
-    /// Two phases per author:
-    ///   A) Recent: fetch new notes since `newest_seen_at`
-    ///   B) Backfill: walk backwards from `crawl_cursor` to fill history
+    /// Three phases per cycle:
+    ///   1) Primary negentropy relays — all authors in batch, exhaustive
+    ///   2) Author-specific write relays (NIP-65) — additional niche coverage
+    ///   3) Fallback for unrouted authors (no NIP-65 data)
     async fn targeted_crawl_cycle(&self) {
         // Take a batch from the crawl queue
         let batch = match self.queue.take_batch(self.config.legacy_batch_size).await {
@@ -401,7 +418,202 @@ impl HybridCrawler {
             "targeted crawl: processing batch"
         );
 
-        // Group authors by their preferred relays
+        // Track per-author stats across all relays
+        let mut author_stats: std::collections::HashMap<String, AuthorCrawlStats> =
+            std::collections::HashMap::new();
+
+        // Track which authors have NIP-65 relay lists (for unrouted fallback detection)
+        let mut routed_pubkeys: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        // ── Phase 1: Primary negentropy relays — ALL authors ────────────────────
+        // Always try big, globally-known negentropy-capable relays first for every
+        // author in the batch, regardless of their NIP-65 data. This is the most
+        // exhaustive strategy: these relays typically have the widest event coverage.
+        // t1/t2 authors especially benefit from this breadth-first approach.
+        let primary_neg_relays = self.primary_negentropy_relays().await;
+        let primary_neg_set: std::collections::HashSet<String> =
+            primary_neg_relays.iter().cloned().collect();
+
+        if !primary_neg_relays.is_empty() {
+            tracing::info!(
+                relay_count = primary_neg_relays.len(),
+                authors = pubkeys.len(),
+                "targeted crawl: phase 1 — negentropy sync on primary relays"
+            );
+
+            for relay_url in &primary_neg_relays {
+                if self.config.dry_run {
+                    tracing::info!(
+                        relay = %relay_url,
+                        authors = pubkeys.len(),
+                        "targeted crawl: DRY RUN — would negentropy sync all authors on primary relay"
+                    );
+                    continue;
+                }
+
+                let relay_has_neg = relay_caps::check_and_update_caps(&self.pool, relay_url)
+                    .await
+                    .map(|c| c.supports_negentropy)
+                    .unwrap_or(false);
+
+                if !relay_has_neg {
+                    tracing::debug!(
+                        relay = %relay_url,
+                        "targeted crawl: primary relay has no negentropy, skipping"
+                    );
+                    continue;
+                }
+
+                let syncer = NegentropySyncer::new(
+                    self.repo.clone(),
+                    self.cache.clone(),
+                    self.pool.clone(),
+                );
+
+                tracing::info!(
+                    relay = %relay_url,
+                    authors = pubkeys.len(),
+                    "targeted crawl: phase 1 negentropy sync"
+                );
+
+                'phase1_chunks: for chunk in pubkeys.chunks(10) {
+                    let chunk_vec: Vec<String> = chunk.to_vec();
+                    match syncer.sync_authors(relay_url, &[1], &chunk_vec).await {
+                        Ok(stats) => {
+                            if stats.events_inserted > 0 {
+                                self.total_events
+                                    .fetch_add(stats.events_inserted as u64, Ordering::Relaxed);
+                                tracing::info!(
+                                    relay = %relay_url,
+                                    discovered = stats.events_discovered,
+                                    inserted = stats.events_inserted,
+                                    duration_ms = stats.duration_ms,
+                                    "targeted crawl: phase 1 negentropy complete"
+                                );
+
+                                // Fetch engagement for newly inserted notes
+                                if let Ok(note_rows) = sqlx::query_as::<_, (String,)>(
+                                    "SELECT id FROM events WHERE pubkey = ANY($1) AND kind = 1 ORDER BY created_at DESC LIMIT 200",
+                                )
+                                .bind(&chunk_vec)
+                                .fetch_all(&self.pool)
+                                .await
+                                {
+                                    let note_ids: Vec<String> =
+                                        note_rows.into_iter().map(|r| r.0).collect();
+                                    if !note_ids.is_empty() {
+                                        match self
+                                            .fetch_engagement_for_notes(relay_url, &note_ids)
+                                            .await
+                                        {
+                                            Ok(n) if n > 0 => {
+                                                tracing::info!(
+                                                    relay = %relay_url,
+                                                    engagement_events = n,
+                                                    "targeted crawl: phase 1 engagement backfill"
+                                                );
+                                            }
+                                            Err(e) => {
+                                                tracing::debug!(
+                                                    relay = %relay_url,
+                                                    error = %e,
+                                                    "targeted crawl: phase 1 engagement backfill failed"
+                                                );
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Fetch zaps received by these authors on this relay
+                            match self.fetch_zaps_for_authors(relay_url, chunk).await {
+                                Ok(n) if n > 0 => {
+                                    tracing::info!(
+                                        relay = %relay_url,
+                                        authors = chunk.len(),
+                                        zaps = n,
+                                        "targeted crawl: phase 1 zap backfill"
+                                    );
+                                }
+                                Err(e) => {
+                                    tracing::debug!(
+                                        relay = %relay_url,
+                                        error = %e,
+                                        "targeted crawl: phase 1 zap backfill failed"
+                                    );
+                                }
+                                _ => {}
+                            }
+
+                            // Update per-author stats from DB
+                            for pk in chunk {
+                                if let Ok(row) = sqlx::query_as::<_, (i64, i64, i64)>(
+                                    "SELECT count(*), COALESCE(min(created_at), 0), COALESCE(max(created_at), 0) FROM events WHERE pubkey = $1 AND kind = 1",
+                                )
+                                .bind(pk)
+                                .fetch_one(&self.pool)
+                                .await
+                                {
+                                    let entry =
+                                        author_stats.entry(pk.clone()).or_insert(AuthorCrawlStats {
+                                            new_events: 0,
+                                            oldest_ts: None,
+                                            newest_ts: None,
+                                        });
+                                    if row.1 > 0 {
+                                        entry.oldest_ts = Some(row.1);
+                                    }
+                                    if row.2 > 0 {
+                                        entry.newest_ts = Some(row.2);
+                                    }
+                                    entry.new_events = entry.new_events.max(0);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            let err_msg = e.to_string();
+                            tracing::warn!(
+                                relay = %relay_url,
+                                error = %err_msg,
+                                "targeted crawl: phase 1 negentropy failed"
+                            );
+                            // Mark relay as non-negentropy and skip remaining chunks
+                            if err_msg.contains("does not support negentropy")
+                                || err_msg.contains("negentropy disabled")
+                            {
+                                let caps = relay_caps::RelayCaps {
+                                    relay_url: relay_url.clone(),
+                                    supports_negentropy: false,
+                                    max_limit: None,
+                                    nip11: None,
+                                    last_checked_at: chrono::Utc::now(),
+                                };
+                                let _ = relay_caps::upsert_relay_caps(&self.pool, &caps).await;
+                                tracing::info!(
+                                    relay = %relay_url,
+                                    "targeted crawl: phase 1 relay marked as non-negentropy"
+                                );
+                                break 'phase1_chunks;
+                            }
+                        }
+                    }
+
+                    if self.config.legacy_request_delay_ms > 0 {
+                        sleep(Duration::from_millis(self.config.legacy_request_delay_ms)).await;
+                    }
+                }
+
+                if self.config.legacy_request_delay_ms > 0 {
+                    sleep(Duration::from_millis(self.config.legacy_request_delay_ms)).await;
+                }
+            }
+        }
+
+        // ── Phase 2: Author-specific write relays (NIP-65) ──────────────────────
+        // Additional coverage from each author's own write relays, which may hold
+        // content not yet on the primary relays (niche or personal relays).
+        // Relays already covered exhaustively in Phase 1 are skipped.
         let relay_groups = match self.router.get_relay_author_groups(&pubkeys).await {
             Ok(g) => g,
             Err(e) => {
@@ -410,14 +622,6 @@ impl HybridCrawler {
             }
         };
 
-        // Track per-author stats across all relays
-        let mut author_stats: std::collections::HashMap<String, AuthorCrawlStats> =
-            std::collections::HashMap::new();
-
-        // Track which authors got routed to a relay
-        let mut routed_pubkeys: std::collections::HashSet<String> = std::collections::HashSet::new();
-
-        // Crawl each relay group — prefer negentropy (complete diff), fall back to legacy REQ
         for (relay_url, group_pubkeys) in &relay_groups {
             for pk in group_pubkeys {
                 routed_pubkeys.insert(pk.clone());
@@ -432,6 +636,16 @@ impl HybridCrawler {
                 continue;
             }
 
+            // Skip relays already covered exhaustively in Phase 1
+            if primary_neg_set.contains(relay_url) {
+                tracing::debug!(
+                    relay = %relay_url,
+                    authors = group_pubkeys.len(),
+                    "targeted crawl: relay covered in phase 1, skipping phase 2"
+                );
+                continue;
+            }
+
             // Check if relay supports negentropy (cached in DB)
             let relay_has_neg = relay_caps::check_and_update_caps(&self.pool, relay_url)
                 .await
@@ -440,8 +654,6 @@ impl HybridCrawler {
 
             if relay_has_neg {
                 // ── Negentropy path: full set reconciliation per author ──
-                // One NEG-OPEN per author batch finds ALL missing events across
-                // all time — no Phase A/B split needed.
                 let syncer = NegentropySyncer::new(
                     self.repo.clone(),
                     self.cache.clone(),
@@ -451,7 +663,7 @@ impl HybridCrawler {
                 tracing::info!(
                     relay = %relay_url,
                     authors = group_pubkeys.len(),
-                    "targeted crawl: using negentropy per-author sync"
+                    "targeted crawl: phase 2 negentropy sync"
                 );
 
                 // Sync in sub-batches of 10 authors to keep negentropy sets manageable
@@ -470,12 +682,9 @@ impl HybridCrawler {
                                     inserted = stats.events_inserted,
                                     total = total,
                                     duration_ms = stats.duration_ms,
-                                    "targeted crawl: negentropy batch complete"
+                                    "targeted crawl: phase 2 negentropy complete"
                                 );
 
-                                // Fetch engagement (reactions/reposts/zaps) for newly inserted notes.
-                                // Query the most recent notes by these authors to backfill engagement.
-                                // Limit to 200 note IDs to avoid overwhelming the relay.
                                 if let Ok(note_rows) = sqlx::query_as::<_, (String,)>(
                                     "SELECT id FROM events WHERE pubkey = ANY($1) AND kind = 1 ORDER BY created_at DESC LIMIT 200",
                                 )
@@ -483,22 +692,25 @@ impl HybridCrawler {
                                 .fetch_all(&self.pool)
                                 .await
                                 {
-                                    let note_ids: Vec<String> = note_rows.into_iter().map(|r| r.0).collect();
+                                    let note_ids: Vec<String> =
+                                        note_rows.into_iter().map(|r| r.0).collect();
                                     if !note_ids.is_empty() {
-                                        match self.fetch_engagement_for_notes(relay_url, &note_ids).await {
+                                        match self
+                                            .fetch_engagement_for_notes(relay_url, &note_ids)
+                                            .await
+                                        {
                                             Ok(n) if n > 0 => {
                                                 tracing::info!(
                                                     relay = %relay_url,
-                                                    notes = note_ids.len(),
                                                     engagement_events = n,
-                                                    "targeted crawl: negentropy engagement backfill complete"
+                                                    "targeted crawl: phase 2 engagement backfill"
                                                 );
                                             }
                                             Err(e) => {
                                                 tracing::debug!(
                                                     relay = %relay_url,
                                                     error = %e,
-                                                    "targeted crawl: negentropy engagement backfill failed"
+                                                    "targeted crawl: phase 2 engagement backfill failed"
                                                 );
                                             }
                                             _ => {}
@@ -507,30 +719,25 @@ impl HybridCrawler {
                                 }
                             }
 
-                            // Fetch zaps received by these authors (#p tag query).
-                            // Must be a separate REQ because zap receipts are authored
-                            // by the LNURL provider, not the note author.
                             match self.fetch_zaps_for_authors(relay_url, chunk).await {
                                 Ok(n) if n > 0 => {
                                     tracing::info!(
                                         relay = %relay_url,
                                         authors = chunk.len(),
                                         zaps = n,
-                                        "targeted crawl: zap backfill complete"
+                                        "targeted crawl: phase 2 zap backfill"
                                     );
                                 }
                                 Err(e) => {
                                     tracing::debug!(
                                         relay = %relay_url,
                                         error = %e,
-                                        "targeted crawl: zap backfill failed"
+                                        "targeted crawl: phase 2 zap backfill failed"
                                     );
                                 }
                                 _ => {}
                             }
 
-                            // Update per-author stats from the events we just synced.
-                            // Query what we have per author to get accurate timestamps.
                             for pk in chunk {
                                 if let Ok(row) = sqlx::query_as::<_, (i64, i64, i64)>(
                                     "SELECT count(*), COALESCE(min(created_at), 0), COALESCE(max(created_at), 0) FROM events WHERE pubkey = $1 AND kind = 1",
@@ -539,11 +746,12 @@ impl HybridCrawler {
                                 .fetch_one(&self.pool)
                                 .await
                                 {
-                                    let entry = author_stats.entry(pk.clone()).or_insert(AuthorCrawlStats {
-                                        new_events: 0,
-                                        oldest_ts: None,
-                                        newest_ts: None,
-                                    });
+                                    let entry =
+                                        author_stats.entry(pk.clone()).or_insert(AuthorCrawlStats {
+                                            new_events: 0,
+                                            oldest_ts: None,
+                                            newest_ts: None,
+                                        });
                                     if row.1 > 0 {
                                         entry.oldest_ts = Some(row.1);
                                     }
@@ -558,12 +766,16 @@ impl HybridCrawler {
                             tracing::warn!(
                                 relay = %relay_url,
                                 error = %e,
-                                "targeted crawl: negentropy sync failed, falling back to legacy"
+                                "targeted crawl: phase 2 negentropy failed, falling back to legacy"
                             );
                             // Fall back to legacy REQ for this chunk
                             self.legacy_crawl_authors(
-                                relay_url, chunk, &target_map, &mut author_stats,
-                            ).await;
+                                relay_url,
+                                chunk,
+                                &target_map,
+                                &mut author_stats,
+                            )
+                            .await;
                         }
                     }
 
@@ -574,12 +786,19 @@ impl HybridCrawler {
             } else {
                 // ── Legacy REQ path: for relays without negentropy ──
                 self.legacy_crawl_authors(
-                    relay_url, group_pubkeys, &target_map, &mut author_stats,
-                ).await;
+                    relay_url,
+                    group_pubkeys,
+                    &target_map,
+                    &mut author_stats,
+                )
+                .await;
             }
         }
 
-        // Fall back to hardcoded relays for authors without NIP-65 data
+        // ── Phase 3: Fallback for unrouted authors (no NIP-65 data) ─────────────
+        // Authors without NIP-65 relay lists were already covered by Phase 1.
+        // Only use fallback relays that weren't already in the primary negentropy
+        // set to avoid redundant syncs. Legacy REQ is the last resort here.
         let unrouted: Vec<String> = pubkeys
             .iter()
             .filter(|pk| !routed_pubkeys.contains(*pk))
@@ -589,10 +808,15 @@ impl HybridCrawler {
         if !unrouted.is_empty() && !self.config.fallback_relay_urls.is_empty() {
             tracing::info!(
                 authors = unrouted.len(),
-                "targeted crawl: falling back to default relays for unrouted authors"
+                "targeted crawl: phase 3 — fallback for unrouted authors"
             );
 
             for relay_url in &self.config.fallback_relay_urls {
+                // Skip relays already covered in Phase 1
+                if primary_neg_set.contains(relay_url) {
+                    continue;
+                }
+
                 if self.config.dry_run {
                     tracing::info!(
                         relay = %relay_url,
@@ -602,7 +826,6 @@ impl HybridCrawler {
                     continue;
                 }
 
-                // Check negentropy support for fallback relays too
                 let relay_has_neg = relay_caps::check_and_update_caps(&self.pool, relay_url)
                     .await
                     .map(|c| c.supports_negentropy)
@@ -625,7 +848,7 @@ impl HybridCrawler {
                                     tracing::info!(
                                         relay = %relay_url,
                                         inserted = stats.events_inserted,
-                                        "targeted crawl: negentropy fallback complete"
+                                        "targeted crawl: phase 3 negentropy complete"
                                     );
                                 }
                             }
@@ -633,31 +856,34 @@ impl HybridCrawler {
                                 tracing::debug!(
                                     relay = %relay_url,
                                     error = %e,
-                                    "targeted crawl: negentropy fallback failed"
+                                    "targeted crawl: phase 3 negentropy failed"
                                 );
                             }
                         }
                     }
-                    // Fetch zaps for all unrouted authors from this fallback relay
                     match self.fetch_zaps_for_authors(relay_url, &unrouted).await {
                         Ok(n) if n > 0 => {
                             tracing::info!(
                                 relay = %relay_url,
                                 authors = unrouted.len(),
                                 zaps = n,
-                                "targeted crawl: fallback zap backfill complete"
+                                "targeted crawl: phase 3 zap backfill"
                             );
                         }
                         Err(e) => {
-                            tracing::debug!(relay = %relay_url, error = %e, "targeted crawl: fallback zap backfill failed");
+                            tracing::debug!(relay = %relay_url, error = %e, "targeted crawl: phase 3 zap backfill failed");
                         }
                         _ => {}
                     }
                     break; // negentropy gives complete diff, no need for more relays
                 } else {
                     self.legacy_crawl_authors(
-                        relay_url, &unrouted, &target_map, &mut author_stats,
-                    ).await;
+                        relay_url,
+                        &unrouted,
+                        &target_map,
+                        &mut author_stats,
+                    )
+                    .await;
                 }
 
                 if self.config.legacy_request_delay_ms > 0 {
@@ -672,7 +898,11 @@ impl HybridCrawler {
             let notes_found = stats.map_or(0, |s| s.new_events);
             let oldest = stats.and_then(|s| s.oldest_ts);
             let newest = stats.and_then(|s| s.newest_ts);
-            if let Err(e) = self.queue.mark_crawled(&target.pubkey, notes_found, oldest, newest).await {
+            if let Err(e) = self
+                .queue
+                .mark_crawled(&target.pubkey, notes_found, oldest, newest)
+                .await
+            {
                 tracing::warn!(
                     pubkey = %target.pubkey,
                     error = %e,
