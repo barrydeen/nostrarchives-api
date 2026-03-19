@@ -79,9 +79,12 @@ impl RelayRouter {
         Ok(map)
     }
 
-    /// Group pubkeys by their preferred read relays.
+    /// Group pubkeys by their preferred write relays for content fetching.
     /// Returns `HashMap<relay_url, Vec<pubkey>>`.
-    /// Only includes relays marked as read or read+write (not write-only).
+    ///
+    /// Per NIP-65, an author's **write** relays are where they publish events,
+    /// so those are the relays to query when fetching their content. Read relays
+    /// are where others should send events *to* the author (mentions, DMs).
     pub async fn get_relay_author_groups(
         &self,
         pubkeys: &[String],
@@ -92,7 +95,7 @@ impl RelayRouter {
 
         for (pubkey, prefs) in author_relays {
             for pref in prefs {
-                if pref.read {
+                if pref.write {
                     groups
                         .entry(pref.url)
                         .or_default()
