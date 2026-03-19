@@ -45,8 +45,8 @@ pub fn router(state: AppState) -> Router {
         )
         // Up-and-coming users feed
         .route("/users/upandcoming", any(ws_upandcoming_handler))
-        // Followers feed: /followers/{pubkey}
-        .route("/followers/{pubkey}", any(ws_followers_handler))
+        // Followers feed: /profiles/{pubkey}/followers
+        .route("/profiles/{pubkey}/followers", any(ws_followers_handler))
         // Ranked notes feeds: /profiles/{pubkey}/{note_type}/{metric}
         // note_type: "root" or "replies"
         // metric: "likes", "reposts", "zaps", "replies"
