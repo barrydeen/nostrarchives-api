@@ -21,6 +21,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_mv_client_leaderboard_name
     ON mv_client_leaderboard (client_name);
 
 -- 2. Relay leaderboard: relays ranked by user count from NIP-65 relay lists
+-- Filter relay_url to max 255 chars to avoid btree index size limits.
 CREATE MATERIALIZED VIEW IF NOT EXISTS mv_relay_leaderboard AS
 WITH latest_relay_lists AS (
     SELECT DISTINCT ON (pubkey) pubkey, tags
@@ -31,12 +32,13 @@ WITH latest_relay_lists AS (
 relay_urls AS (
     SELECT
         lrl.pubkey,
-        RTRIM(LOWER(tag ->> 1), '/') AS relay_url
+        LEFT(RTRIM(LOWER(tag ->> 1), '/'), 255) AS relay_url
     FROM latest_relay_lists lrl,
          jsonb_array_elements(lrl.tags::jsonb) AS tag
     WHERE tag ->> 0 = 'r'
       AND tag ->> 1 IS NOT NULL
       AND tag ->> 1 != ''
+      AND LENGTH(tag ->> 1) <= 255
 )
 SELECT relay_url, COUNT(DISTINCT pubkey)::bigint AS user_count
 FROM relay_urls
