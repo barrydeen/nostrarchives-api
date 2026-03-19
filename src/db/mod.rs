@@ -102,6 +102,10 @@ async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
             "019_analytics_materialized_views",
             include_str!("../../migrations/019_analytics_materialized_views.sql"),
         ),
+        (
+            "020_scheduled_events",
+            include_str!("../../migrations/020_scheduled_events.sql"),
+        ),
     ];
 
     for (name, sql) in migrations {

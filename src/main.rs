@@ -11,6 +11,7 @@ mod relay;
 mod social;
 mod profile_search_cache;
 mod wot_cache;
+mod scheduler;
 mod ws;
 
 use std::collections::HashSet;
@@ -355,6 +356,43 @@ async fn main() {
         .expect("invalid ws listen address");
     let ws_shutdown_rx = shutdown_tx.subscribe();
     tokio::spawn(ws::serve(state.clone(), ws_addr, ws_shutdown_rx));
+
+    // Scheduler relay (future-dated event scheduling)
+    if cfg.scheduler_enabled {
+        let scheduler_addr: SocketAddr = cfg
+            .scheduler_ws_listen_addr
+            .parse()
+            .expect("invalid scheduler ws listen address");
+
+        let scheduler_relay_router = crawler::relay_router::RelayRouter::new(pool.clone());
+        let scheduler_state = scheduler::SchedulerState {
+            pool: pool.clone(),
+            relay_router: scheduler_relay_router,
+            top_relays: Arc::new(tokio::sync::RwLock::new(Vec::new())),
+        };
+
+        // Spawn top relays cache refresher
+        tokio::spawn(scheduler::refresh_top_relays_loop(scheduler_state.clone()));
+
+        // Spawn the background publisher (checks every 60s for due events)
+        let publisher_shutdown_rx = shutdown_tx.subscribe();
+        tokio::spawn(scheduler::run_publisher(
+            scheduler_state.clone(),
+            publisher_shutdown_rx,
+        ));
+
+        // Spawn the WebSocket listener
+        let scheduler_shutdown_rx = shutdown_tx.subscribe();
+        tokio::spawn(scheduler::serve(
+            scheduler_state,
+            scheduler_addr,
+            scheduler_shutdown_rx,
+        ));
+
+        tracing::info!(addr = %scheduler_addr, "scheduler relay enabled");
+    } else {
+        tracing::info!("scheduler relay disabled");
+    }
 
     let app = api::router(state).into_make_service_with_connect_info::<SocketAddr>();
     let addr: SocketAddr = cfg.listen_addr.parse().expect("invalid listen address");

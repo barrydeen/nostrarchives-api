@@ -33,6 +33,8 @@ pub struct Config {
     pub ondemand_fetch_timeout_ms: u64,
     pub ondemand_fetch_max_relays: usize,
     pub profile_search_cache_refresh_secs: u64,
+    pub scheduler_enabled: bool,
+    pub scheduler_ws_listen_addr: String,
 }
 
 impl Config {
@@ -194,6 +196,13 @@ impl Config {
             .and_then(|v| v.parse().ok())
             .unwrap_or(86400); // Default: 24 hours
 
+        let scheduler_enabled = env::var("ENABLE_SCHEDULER")
+            .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(false);
+
+        let scheduler_ws_listen_addr = env::var("SCHEDULER_WS_LISTEN_ADDR")
+            .unwrap_or_else(|_| "0.0.0.0:8002".into());
+
         Self {
             database_url,
             redis_url,
@@ -226,6 +235,8 @@ impl Config {
             ondemand_fetch_timeout_ms,
             ondemand_fetch_max_relays,
             profile_search_cache_refresh_secs,
+            scheduler_enabled,
+            scheduler_ws_listen_addr,
         }
     }
 }
