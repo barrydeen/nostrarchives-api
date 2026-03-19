@@ -507,6 +507,28 @@ impl HybridCrawler {
                                 }
                             }
 
+                            // Fetch zaps received by these authors (#p tag query).
+                            // Must be a separate REQ because zap receipts are authored
+                            // by the LNURL provider, not the note author.
+                            match self.fetch_zaps_for_authors(relay_url, chunk).await {
+                                Ok(n) if n > 0 => {
+                                    tracing::info!(
+                                        relay = %relay_url,
+                                        authors = chunk.len(),
+                                        zaps = n,
+                                        "targeted crawl: zap backfill complete"
+                                    );
+                                }
+                                Err(e) => {
+                                    tracing::debug!(
+                                        relay = %relay_url,
+                                        error = %e,
+                                        "targeted crawl: zap backfill failed"
+                                    );
+                                }
+                                _ => {}
+                            }
+
                             // Update per-author stats from the events we just synced.
                             // Query what we have per author to get accurate timestamps.
                             for pk in chunk {
@@ -615,6 +637,21 @@ impl HybridCrawler {
                                 );
                             }
                         }
+                    }
+                    // Fetch zaps for all unrouted authors from this fallback relay
+                    match self.fetch_zaps_for_authors(relay_url, &unrouted).await {
+                        Ok(n) if n > 0 => {
+                            tracing::info!(
+                                relay = %relay_url,
+                                authors = unrouted.len(),
+                                zaps = n,
+                                "targeted crawl: fallback zap backfill complete"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::debug!(relay = %relay_url, error = %e, "targeted crawl: fallback zap backfill failed");
+                        }
+                        _ => {}
                     }
                     break; // negentropy gives complete diff, no need for more relays
                 } else {
@@ -761,6 +798,22 @@ impl HybridCrawler {
                         }
                     }
                 }
+
+                // Fetch zaps received by these authors (#p tag query)
+                match self.fetch_zaps_for_authors(relay_url, group_pubkeys).await {
+                    Ok(n) if n > 0 => {
+                        tracing::info!(
+                            relay = %relay_url,
+                            authors = group_pubkeys.len(),
+                            zaps = n,
+                            "targeted crawl: legacy zap backfill complete"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::debug!(relay = %relay_url, error = %e, "targeted crawl: legacy zap backfill failed");
+                    }
+                    _ => {}
+                }
             }
             Err(e) => {
                 tracing::warn!(
@@ -775,74 +828,82 @@ impl HybridCrawler {
             sleep(Duration::from_millis(self.config.legacy_request_delay_ms)).await;
         }
 
-        // Phase B: Historical backfill (Tier 1-2 only)
-        let backfill_pubkeys: Vec<String> = group_pubkeys
-            .iter()
-            .filter(|pk| {
-                target_map.get(*pk).map_or(false, |t| {
-                    t.priority_tier <= 2 && t.crawl_cursor.is_some()
-                })
-            })
-            .cloned()
-            .collect();
+        // Phase B: Historical backfill — per-author with individual cursors.
+        // Tiers 1-3 are included; Tier 4 (< 10 followers) is skipped.
+        // Each author uses their own crawl_cursor so mixed-age authors don't starve each other.
+        for pk in group_pubkeys {
+            let target = match target_map.get(pk) {
+                Some(t) => t,
+                None => continue,
+            };
+            if target.priority_tier > 3 {
+                continue;
+            }
+            let until_ts = match target.crawl_cursor {
+                Some(ts) => ts,
+                None => continue,
+            };
 
-        if !backfill_pubkeys.is_empty() {
-            let until_ts = backfill_pubkeys.iter().filter_map(|pk| {
-                target_map.get(pk).and_then(|t| t.crawl_cursor)
-            }).max();
+            tracing::debug!(
+                relay = %relay_url,
+                pubkey = %pk,
+                until = until_ts,
+                tier = target.priority_tier,
+                "targeted crawl: legacy phase B (backfill)"
+            );
 
-            if let Some(until) = until_ts {
-                tracing::info!(
-                    relay = %relay_url,
-                    authors = backfill_pubkeys.len(),
-                    until = until,
-                    "targeted crawl: legacy phase B (backfill)"
-                );
-
-                match self
-                    .fetch_authors_from_relay(
-                        relay_url,
-                        &backfill_pubkeys,
-                        self.config.legacy_events_per_author,
-                        None,
-                        Some(until),
-                    )
-                    .await
-                {
-                    Ok(events) => {
-                        let (new_count, new_note_ids) = self.ingest_events(&events, relay_url, author_stats).await;
-                        if new_count > 0 {
-                            let total = self
-                                .total_events
-                                .fetch_add(new_count, Ordering::Relaxed)
-                                + new_count;
-                            tracing::info!(
-                                relay = %relay_url,
-                                new = new_count,
-                                total = total,
-                                "targeted crawl: legacy backfill batch complete"
-                            );
-                        }
-                        if !new_note_ids.is_empty() {
-                            if let Ok(n) = self.fetch_engagement_for_notes(relay_url, &new_note_ids).await {
-                                if n > 0 {
-                                    tracing::info!(
-                                        relay = %relay_url,
-                                        engagement_events = n,
-                                        "targeted crawl: historical engagement complete"
-                                    );
-                                }
+            match self
+                .fetch_authors_from_relay(
+                    relay_url,
+                    std::slice::from_ref(pk),
+                    self.config.legacy_events_per_author,
+                    None,
+                    Some(until_ts),
+                )
+                .await
+            {
+                Ok(events) => {
+                    let (new_count, new_note_ids) =
+                        self.ingest_events(&events, relay_url, author_stats).await;
+                    if new_count > 0 {
+                        let total = self
+                            .total_events
+                            .fetch_add(new_count, Ordering::Relaxed)
+                            + new_count;
+                        tracing::info!(
+                            relay = %relay_url,
+                            pubkey = %pk,
+                            new = new_count,
+                            total = total,
+                            "targeted crawl: legacy backfill complete"
+                        );
+                    }
+                    if !new_note_ids.is_empty() {
+                        if let Ok(n) =
+                            self.fetch_engagement_for_notes(relay_url, &new_note_ids).await
+                        {
+                            if n > 0 {
+                                tracing::info!(
+                                    relay = %relay_url,
+                                    engagement_events = n,
+                                    "targeted crawl: historical engagement complete"
+                                );
                             }
                         }
                     }
-                    Err(e) => {
-                        tracing::warn!(
-                            relay = %relay_url,
-                            error = %e,
-                            "targeted crawl: legacy backfill fetch failed"
-                        );
-                    }
                 }
+                Err(e) => {
+                    tracing::warn!(
+                        relay = %relay_url,
+                        pubkey = %pk,
+                        error = %e,
+                        "targeted crawl: legacy backfill fetch failed"
+                    );
+                }
+            }
+
+            if self.config.legacy_request_delay_ms > 0 {
+                sleep(Duration::from_millis(self.config.legacy_request_delay_ms)).await;
             }
         }
     }
@@ -945,6 +1006,104 @@ impl HybridCrawler {
         }
 
         Ok(total_processed)
+    }
+
+    /// Fetch zap receipts (kind 9735) received by specific authors from a relay.
+    /// Uses `#p` tag filter because zaps are authored by the LNURL provider,
+    /// not the note author — so negentropy by-author doesn't find them.
+    async fn fetch_zaps_for_authors(
+        &self,
+        relay_url: &str,
+        pubkeys: &[String],
+    ) -> Result<u64, String> {
+        if pubkeys.is_empty() {
+            return Ok(0);
+        }
+
+        let connect_timeout = Duration::from_secs(10);
+        let msg_timeout = Duration::from_secs(20);
+
+        let (ws_stream, _) = timeout(connect_timeout, tokio_tungstenite::connect_async(relay_url))
+            .await
+            .map_err(|_| format!("connect timeout: {relay_url}"))?
+            .map_err(|e| format!("connect failed to {relay_url}: {e}"))?;
+
+        let (mut write, mut read) = ws_stream.split();
+        let mut total_inserted = 0u64;
+
+        // Chunk into batches of 50 authors to stay within relay filter limits
+        for chunk in pubkeys.chunks(50) {
+            let filter = serde_json::json!({
+                "kinds": [9735],
+                "#p": chunk,
+                "limit": 5000,
+            });
+
+            let sub_id = format!("zaps-{}", Uuid::new_v4().simple());
+            let req = serde_json::json!(["REQ", &sub_id, filter]);
+
+            write
+                .send(Message::Text(req.to_string().into()))
+                .await
+                .map_err(|e| format!("send REQ failed: {e}"))?;
+
+            loop {
+                match timeout(msg_timeout, read.next()).await {
+                    Ok(Some(Ok(Message::Text(text)))) => {
+                        let parsed: Value = match serde_json::from_str(&text) {
+                            Ok(v) => v,
+                            Err(_) => continue,
+                        };
+                        let arr = match parsed.as_array() {
+                            Some(a) if a.len() >= 2 => a,
+                            _ => continue,
+                        };
+                        match arr[0].as_str() {
+                            Some("EVENT") if arr.len() >= 3 => {
+                                if let Ok(event) =
+                                    serde_json::from_value::<NostrEvent>(arr[2].clone())
+                                {
+                                    if event.kind == 9735 {
+                                        match self.repo.insert_event(&event, relay_url).await {
+                                            Ok(true) => {
+                                                total_inserted += 1;
+                                                self.cache
+                                                    .on_event_ingested(&event.pubkey, event.kind)
+                                                    .await;
+                                            }
+                                            Ok(false) => {}
+                                            Err(e) => {
+                                                tracing::debug!(
+                                                    error = %e,
+                                                    "fetch_zaps_for_authors: insert failed"
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            Some("EOSE") => break,
+                            Some("CLOSED") | Some("NOTICE") => break,
+                            _ => {}
+                        }
+                    }
+                    Ok(Some(Ok(Message::Ping(data)))) => {
+                        let _ = write.send(Message::Pong(data)).await;
+                    }
+                    Ok(Some(Ok(Message::Close(_)))) | Ok(None) => break,
+                    Ok(Some(Err(e))) => return Err(format!("ws error: {e}")),
+                    Err(_) => break,
+                    _ => {}
+                }
+            }
+
+            let close_msg = serde_json::json!(["CLOSE", &sub_id]);
+            let _ = write
+                .send(Message::Text(close_msg.to_string().into()))
+                .await;
+        }
+
+        Ok(total_inserted)
     }
 
     /// Fetch kind-1 notes for specific authors from a specific relay.

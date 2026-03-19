@@ -29,6 +29,14 @@ pub struct RankedEvent {
     pub zap_sats: i64,
 }
 
+/// A missing event ID discovered during ingestion (e.g. zap target we don't have).
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct MissingEvent {
+    pub event_id: String,
+    pub relay_hint: Option<String>,
+    pub priority: i16,
+}
+
 #[derive(Debug, sqlx::FromRow, Clone)]
 pub struct ProfileRow {
     pub pubkey: String,
@@ -193,16 +201,16 @@ impl EventRepository {
     /// Process a repost (kind 6/16) as a counter increment only.
     /// Does NOT store the repost event. Uses seen_events for dedup.
     async fn process_repost_as_counter(&self, event: &NostrEvent) -> Result<bool, AppError> {
-        let target_id = event
+        let e_tag = event
             .tags
             .iter()
-            .find(|t| t.len() >= 2 && t[0] == "e")
-            .and_then(|t| t.get(1))
-            .cloned();
+            .find(|t| t.len() >= 2 && t[0] == "e");
 
-        let Some(target_id) = target_id else {
+        let Some(e_tag) = e_tag else {
             return Ok(false);
         };
+        let target_id = e_tag[1].clone();
+        let relay_hint = e_tag.get(2).filter(|s| !s.is_empty()).cloned();
 
         // Dedup via seen_events
         if self.check_seen(&event.id).await? {
@@ -223,23 +231,25 @@ impl EventRepository {
             return Ok(true);
         }
 
+        // Target not in DB — queue it for on-demand fetch
+        let _ = self.queue_missing_event(&target_id, relay_hint.as_deref(), 1).await;
         Ok(false)
     }
 
     /// Process a reaction (kind 7) as a counter increment only.
     /// Does NOT store the reaction event. Uses seen_events for dedup.
     async fn process_reaction_as_counter(&self, event: &NostrEvent) -> Result<bool, AppError> {
-        let target_id = event
+        let e_tag = event
             .tags
             .iter()
             .rev()
-            .find(|t| t.len() >= 2 && t[0] == "e")
-            .and_then(|t| t.get(1))
-            .cloned();
+            .find(|t| t.len() >= 2 && t[0] == "e");
 
-        let Some(target_id) = target_id else {
+        let Some(e_tag) = e_tag else {
             return Ok(false);
         };
+        let target_id = e_tag[1].clone();
+        let relay_hint = e_tag.get(2).filter(|s| !s.is_empty()).cloned();
 
         // Dedup via seen_events
         if self.check_seen(&event.id).await? {
@@ -260,6 +270,8 @@ impl EventRepository {
             return Ok(true);
         }
 
+        // Target not in DB — queue it for on-demand fetch
+        let _ = self.queue_missing_event(&target_id, relay_hint.as_deref(), 1).await;
         Ok(false)
     }
 
@@ -308,13 +320,25 @@ impl EventRepository {
             }
         }
 
-        sqlx::query(
+        let updated = sqlx::query(
             "UPDATE events SET zap_count = zap_count + 1, zap_amount_msats = zap_amount_msats + $2 WHERE id = $1",
         )
         .bind(&target_id)
         .bind(amount_msats)
         .execute(&self.pool)
         .await?;
+
+        if updated.rows_affected() == 0 {
+            // Zap target not in DB — high priority fetch (broken zap linkage)
+            let relay_hint = event
+                .tags
+                .iter()
+                .find(|t| t.len() >= 2 && t[0] == "e")
+                .and_then(|t| t.get(2))
+                .filter(|s| !s.is_empty())
+                .map(|s| s.as_str());
+            let _ = self.queue_missing_event(&target_id, relay_hint, 2).await;
+        }
 
         Ok(())
     }
@@ -3213,6 +3237,97 @@ impl EventRepository {
                 zap_count: recv_row.1,
             },
         })
+    }
+
+    // -----------------------------------------------------------------------
+    // Missing event queue
+    // -----------------------------------------------------------------------
+
+    /// Queue an event ID for on-demand fetching.
+    /// Called when a counter update (reaction/repost/zap) hits a target we don't have.
+    /// Idempotent — raises priority if a higher-priority entry arrives later.
+    pub async fn queue_missing_event(
+        &self,
+        event_id: &str,
+        relay_hint: Option<&str>,
+        priority: i16,
+    ) -> Result<(), AppError> {
+        if event_id.len() != 64 || !event_id.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Ok(());
+        }
+        sqlx::query(
+            "INSERT INTO missing_events (event_id, relay_hint, priority)
+             VALUES ($1, $2, $3)
+             ON CONFLICT (event_id) DO UPDATE SET
+                 priority  = GREATEST(missing_events.priority, EXCLUDED.priority),
+                 relay_hint = COALESCE(EXCLUDED.relay_hint, missing_events.relay_hint)
+             WHERE NOT missing_events.fetched",
+        )
+        .bind(event_id)
+        .bind(relay_hint)
+        .bind(priority)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Pull up to `limit` unfetched missing events, ordered by priority then discovery time.
+    pub async fn take_missing_events(&self, limit: i64) -> Result<Vec<MissingEvent>, AppError> {
+        let rows = sqlx::query_as::<_, MissingEvent>(
+            "SELECT event_id, relay_hint, priority
+             FROM missing_events
+             WHERE fetched = false AND attempt_count < 5
+             ORDER BY priority DESC, discovered_at ASC
+             LIMIT $1",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Mark a missing event as successfully fetched.
+    pub async fn mark_missing_event_fetched(&self, event_id: &str) -> Result<(), AppError> {
+        sqlx::query("UPDATE missing_events SET fetched = true WHERE event_id = $1")
+            .bind(event_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Record a failed fetch attempt so we back off and eventually give up.
+    pub async fn mark_missing_event_attempted(&self, event_id: &str) -> Result<(), AppError> {
+        sqlx::query(
+            "UPDATE missing_events
+             SET attempt_count = attempt_count + 1, last_attempted_at = NOW()
+             WHERE event_id = $1",
+        )
+        .bind(event_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Reapply engagement counters for an event that was just fetched from relays.
+    /// Uses stored seen_events (reactions/reposts) and zap_metadata (zaps) as the
+    /// source of truth, since the event had zero counters when first inserted.
+    pub async fn reapply_counters_for_event(&self, event_id: &str) -> Result<(), AppError> {
+        sqlx::query(
+            "UPDATE events SET
+                reaction_count    = (SELECT COUNT(*) FROM seen_events
+                                     WHERE target_id = $1 AND kind = 7),
+                repost_count      = (SELECT COUNT(*) FROM seen_events
+                                     WHERE target_id = $1 AND kind IN (6, 16)),
+                zap_count         = (SELECT COUNT(*) FROM zap_metadata
+                                     WHERE zapped_event_id = $1),
+                zap_amount_msats  = (SELECT COALESCE(SUM(amount_msats), 0) FROM zap_metadata
+                                     WHERE zapped_event_id = $1)
+             WHERE id = $1",
+        )
+        .bind(event_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 }
 

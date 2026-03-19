@@ -326,6 +326,75 @@ async fn main() {
         cfg.ondemand_fetch_enabled,
     ));
 
+    // Background: drain the missing_events queue.
+    // When the ingester receives a reaction/repost/zap whose target note isn't in the DB,
+    // it queues the missing event ID. This task fetches them via RelayFetcher and then
+    // reapplies engagement counters so linkage is correct.
+    {
+        let missing_repo = repo.clone();
+        let missing_fetcher = Arc::clone(&fetcher);
+        tokio::spawn(async move {
+            // Initial delay — let the service stabilize before hitting relays.
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(120));
+            loop {
+                interval.tick().await;
+                let events = match missing_repo.take_missing_events(50).await {
+                    Ok(e) => e,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "missing events: failed to take batch");
+                        continue;
+                    }
+                };
+                if events.is_empty() {
+                    continue;
+                }
+                tracing::info!(count = events.len(), "missing events: processing batch");
+                for missing in events {
+                    let hints = missing
+                        .relay_hint
+                        .as_deref()
+                        .filter(|h| !h.is_empty())
+                        .map(|h| vec![h.to_string()])
+                        .unwrap_or_default();
+                    match missing_fetcher
+                        .fetch_event_by_id(&missing.event_id, &hints)
+                        .await
+                    {
+                        Ok(Some(_)) => {
+                            if let Err(e) = missing_repo
+                                .reapply_counters_for_event(&missing.event_id)
+                                .await
+                            {
+                                tracing::debug!(error = %e, "missing events: counter reapply failed");
+                            }
+                            if let Err(e) = missing_repo
+                                .mark_missing_event_fetched(&missing.event_id)
+                                .await
+                            {
+                                tracing::debug!(error = %e, "missing events: mark fetched failed");
+                            }
+                            tracing::info!(event_id = %missing.event_id, "missing events: fetched and counters applied");
+                        }
+                        Ok(None) => {
+                            let _ = missing_repo
+                                .mark_missing_event_attempted(&missing.event_id)
+                                .await;
+                        }
+                        Err(e) => {
+                            tracing::debug!(error = %e, event_id = %missing.event_id, "missing events: fetch error");
+                            let _ = missing_repo
+                                .mark_missing_event_attempted(&missing.event_id)
+                                .await;
+                        }
+                    }
+                    // Small pause between fetches to be polite to relays
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                }
+            }
+        });
+    }
+
     // In-memory profile search cache (zero-DB-hit searches)
     let profile_search_cache = profile_search_cache::ProfileSearchCache::new(
         pool.clone(),
