@@ -258,6 +258,21 @@ async fn main() {
         }
     });
 
+    // Background: refresh analytics materialized views every 30 minutes.
+    let analytics_mv_repo = repo.clone();
+    tokio::spawn(async move {
+        // Initial delay: let migrations and profile_search finish first.
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1800));
+        loop {
+            interval.tick().await;
+            match analytics_mv_repo.refresh_analytics_views().await {
+                Ok(()) => tracing::info!("refreshed analytics materialized views"),
+                Err(e) => tracing::warn!("failed to refresh analytics views: {e}"),
+            }
+        }
+    });
+
     // Background: compute daily analytics.
     // On startup: backfill last 30 days. Then loop: sleep until next midnight UTC, compute yesterday.
     let analytics_repo = repo.clone();

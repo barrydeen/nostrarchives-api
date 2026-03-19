@@ -3,11 +3,13 @@ pub mod repository;
 
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
+use std::time::Duration;
 
 /// Initialize the database connection pool and run migrations.
 pub async fn init_pool(database_url: &str) -> Result<PgPool, sqlx::Error> {
     let pool = PgPoolOptions::new()
-        .max_connections(20)
+        .max_connections(30)
+        .acquire_timeout(Duration::from_secs(10))
         .connect(database_url)
         .await?;
 
@@ -95,6 +97,10 @@ async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
         (
             "017_update_profile_search",
             include_str!("../../migrations/017_update_profile_search.sql"),
+        ),
+        (
+            "019_analytics_materialized_views",
+            include_str!("../../migrations/019_analytics_materialized_views.sql"),
         ),
     ];
 
