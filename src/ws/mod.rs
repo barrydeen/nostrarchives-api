@@ -11,6 +11,7 @@ use serde_json::Value;
 use tokio::sync::broadcast;
 
 use crate::api::AppState;
+use std::collections::HashMap;
 
 /// Feed type determines which query backs a feed endpoint.
 #[derive(Debug, Clone)]
@@ -297,27 +298,52 @@ async fn handle_search_req(sub_id: &str, filters: &[Value], state: &AppState) ->
                 }
             }
         } else {
-            // Search profiles (kind 0) — skip for hashtag queries and empty search
-            if search_profiles && !has_hashtag_filter && !search_term.is_empty() {
-                match state.repo.search_profiles_as_events(search_term, limit).await {
-                    Ok(events) => {
-                        tracing::info!(
-                            sub_id = %sub_id,
-                            results = events.len(),
-                            "profile search completed"
-                        );
-                        for event in events {
-                            let event_msg = serde_json::to_string(
-                                &serde_json::json!(["EVENT", sub_id, event.raw.0]),
-                            )
-                            .expect("json serialization cannot fail");
-                            messages.push(event_msg);
+            // Search profiles (kind 0) — in-memory cache for ranking, then fetch raw events.
+            // Require at least 2 characters to avoid overly broad queries.
+            if search_profiles && !has_hashtag_filter && search_term.len() >= 2 {
+                // Phase 1: in-memory ranking (microseconds, no DB)
+                let ranked = state
+                    .profile_search_cache
+                    .suggest_profiles(search_term, limit)
+                    .await;
+
+                if !ranked.is_empty() {
+                    // Phase 2: fetch raw kind-0 events for the ranked pubkeys
+                    let pubkeys: Vec<String> = ranked.iter().map(|p| p.pubkey.clone()).collect();
+                    match state.repo.profile_events_for_pubkeys(&pubkeys).await {
+                        Ok(events) => {
+                            // Re-sort events by the in-memory ranking order
+                            let order: HashMap<&str, usize> = pubkeys
+                                .iter()
+                                .enumerate()
+                                .map(|(i, pk)| (pk.as_str(), i))
+                                .collect();
+                            let mut sorted = events;
+                            sorted.sort_by_key(|e| order.get(e.pubkey.as_str()).copied().unwrap_or(usize::MAX));
+
+                            tracing::info!(
+                                sub_id = %sub_id,
+                                results = sorted.len(),
+                                "profile search completed (in-memory)"
+                            );
+                            for event in sorted {
+                                let event_msg = serde_json::to_string(
+                                    &serde_json::json!(["EVENT", sub_id, event.raw.0]),
+                                )
+                                .expect("json serialization cannot fail");
+                                messages.push(event_msg);
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!(error = %e, "profile event fetch failed");
+                            messages.push(notice(&format!("error: profile search failed: {e}")));
                         }
                     }
-                    Err(e) => {
-                        tracing::error!(error = %e, "profile search failed");
-                        messages.push(notice(&format!("error: profile search failed: {e}")));
-                    }
+                } else {
+                    tracing::info!(
+                        sub_id = %sub_id,
+                        "profile search: no in-memory matches"
+                    );
                 }
             }
 
