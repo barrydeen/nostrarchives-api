@@ -10,7 +10,7 @@
 //! - Maximum 500 results per request
 //! - Rate limited to 30 requests per minute per IP
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -141,23 +141,6 @@ async fn ws_handler(
 
 async fn handle_connection(socket: WebSocket, state: IndexerState, client_ip: IpAddr) {
     let (mut sink, mut stream) = socket.split();
-
-    // Send relay info on connect
-    let info = serde_json::json!({
-        "name": "nostrarchives-indexer",
-        "description": "Restricted relay serving profile metadata (kind 0), follow lists (kind 3), and relay lists (kind 10002)",
-        "supported_nips": [1, 11],
-        "software": "nostrarchives-indexer",
-        "limitation": {
-            "max_filters": 10,
-            "max_authors": MAX_AUTHORS,
-            "max_results": MAX_RESULTS,
-            "rate_limit_per_minute": RATE_LIMIT_MAX,
-            "allowed_kinds": ALLOWED_KINDS,
-            "auth_required": false,
-            "payment_required": false,
-        }
-    });
 
     // Keepalive ping
     let (close_tx, mut close_rx) = tokio::sync::oneshot::channel::<()>();
@@ -375,7 +358,6 @@ fn validate_kinds(filter: &Value, filter_idx: usize) -> Result<(), String> {
         ));
     }
 
-    let mut seen = HashSet::new();
     for k in kinds_arr {
         let kind = match k.as_i64() {
             Some(n) => n,
@@ -401,8 +383,6 @@ fn validate_kinds(filter: &Value, filter_idx: usize) -> Result<(), String> {
                 filter_idx + 1,
             ));
         }
-
-        seen.insert(kind);
     }
 
     Ok(())
