@@ -35,6 +35,8 @@ pub struct Config {
     pub profile_search_cache_refresh_secs: u64,
     pub scheduler_enabled: bool,
     pub scheduler_ws_listen_addr: String,
+    pub indexer_enabled: bool,
+    pub indexer_ws_listen_addr: String,
 }
 
 impl Config {
@@ -203,6 +205,13 @@ impl Config {
         let scheduler_ws_listen_addr = env::var("SCHEDULER_WS_LISTEN_ADDR")
             .unwrap_or_else(|_| "0.0.0.0:8002".into());
 
+        let indexer_enabled = env::var("ENABLE_INDEXER")
+            .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(true);
+
+        let indexer_ws_listen_addr =
+            env::var("INDEXER_WS_LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:8003".into());
+
         Self {
             database_url,
             redis_url,
@@ -237,6 +246,8 @@ impl Config {
             profile_search_cache_refresh_secs,
             scheduler_enabled,
             scheduler_ws_listen_addr,
+            indexer_enabled,
+            indexer_ws_listen_addr,
         }
     }
 }

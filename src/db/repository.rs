@@ -834,6 +834,60 @@ impl EventRepository {
         Ok(rows)
     }
 
+    /// Fetch the latest events matching specific kinds and authors.
+    ///
+    /// For replaceable kinds (0, 3, 10002) returns only the latest per (pubkey, kind).
+    /// Supports optional since/until timestamp filters. Results ordered by created_at DESC.
+    pub async fn events_by_kinds_and_authors(
+        &self,
+        kinds: &[i32],
+        authors: &[String],
+        since: Option<i64>,
+        until: Option<i64>,
+        limit: i64,
+    ) -> Result<Vec<StoredEvent>, AppError> {
+        if authors.is_empty() || kinds.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // For replaceable event kinds we want DISTINCT ON (pubkey, kind)
+        // to return only the latest version per author per kind.
+        let mut sql = String::from(
+            r#"SELECT DISTINCT ON (pubkey, kind)
+                id, pubkey, created_at, kind, content, sig, tags, raw, relay_url, received_at
+            FROM events
+            WHERE kind = ANY($1) AND pubkey = ANY($2)"#,
+        );
+
+        let mut param_idx = 3u32;
+
+        if since.is_some() {
+            sql.push_str(&format!(" AND created_at >= ${param_idx}"));
+            param_idx += 1;
+        }
+        if until.is_some() {
+            sql.push_str(&format!(" AND created_at <= ${param_idx}"));
+            // param_idx += 1; // not needed further
+        }
+
+        sql.push_str(" ORDER BY pubkey, kind, created_at DESC");
+        sql.push_str(&format!(" LIMIT {limit}"));
+
+        let mut query = sqlx::query_as::<_, StoredEvent>(&sql)
+            .bind(kinds)
+            .bind(authors);
+
+        if let Some(s) = since {
+            query = query.bind(s);
+        }
+        if let Some(u) = until {
+            query = query.bind(u);
+        }
+
+        let rows = query.fetch_all(&self.pool).await?;
+        Ok(rows)
+    }
+
     /// Get a single event by ID.
     pub async fn get_event_by_id(&self, id: &str) -> Result<Option<StoredEvent>, AppError> {
         let event = sqlx::query_as::<_, StoredEvent>(
