@@ -1409,10 +1409,9 @@ impl EventRepository {
 
         let rows = sqlx::query_as::<_, (String, i64, i64)>(
             r#"
-            SELECT pubkey, MIN(created_at) AS first_seen, COUNT(*) AS event_count
-            FROM events
-            GROUP BY pubkey
-            HAVING MIN(created_at) >= $1
+            SELECT pubkey, first_seen, event_count
+            FROM mv_pubkey_first_seen
+            WHERE first_seen >= $1
             ORDER BY first_seen DESC
             LIMIT $2 OFFSET $3
             "#,
@@ -2479,6 +2478,27 @@ impl EventRepository {
         Ok(())
     }
 
+    /// Refresh the analytics materialized views (client leaderboard, relay leaderboard, pubkey first-seen).
+    /// These are heavy aggregations that should only run periodically (every 30-60 min).
+    pub async fn refresh_analytics_views(&self) -> Result<(), AppError> {
+        sqlx::query("REFRESH MATERIALIZED VIEW CONCURRENTLY mv_client_leaderboard")
+            .execute(&self.pool)
+            .await?;
+        tracing::info!("refreshed mv_client_leaderboard");
+
+        sqlx::query("REFRESH MATERIALIZED VIEW CONCURRENTLY mv_relay_leaderboard")
+            .execute(&self.pool)
+            .await?;
+        tracing::info!("refreshed mv_relay_leaderboard");
+
+        sqlx::query("REFRESH MATERIALIZED VIEW CONCURRENTLY mv_pubkey_first_seen")
+            .execute(&self.pool)
+            .await?;
+        tracing::info!("refreshed mv_pubkey_first_seen");
+
+        Ok(())
+    }
+
     /// Get trending hashtags from kind-1 notes in the last 24 hours.
     pub async fn trending_hashtags(
         &self,
@@ -2529,18 +2549,8 @@ impl EventRepository {
     ) -> Result<Vec<super::models::ClientEntry>, AppError> {
         let rows = sqlx::query_as::<_, (String, i64, i64)>(
             r#"
-            SELECT LOWER(tag_elem->>1)                    AS client_name,
-                   COUNT(DISTINCT e.id)::bigint           AS note_count,
-                   COUNT(DISTINCT e.pubkey)::bigint       AS user_count
-            FROM events e
-            JOIN profile_search ps ON ps.pubkey = e.pubkey AND ps.follower_count >= 1,
-                 jsonb_array_elements(e.tags) AS tag_elem
-            WHERE tag_elem->>0 = 'client'
-              AND e.kind = 1
-              AND LENGTH(tag_elem->>1) BETWEEN 1 AND 100
-              AND LOWER(tag_elem->>1) NOT IN ('mostr')
-            GROUP BY LOWER(tag_elem->>1)
-            HAVING COUNT(DISTINCT e.id) >= 2
+            SELECT client_name, note_count, user_count
+            FROM mv_client_leaderboard
             ORDER BY note_count DESC
             LIMIT $1 OFFSET $2
             "#,
@@ -2569,26 +2579,8 @@ impl EventRepository {
     ) -> Result<Vec<super::models::RelayLeaderboardEntry>, AppError> {
         let rows = sqlx::query_as::<_, (String, i64)>(
             r#"
-            WITH latest_relay_lists AS (
-                SELECT DISTINCT ON (pubkey) pubkey, tags
-                FROM events
-                WHERE kind = 10002
-                ORDER BY pubkey, created_at DESC
-            ),
-            relay_urls AS (
-                SELECT
-                    lrl.pubkey,
-                    RTRIM(LOWER(tag ->> 1), '/') AS relay_url
-                FROM latest_relay_lists lrl,
-                     jsonb_array_elements(lrl.tags::jsonb) AS tag
-                WHERE tag ->> 0 = 'r'
-                  AND tag ->> 1 IS NOT NULL
-                  AND tag ->> 1 != ''
-            )
-            SELECT relay_url, COUNT(DISTINCT pubkey)::bigint AS user_count
-            FROM relay_urls
-            WHERE relay_url LIKE 'wss://%' OR relay_url LIKE 'ws://%'
-            GROUP BY relay_url
+            SELECT relay_url, user_count
+            FROM mv_relay_leaderboard
             ORDER BY user_count DESC
             LIMIT $1 OFFSET $2
             "#,
