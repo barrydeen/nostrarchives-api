@@ -472,6 +472,39 @@ impl HybridCrawler {
                                     duration_ms = stats.duration_ms,
                                     "targeted crawl: negentropy batch complete"
                                 );
+
+                                // Fetch engagement (reactions/reposts/zaps) for newly inserted notes.
+                                // Query the most recent notes by these authors to backfill engagement.
+                                // Limit to 200 note IDs to avoid overwhelming the relay.
+                                if let Ok(note_rows) = sqlx::query_as::<_, (String,)>(
+                                    "SELECT id FROM events WHERE pubkey = ANY($1) AND kind = 1 ORDER BY created_at DESC LIMIT 200",
+                                )
+                                .bind(&chunk_vec)
+                                .fetch_all(&self.pool)
+                                .await
+                                {
+                                    let note_ids: Vec<String> = note_rows.into_iter().map(|r| r.0).collect();
+                                    if !note_ids.is_empty() {
+                                        match self.fetch_engagement_for_notes(relay_url, &note_ids).await {
+                                            Ok(n) if n > 0 => {
+                                                tracing::info!(
+                                                    relay = %relay_url,
+                                                    notes = note_ids.len(),
+                                                    engagement_events = n,
+                                                    "targeted crawl: negentropy engagement backfill complete"
+                                                );
+                                            }
+                                            Err(e) => {
+                                                tracing::debug!(
+                                                    relay = %relay_url,
+                                                    error = %e,
+                                                    "targeted crawl: negentropy engagement backfill failed"
+                                                );
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                }
                             }
 
                             // Update per-author stats from the events we just synced.
@@ -489,15 +522,12 @@ impl HybridCrawler {
                                         oldest_ts: None,
                                         newest_ts: None,
                                     });
-                                    // We don't know exactly how many were new per author,
-                                    // but set timestamps for cursor updates
                                     if row.1 > 0 {
                                         entry.oldest_ts = Some(row.1);
                                     }
                                     if row.2 > 0 {
                                         entry.newest_ts = Some(row.2);
                                     }
-                                    // Mark as crawled even if 0 new (negentropy confirmed complete)
                                     entry.new_events = entry.new_events.max(0);
                                 }
                             }
