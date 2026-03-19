@@ -24,6 +24,13 @@ enum FeedKind {
     Trending { metric: String, range: String },
     /// Up-and-coming users feed — returns a NIP-51 kind 30000 people list.
     UpAndComing,
+    /// Followers feed: returns kind-0 profiles for all followers of a pubkey.
+    Followers { pubkey: String },
+    /// Ranked notes feed: a specific pubkey's root notes or replies ordered by a metric.
+    /// pubkey: hex pubkey
+    /// note_type: "root" | "replies"
+    /// metric: "likes" | "reposts" | "zaps" | "replies"
+    RankedNotes { pubkey: String, note_type: String, metric: String },
 }
 
 /// Build the WebSocket relay router.
@@ -38,6 +45,12 @@ pub fn router(state: AppState) -> Router {
         )
         // Up-and-coming users feed
         .route("/users/upandcoming", any(ws_upandcoming_handler))
+        // Followers feed: /followers/{pubkey}
+        .route("/followers/{pubkey}", any(ws_followers_handler))
+        // Ranked notes feeds: /profiles/{pubkey}/{note_type}/{metric}
+        // note_type: "root" or "replies"
+        // metric: "likes", "reposts", "zaps", "replies"
+        .route("/profiles/{pubkey}/{note_type}/{metric}", any(ws_ranked_notes_handler))
         .with_state(state)
 }
 
@@ -83,6 +96,26 @@ async fn ws_trending_handler(
 ) -> impl IntoResponse {
     ws.on_upgrade(move |socket| {
         handle_connection(socket, state, FeedKind::Trending { metric, range })
+    })
+}
+
+async fn ws_followers_handler(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+    Path(pubkey): Path<String>,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| {
+        handle_connection(socket, state, FeedKind::Followers { pubkey })
+    })
+}
+
+async fn ws_ranked_notes_handler(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+    Path((pubkey, note_type, metric)): Path<(String, String, String)>,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| {
+        handle_connection(socket, state, FeedKind::RankedNotes { pubkey, note_type, metric })
     })
 }
 
@@ -184,6 +217,12 @@ async fn handle_req(arr: &[Value], state: &AppState, feed_kind: &FeedKind) -> Ve
         }
         FeedKind::UpAndComing => {
             handle_upandcoming_req(&sub_id, &arr[2..], state).await
+        }
+        FeedKind::Followers { pubkey } => {
+            handle_followers_req(&sub_id, &arr[2..], state, pubkey).await
+        }
+        FeedKind::RankedNotes { pubkey, note_type, metric } => {
+            handle_ranked_notes_req(&sub_id, &arr[2..], state, &pubkey, &note_type, &metric).await
         }
     }
 }
@@ -679,6 +718,243 @@ async fn handle_upandcoming_req(
             tracing::error!(error = %e, "failed to fetch profile events");
             vec![
                 notice("error: failed to fetch profile events"),
+                eose(sub_id),
+            ]
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Followers feed handler
+// ---------------------------------------------------------------------------
+
+/// Followers feed: returns kind-0 profile events for ALL followers of a pubkey.
+///
+/// Protocol:
+///   Client: ["REQ", "<sub_id>", {}]
+///   Relay:  ["EVENT", "<sub_id>", <kind-0>] ... ["EOSE", "<sub_id>"]
+async fn handle_followers_req(
+    sub_id: &str,
+    _filters: &[Value],
+    state: &AppState,
+    pubkey: &str,
+) -> Vec<String> {
+    tracing::info!(sub_id = %sub_id, pubkey = %pubkey, "followers feed request");
+
+    // Validate pubkey format
+    if pubkey.len() != 64 || !pubkey.chars().all(|c| c.is_ascii_hexdigit()) {
+        return vec![
+            notice(&format!("invalid pubkey: {pubkey}")),
+            eose(sub_id),
+        ];
+    }
+
+    // Cache key for this follower list
+    let cache_key = format!("ws:followers:{pubkey}");
+
+    // Try cache first
+    if let Some(cached) = state.cache.get_json(&cache_key).await {
+        if let Ok(raw_events) = serde_json::from_str::<Vec<Value>>(&cached) {
+            let mut messages = Vec::with_capacity(raw_events.len() + 1);
+            for raw in &raw_events {
+                let msg = serde_json::to_string(&serde_json::json!(["EVENT", sub_id, raw]))
+                    .expect("json serialization cannot fail");
+                messages.push(msg);
+            }
+            tracing::info!(sub_id = %sub_id, pubkey = %pubkey, profiles = raw_events.len(), "followers feed served (cache hit)");
+            messages.push(eose(sub_id));
+            return messages;
+        }
+    }
+
+    // Cache miss — get all follower pubkeys
+    let follower_pubkeys = match state.repo.all_follower_pubkeys(pubkey).await {
+        Ok(pks) => pks,
+        Err(e) => {
+            tracing::error!(error = %e, "followers query failed");
+            return vec![
+                notice("error: failed to fetch followers"),
+                eose(sub_id),
+            ];
+        }
+    };
+
+    if follower_pubkeys.is_empty() {
+        return vec![eose(sub_id)];
+    }
+
+    tracing::info!(sub_id = %sub_id, pubkey = %pubkey, followers = follower_pubkeys.len(), "fetching kind-0 profiles for followers");
+
+    // Fetch kind-0 events in batches to avoid overly large queries
+    let mut all_events = Vec::new();
+    for chunk in follower_pubkeys.chunks(500) {
+        match state.repo.profile_events_for_pubkeys(&chunk.to_vec()).await {
+            Ok(events) => all_events.extend(events),
+            Err(e) => {
+                tracing::error!(error = %e, "profile event fetch failed for follower batch");
+            }
+        }
+    }
+
+    let raw_events: Vec<&Value> = all_events.iter().map(|e| &e.raw.0).collect();
+    let mut messages = Vec::with_capacity(all_events.len() + 1);
+    for raw in &raw_events {
+        let msg = serde_json::to_string(&serde_json::json!(["EVENT", sub_id, raw]))
+            .expect("json serialization cannot fail");
+        messages.push(msg);
+    }
+
+    // Cache for 10 minutes
+    if let Ok(json_str) = serde_json::to_string(&raw_events) {
+        state.cache.set_json(&cache_key, &json_str, 600).await;
+    }
+
+    tracing::info!(sub_id = %sub_id, pubkey = %pubkey, profiles = all_events.len(), "followers feed served (cache miss)");
+    messages.push(eose(sub_id));
+    messages
+}
+
+// ---------------------------------------------------------------------------
+// Ranked notes feed handler
+// ---------------------------------------------------------------------------
+
+/// Validate note_type: "root" or "replies".
+fn validate_note_type(note_type: &str) -> bool {
+    matches!(note_type, "root" | "replies")
+}
+
+/// Validate ranking metric: "likes", "reposts", "zaps", "replies".
+fn validate_ranking_metric(metric: &str) -> bool {
+    matches!(metric, "likes" | "reposts" | "zaps" | "replies")
+}
+
+/// Ranked notes feed: a pubkey's root notes or replies ordered by a specific metric.
+///
+/// Routes:
+///   /profiles/{pubkey}/root/likes      — pubkey's root notes ordered by reaction_count
+///   /profiles/{pubkey}/root/reposts    — pubkey's root notes ordered by repost_count
+///   /profiles/{pubkey}/root/zaps       — pubkey's root notes ordered by zap_amount_msats
+///   /profiles/{pubkey}/root/replies    — pubkey's root notes ordered by reply_count
+///   /profiles/{pubkey}/replies/likes   — pubkey's replies ordered by reaction_count
+///   /profiles/{pubkey}/replies/reposts — pubkey's replies ordered by repost_count
+///   /profiles/{pubkey}/replies/zaps    — pubkey's replies ordered by zap_amount_msats
+///   /profiles/{pubkey}/replies/replies — pubkey's replies ordered by reply_count
+///
+/// Protocol:
+///   Client: ["REQ", "<sub_id>", {"limit": 50}]
+///   Relay:  ["EVENT", "<sub_id>", <kind-1>] ... ["EOSE", "<sub_id>"]
+async fn handle_ranked_notes_req(
+    sub_id: &str,
+    filters: &[Value],
+    state: &AppState,
+    pubkey: &str,
+    note_type: &str,
+    metric: &str,
+) -> Vec<String> {
+    // Validate pubkey format
+    if pubkey.len() != 64 || !pubkey.chars().all(|c| c.is_ascii_hexdigit()) {
+        return vec![
+            notice(&format!("invalid pubkey: {pubkey}")),
+            eose(sub_id),
+        ];
+    }
+    // Validate note_type
+    if !validate_note_type(note_type) {
+        return vec![
+            notice(&format!(
+                "invalid note_type: {note_type}. Use: root, replies"
+            )),
+            eose(sub_id),
+        ];
+    }
+
+    // Validate metric
+    if !validate_ranking_metric(metric) {
+        return vec![
+            notice(&format!(
+                "invalid metric: {metric}. Use: likes, reposts, zaps, replies"
+            )),
+            eose(sub_id),
+        ];
+    }
+
+    let filter = filters.first().unwrap_or(&Value::Null);
+    let limit = filter
+        .get("limit")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(50)
+        .clamp(1, 500);
+
+    let is_reply = note_type == "replies";
+
+    tracing::info!(
+        sub_id = %sub_id,
+        pubkey = %pubkey,
+        note_type = %note_type,
+        metric = %metric,
+        limit = limit,
+        "ranked notes feed request"
+    );
+
+    // Cache key (per pubkey)
+    let cache_key = format!("ws:ranked:{pubkey}:{note_type}:{metric}:{limit}");
+
+    // Try cache first
+    if let Some(cached) = state.cache.get_json(&cache_key).await {
+        if let Ok(raw_events) = serde_json::from_str::<Vec<Value>>(&cached) {
+            let mut messages = Vec::with_capacity(raw_events.len() + 1);
+            for raw in &raw_events {
+                let msg = serde_json::to_string(&serde_json::json!(["EVENT", sub_id, raw]))
+                    .expect("json serialization cannot fail");
+                messages.push(msg);
+            }
+            tracing::info!(
+                sub_id = %sub_id,
+                note_type = %note_type,
+                metric = %metric,
+                events = raw_events.len(),
+                "ranked notes feed served (cache hit)"
+            );
+            messages.push(eose(sub_id));
+            return messages;
+        }
+    }
+
+    // Cache miss — query DB
+    match state.repo.ranked_notes_by_pubkey(pubkey, is_reply, metric, limit, 0).await {
+        Ok((ranked, _profiles)) => {
+            let raw_events: Vec<&Value> = ranked.iter().map(|e| &e.event.raw.0).collect();
+            let mut messages = Vec::with_capacity(ranked.len() + 1);
+            for raw in &raw_events {
+                let msg = serde_json::to_string(&serde_json::json!(["EVENT", sub_id, raw]))
+                    .expect("json serialization cannot fail");
+                messages.push(msg);
+            }
+
+            // Cache for 5 minutes
+            if let Ok(json_str) = serde_json::to_string(&raw_events) {
+                state.cache.set_json(&cache_key, &json_str, 300).await;
+            }
+
+            tracing::info!(
+                sub_id = %sub_id,
+                note_type = %note_type,
+                metric = %metric,
+                events = ranked.len(),
+                "ranked notes feed served (cache miss)"
+            );
+            messages.push(eose(sub_id));
+            messages
+        }
+        Err(e) => {
+            tracing::error!(
+                note_type = %note_type,
+                metric = %metric,
+                error = %e,
+                "failed to fetch ranked notes"
+            );
+            vec![
+                notice("error: failed to fetch ranked notes"),
                 eose(sub_id),
             ]
         }

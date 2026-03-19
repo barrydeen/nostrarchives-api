@@ -3067,6 +3067,122 @@ impl EventRepository {
         Ok((entries, total, profile_rows))
     }
 
+    /// Return ALL follower pubkeys for a given pubkey (no limit).
+    pub async fn all_follower_pubkeys(
+        &self,
+        pubkey: &str,
+    ) -> Result<Vec<String>, AppError> {
+        let rows = sqlx::query_scalar::<_, String>(
+            "SELECT follower_pubkey
+             FROM follows
+             WHERE followed_pubkey = $1
+             ORDER BY created_at DESC",
+        )
+        .bind(pubkey)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows)
+    }
+
+    /// A pubkey's kind-1 notes ranked by a specific metric, filtered by root/reply status.
+    ///
+    /// `pubkey`: hex pubkey to scope the query
+    /// `is_reply`: false = root notes only, true = replies only
+    /// `metric`: "likes" | "reposts" | "zaps" | "replies"
+    pub async fn ranked_notes_by_pubkey(
+        &self,
+        pubkey: &str,
+        is_reply: bool,
+        metric: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<RankedEvent>, Vec<ProfileRow>), AppError> {
+        let order_col = match metric {
+            "likes" => "reaction_count",
+            "reposts" => "repost_count",
+            "zaps" => "zap_amount_msats",
+            "replies" => "reply_count",
+            _ => "reaction_count",
+        };
+
+        let reply_filter = if is_reply { "AND e.is_reply = true" } else { "AND NOT e.is_reply" };
+
+        let sql = format!(
+            r#"
+            SELECT
+                e.id, e.pubkey, e.created_at, e.kind, e.content, e.sig,
+                e.tags, e.raw, e.relay_url, e.received_at,
+                e.reaction_count::bigint AS reactions,
+                e.repost_count::bigint AS reposts,
+                e.reply_count::bigint AS replies,
+                e.zap_count::bigint AS zaps,
+                e.zap_amount_msats,
+                {order_col}::bigint AS metric_count
+            FROM events e
+            WHERE e.kind = 1
+              AND e.pubkey = $1
+              {reply_filter}
+              AND {order_col} > 0
+            ORDER BY {order_col} DESC, e.created_at DESC
+            LIMIT $2 OFFSET $3
+            "#
+        );
+
+        let rows = sqlx::query(&sql)
+            .bind(pubkey)
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&self.pool)
+            .await?;
+
+        let is_zap = metric == "zaps";
+
+        let mut pubkeys = Vec::new();
+        let events: Vec<RankedEvent> = rows
+            .into_iter()
+            .map(|row| -> Result<RankedEvent, sqlx::Error> {
+                let pubkey: String = row.try_get("pubkey")?;
+                pubkeys.push(pubkey.clone());
+                let event = StoredEvent {
+                    id: row.try_get("id")?,
+                    pubkey,
+                    created_at: row.try_get("created_at")?,
+                    kind: row.try_get("kind")?,
+                    content: row.try_get("content")?,
+                    sig: row.try_get("sig")?,
+                    tags: row.try_get("tags")?,
+                    raw: row.try_get("raw")?,
+                    relay_url: row.try_get("relay_url").ok(),
+                    received_at: row.try_get("received_at")?,
+                };
+                let count: i64 = row.try_get("metric_count")?;
+                let zap_msats: i64 = row.try_get("zap_amount_msats")?;
+                let total_sats = if is_zap { Some(zap_msats / 1000) } else { None };
+                Ok(RankedEvent {
+                    event,
+                    count,
+                    total_sats,
+                    reactions: row.try_get::<i64, _>("reactions").unwrap_or(0),
+                    replies: row.try_get::<i64, _>("replies").unwrap_or(0),
+                    reposts: row.try_get::<i64, _>("reposts").unwrap_or(0),
+                    zap_sats: zap_msats / 1000,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let unique_pubkeys: Vec<String> = {
+            let mut seen = HashSet::new();
+            pubkeys
+                .into_iter()
+                .filter(|pk| seen.insert(pk.clone()))
+                .collect()
+        };
+        let profiles = self.latest_profile_metadata(&unique_pubkeys).await?;
+
+        Ok((events, profiles))
+    }
+
     /// Aggregate zap stats for a pubkey (total sent + received).
     pub async fn profile_zap_stats(
         &self,
