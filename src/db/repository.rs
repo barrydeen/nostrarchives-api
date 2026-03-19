@@ -3,8 +3,8 @@ use std::collections::HashSet;
 use sqlx::{PgPool, Row};
 
 use super::models::{
-    DailyStats, EventInteractions, EventQuery, EventRef, EventThread, KindCount, 
-    MostLikedAuthor, MostSharedAuthor, NewUser, NostrEvent, StoredEvent, TopPoster, 
+    DailyStats, EventInteractions, EventQuery, EventRef, EventThread, KindCount,
+    NewUser, NostrEvent, StoredEvent,
     TrendingNote, TrendingUser,
 };
 use crate::error::AppError;
@@ -44,16 +44,6 @@ pub struct ProfileRow {
 }
 
 /// Convert a range string to a timestamp for filtering.
-fn range_to_since(range: &str) -> i64 {
-    let now = chrono::Utc::now().timestamp();
-    match range {
-        "today" => now - 86400,
-        "7d" => now - 7 * 86400,
-        "30d" => now - 30 * 86400,
-        "all" => 0,
-        _ => now - 7 * 86400,
-    }
-}
 
 /// Calculate cache TTL in seconds based on range.
 fn range_cache_ttl(range: &str) -> u64 {
@@ -1611,87 +1601,31 @@ impl EventRepository {
         limit: i64,
         offset: i64,
     ) -> Result<Vec<super::models::TopZapper>, AppError> {
-        let since = range_to_since(range);
-
-        let rows = if direction == "sent" {
-            // Sender pubkey is inside the embedded zap request JSON (description tag)
-            if since == 0 {
-                sqlx::query_as::<_, (String, i64, i64)>(
-                    r#"
-                    SELECT sender_pubkey AS pubkey,
-                           (SUM(amount_msats) / 1000)::bigint AS total_sats,
-                           COUNT(*)::bigint AS zap_count
-                    FROM zap_metadata
-                    WHERE sender_pubkey IS NOT NULL AND sender_pubkey != ''
-                    GROUP BY sender_pubkey
-                    ORDER BY total_sats DESC
-                    LIMIT $1 OFFSET $2
-                    "#,
-                )
-                .bind(limit)
-                .bind(offset)
-                .fetch_all(&self.pool)
-                .await?
-            } else {
-                sqlx::query_as::<_, (String, i64, i64)>(
-                    r#"
-                    SELECT sender_pubkey AS pubkey,
-                           (SUM(amount_msats) / 1000)::bigint AS total_sats,
-                           COUNT(*)::bigint AS zap_count
-                    FROM zap_metadata
-                    WHERE sender_pubkey IS NOT NULL AND sender_pubkey != ''
-                      AND created_at >= $1
-                    GROUP BY sender_pubkey
-                    ORDER BY total_sats DESC
-                    LIMIT $2 OFFSET $3
-                    "#,
-                )
-                .bind(since)
-                .bind(limit)
-                .bind(offset)
-                .fetch_all(&self.pool)
-                .await?
-            }
-        } else {
-            // Received: recipient is the p tag on the zap receipt
-            if since == 0 {
-                sqlx::query_as::<_, (String, i64, i64)>(
-                    r#"
-                    SELECT recipient_pubkey AS pubkey,
-                           (SUM(amount_msats) / 1000)::bigint AS total_sats,
-                           COUNT(*)::bigint AS zap_count
-                    FROM zap_metadata
-                    WHERE recipient_pubkey IS NOT NULL AND recipient_pubkey != ''
-                    GROUP BY recipient_pubkey
-                    ORDER BY total_sats DESC
-                    LIMIT $1 OFFSET $2
-                    "#,
-                )
-                .bind(limit)
-                .bind(offset)
-                .fetch_all(&self.pool)
-                .await?
-            } else {
-                sqlx::query_as::<_, (String, i64, i64)>(
-                    r#"
-                    SELECT recipient_pubkey AS pubkey,
-                           (SUM(amount_msats) / 1000)::bigint AS total_sats,
-                           COUNT(*)::bigint AS zap_count
-                    FROM zap_metadata
-                    WHERE recipient_pubkey IS NOT NULL AND recipient_pubkey != ''
-                      AND created_at >= $1
-                    GROUP BY recipient_pubkey
-                    ORDER BY total_sats DESC
-                    LIMIT $2 OFFSET $3
-                    "#,
-                )
-                .bind(since)
-                .bind(limit)
-                .bind(offset)
-                .fetch_all(&self.pool)
-                .await?
-            }
+        let (sats_col, count_col) = match range {
+            "today" => ("sats_today", "count_today"),
+            "7d"    => ("sats_7d",    "count_7d"),
+            "30d"   => ("sats_30d",   "count_30d"),
+            _       => ("sats_all",   "count_all"),
         };
+
+        let sql = format!(
+            r#"
+            SELECT pubkey, {sats_col} AS total_sats, {count_col} AS zap_count
+            FROM mv_zapper_leaderboards
+            WHERE direction = $1 AND {sats_col} > 0
+            ORDER BY {sats_col} DESC
+            LIMIT $2 OFFSET $3
+            "#,
+            sats_col = sats_col,
+            count_col = count_col,
+        );
+
+        let rows = sqlx::query_as::<_, (String, i64, i64)>(&sql)
+            .bind(direction)
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&self.pool)
+            .await?;
 
         Ok(rows
             .into_iter()
@@ -1710,40 +1644,29 @@ impl EventRepository {
         limit: i64,
         offset: i64,
     ) -> Result<Vec<super::models::TopPoster>, AppError> {
-        let since = range_to_since(range);
-
-        let rows = if since == 0 {
-            sqlx::query_as::<_, (String, i64)>(
-                r#"
-                SELECT pubkey, COUNT(*) as note_count
-                FROM events
-                WHERE kind = 1
-                GROUP BY pubkey
-                ORDER BY note_count DESC
-                LIMIT $1 OFFSET $2
-                "#,
-            )
-            .bind(limit)
-            .bind(offset)
-            .fetch_all(&self.pool)
-            .await?
-        } else {
-            sqlx::query_as::<_, (String, i64)>(
-                r#"
-                SELECT pubkey, COUNT(*) as note_count
-                FROM events
-                WHERE kind = 1 AND created_at >= $1
-                GROUP BY pubkey
-                ORDER BY note_count DESC
-                LIMIT $2 OFFSET $3
-                "#,
-            )
-            .bind(since)
-            .bind(limit)
-            .bind(offset)
-            .fetch_all(&self.pool)
-            .await?
+        let col = match range {
+            "today" => "note_count_today",
+            "7d"    => "note_count_7d",
+            "30d"   => "note_count_30d",
+            _       => "note_count_all",
         };
+
+        let sql = format!(
+            r#"
+            SELECT pubkey, {col} AS note_count
+            FROM mv_author_leaderboards
+            WHERE {col} > 0
+            ORDER BY {col} DESC
+            LIMIT $1 OFFSET $2
+            "#,
+            col = col,
+        );
+
+        let rows = sqlx::query_as::<_, (String, i64)>(&sql)
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&self.pool)
+            .await?;
 
         Ok(rows
             .into_iter()
@@ -1762,40 +1685,29 @@ impl EventRepository {
         limit: i64,
         offset: i64,
     ) -> Result<Vec<super::models::MostLikedAuthor>, AppError> {
-        let since = range_to_since(range);
-
-        let rows = if since == 0 {
-            sqlx::query_as::<_, (String, i64)>(
-                r#"
-                SELECT pubkey, SUM(reaction_count)::bigint AS like_count
-                FROM events
-                WHERE kind = 1 AND reaction_count > 0
-                GROUP BY pubkey
-                ORDER BY like_count DESC
-                LIMIT $1 OFFSET $2
-                "#,
-            )
-            .bind(limit)
-            .bind(offset)
-            .fetch_all(&self.pool)
-            .await?
-        } else {
-            sqlx::query_as::<_, (String, i64)>(
-                r#"
-                SELECT pubkey, SUM(reaction_count)::bigint AS like_count
-                FROM events
-                WHERE kind = 1 AND reaction_count > 0 AND created_at >= $1
-                GROUP BY pubkey
-                ORDER BY like_count DESC
-                LIMIT $2 OFFSET $3
-                "#,
-            )
-            .bind(since)
-            .bind(limit)
-            .bind(offset)
-            .fetch_all(&self.pool)
-            .await?
+        let col = match range {
+            "today" => "like_count_today",
+            "7d"    => "like_count_7d",
+            "30d"   => "like_count_30d",
+            _       => "like_count_all",
         };
+
+        let sql = format!(
+            r#"
+            SELECT pubkey, {col} AS like_count
+            FROM mv_author_leaderboards
+            WHERE {col} > 0
+            ORDER BY {col} DESC
+            LIMIT $1 OFFSET $2
+            "#,
+            col = col,
+        );
+
+        let rows = sqlx::query_as::<_, (String, i64)>(&sql)
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&self.pool)
+            .await?;
 
         Ok(rows
             .into_iter()
@@ -1814,40 +1726,29 @@ impl EventRepository {
         limit: i64,
         offset: i64,
     ) -> Result<Vec<super::models::MostSharedAuthor>, AppError> {
-        let since = range_to_since(range);
-
-        let rows = if since == 0 {
-            sqlx::query_as::<_, (String, i64)>(
-                r#"
-                SELECT pubkey, SUM(repost_count)::bigint AS repost_count
-                FROM events
-                WHERE kind = 1 AND repost_count > 0
-                GROUP BY pubkey
-                ORDER BY repost_count DESC
-                LIMIT $1 OFFSET $2
-                "#,
-            )
-            .bind(limit)
-            .bind(offset)
-            .fetch_all(&self.pool)
-            .await?
-        } else {
-            sqlx::query_as::<_, (String, i64)>(
-                r#"
-                SELECT pubkey, SUM(repost_count)::bigint AS repost_count
-                FROM events
-                WHERE kind = 1 AND repost_count > 0 AND created_at >= $1
-                GROUP BY pubkey
-                ORDER BY repost_count DESC
-                LIMIT $2 OFFSET $3
-                "#,
-            )
-            .bind(since)
-            .bind(limit)
-            .bind(offset)
-            .fetch_all(&self.pool)
-            .await?
+        let col = match range {
+            "today" => "repost_count_today",
+            "7d"    => "repost_count_7d",
+            "30d"   => "repost_count_30d",
+            _       => "repost_count_all",
         };
+
+        let sql = format!(
+            r#"
+            SELECT pubkey, {col} AS repost_count
+            FROM mv_author_leaderboards
+            WHERE {col} > 0
+            ORDER BY {col} DESC
+            LIMIT $1 OFFSET $2
+            "#,
+            col = col,
+        );
+
+        let rows = sqlx::query_as::<_, (String, i64)>(&sql)
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&self.pool)
+            .await?;
 
         Ok(rows
             .into_iter()
@@ -2624,7 +2525,8 @@ impl EventRepository {
         Ok(())
     }
 
-    /// Refresh the analytics materialized views (client leaderboard, relay leaderboard, pubkey first-seen).
+    /// Refresh the analytics materialized views (client leaderboard, relay leaderboard, pubkey first-seen,
+    /// author leaderboards, zapper leaderboards).
     /// These are heavy aggregations that should only run periodically (every 30-60 min).
     pub async fn refresh_analytics_views(&self) -> Result<(), AppError> {
         sqlx::query("REFRESH MATERIALIZED VIEW CONCURRENTLY mv_client_leaderboard")
@@ -2641,6 +2543,16 @@ impl EventRepository {
             .execute(&self.pool)
             .await?;
         tracing::info!("refreshed mv_pubkey_first_seen");
+
+        sqlx::query("REFRESH MATERIALIZED VIEW CONCURRENTLY mv_author_leaderboards")
+            .execute(&self.pool)
+            .await?;
+        tracing::info!("refreshed mv_author_leaderboards");
+
+        sqlx::query("REFRESH MATERIALIZED VIEW CONCURRENTLY mv_zapper_leaderboards")
+            .execute(&self.pool)
+            .await?;
+        tracing::info!("refreshed mv_zapper_leaderboards");
 
         Ok(())
     }
