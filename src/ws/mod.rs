@@ -233,6 +233,19 @@ async fn handle_search_req(sub_id: &str, filters: &[Value], state: &AppState) ->
         let search_profiles = kinds.is_empty() || kinds.contains(&0);
         let search_notes = kinds.is_empty() || kinds.contains(&1);
 
+        // NIP-01 `authors` filter: array of hex pubkeys
+        let authors: Vec<String> = filter
+            .get("authors")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_lowercase())
+                    .collect()
+            })
+            .unwrap_or_default();
+
         // NIP-01 `#t` tag filter: array of hashtag values (OR semantics)
         let tag_filter: Vec<String> = filter
             .get("#t")
@@ -271,6 +284,7 @@ async fn handle_search_req(sub_id: &str, filters: &[Value], state: &AppState) ->
             kinds = ?kinds,
             limit = limit,
             hashtags = ?hashtags,
+            authors = ?authors,
             "NIP-50 search request"
         );
 
@@ -285,6 +299,10 @@ async fn handle_search_req(sub_id: &str, filters: &[Value], state: &AppState) ->
                         "hashtag search completed"
                     );
                     for note in notes {
+                        // Apply authors filter if present
+                        if !authors.is_empty() && !authors.contains(&note.event.pubkey) {
+                            continue;
+                        }
                         let event_msg = serde_json::to_string(
                             &serde_json::json!(["EVENT", sub_id, note.event.raw.0]),
                         )
@@ -309,7 +327,15 @@ async fn handle_search_req(sub_id: &str, filters: &[Value], state: &AppState) ->
 
                 if !ranked.is_empty() {
                     // Phase 2: fetch raw kind-0 events for the ranked pubkeys
-                    let pubkeys: Vec<String> = ranked.iter().map(|p| p.pubkey.clone()).collect();
+                    // If authors filter is set, only include profiles matching those pubkeys
+                    let pubkeys: Vec<String> = if authors.is_empty() {
+                        ranked.iter().map(|p| p.pubkey.clone()).collect()
+                    } else {
+                        ranked.iter()
+                            .filter(|p| authors.contains(&p.pubkey))
+                            .map(|p| p.pubkey.clone())
+                            .collect()
+                    };
                     match state.repo.profile_events_for_pubkeys(&pubkeys).await {
                         Ok(events) => {
                             // Re-sort events by the in-memory ranking order
@@ -349,7 +375,8 @@ async fn handle_search_req(sub_id: &str, filters: &[Value], state: &AppState) ->
 
             // Search notes (kind 1) — full-text search (skip when hashtag filter or empty search)
             if search_notes && !has_hashtag_filter && !search_term.is_empty() {
-                match state.repo.search_notes_as_events(search_term, limit).await {
+                let authors_ref: Vec<&str> = authors.iter().map(|s| s.as_str()).collect();
+                match state.repo.search_notes_as_events(search_term, limit, &authors_ref).await {
                     Ok(events) => {
                         tracing::info!(
                             sub_id = %sub_id,

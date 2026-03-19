@@ -2367,47 +2367,96 @@ impl EventRepository {
         &self,
         query: &str,
         limit: i64,
+        authors: &[&str],
     ) -> Result<Vec<StoredEvent>, AppError> {
-        let rows = sqlx::query_as::<_, StoredEvent>(
-            r#"
-            WITH ranked AS (
+        if authors.is_empty() {
+            // No author filter — original query
+            let rows = sqlx::query_as::<_, StoredEvent>(
+                r#"
+                WITH ranked AS (
+                    SELECT
+                        e.id, e.pubkey, e.created_at, e.kind, e.content, e.sig,
+                        e.tags, e.raw, e.relay_url, e.received_at,
+                        e.reaction_count, e.reply_count, e.repost_count, e.zap_count,
+                        ts_rank(e.content_tsv, query) AS text_rank
+                    FROM events e, plainto_tsquery('english', $1) query
+                    WHERE e.kind = 1 AND e.content_tsv @@ query
+                    ORDER BY ts_rank(e.content_tsv, query) DESC
+                    LIMIT 200
+                )
                 SELECT
-                    e.id, e.pubkey, e.created_at, e.kind, e.content, e.sig,
-                    e.tags, e.raw, e.relay_url, e.received_at,
-                    e.reaction_count, e.reply_count, e.repost_count, e.zap_count,
-                    ts_rank(e.content_tsv, query) AS text_rank
-                FROM events e, plainto_tsquery('english', $1) query
-                WHERE e.kind = 1 AND e.content_tsv @@ query
-                ORDER BY ts_rank(e.content_tsv, query) DESC
-                LIMIT 200
+                    r.id, r.pubkey, r.created_at, r.kind, r.content, r.sig,
+                    r.tags, r.raw, r.relay_url, r.received_at
+                FROM ranked r
+                ORDER BY (
+                    r.text_rank * 1000 +
+                    LN(
+                        r.reaction_count * 100 +
+                        r.reply_count * 500 +
+                        r.repost_count * 1000 +
+                        r.zap_count * 2000 + 1
+                    ) * 10 +
+                    CASE
+                        WHEN r.created_at > EXTRACT(EPOCH FROM NOW())::bigint - 86400 THEN 50
+                        WHEN r.created_at > EXTRACT(EPOCH FROM NOW())::bigint - 604800 THEN 25
+                        ELSE 0
+                    END
+                ) DESC
+                LIMIT $2
+                "#,
             )
-            SELECT
-                r.id, r.pubkey, r.created_at, r.kind, r.content, r.sig,
-                r.tags, r.raw, r.relay_url, r.received_at
-            FROM ranked r
-            ORDER BY (
-                r.text_rank * 1000 +
-                LN(
-                    r.reaction_count * 100 +
-                    r.reply_count * 500 +
-                    r.repost_count * 1000 +
-                    r.zap_count * 2000 + 1
-                ) * 10 +
-                CASE
-                    WHEN r.created_at > EXTRACT(EPOCH FROM NOW())::bigint - 86400 THEN 50
-                    WHEN r.created_at > EXTRACT(EPOCH FROM NOW())::bigint - 604800 THEN 25
-                    ELSE 0
-                END
-            ) DESC
-            LIMIT $2
-            "#,
-        )
-        .bind(query)
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?;
+            .bind(query)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?;
 
-        Ok(rows)
+            Ok(rows)
+        } else {
+            // Author-filtered search
+            let rows = sqlx::query_as::<_, StoredEvent>(
+                r#"
+                WITH ranked AS (
+                    SELECT
+                        e.id, e.pubkey, e.created_at, e.kind, e.content, e.sig,
+                        e.tags, e.raw, e.relay_url, e.received_at,
+                        e.reaction_count, e.reply_count, e.repost_count, e.zap_count,
+                        ts_rank(e.content_tsv, query) AS text_rank
+                    FROM events e, plainto_tsquery('english', $1) query
+                    WHERE e.kind = 1
+                      AND e.content_tsv @@ query
+                      AND e.pubkey = ANY($3)
+                    ORDER BY ts_rank(e.content_tsv, query) DESC
+                    LIMIT 200
+                )
+                SELECT
+                    r.id, r.pubkey, r.created_at, r.kind, r.content, r.sig,
+                    r.tags, r.raw, r.relay_url, r.received_at
+                FROM ranked r
+                ORDER BY (
+                    r.text_rank * 1000 +
+                    LN(
+                        r.reaction_count * 100 +
+                        r.reply_count * 500 +
+                        r.repost_count * 1000 +
+                        r.zap_count * 2000 + 1
+                    ) * 10 +
+                    CASE
+                        WHEN r.created_at > EXTRACT(EPOCH FROM NOW())::bigint - 86400 THEN 50
+                        WHEN r.created_at > EXTRACT(EPOCH FROM NOW())::bigint - 604800 THEN 25
+                        ELSE 0
+                    END
+                ) DESC
+                LIMIT $2
+                "#,
+            )
+            .bind(query)
+            .bind(limit)
+            .bind(authors)
+            .fetch_all(&self.pool)
+            .await?;
+
+            Ok(rows)
+        }
     }
 
     /// Search kind-1 notes containing a literal hashtag (e.g. `#bitcoin`) in content.
