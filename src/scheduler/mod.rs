@@ -2,10 +2,27 @@
 //!
 //! WebSocket endpoint at `wss://scheduler.nostrarchives.com`
 //!
-//! Supported NIP-01 messages:
-//! - `["EVENT", <event>]`  — Submit a future-dated event for scheduling
-//! - `["REQ", <sub_id>, <filter>]` — Query your own scheduled events
-//! - `["CLOSE", <sub_id>]` — Close a subscription
+//! ## Authentication (NIP-42)
+//!
+//! On connect the server immediately sends `["AUTH", <challenge>]`. Clients must respond
+//! with a signed kind-22242 event containing a `["challenge", "<value>"]` tag before any
+//! other message will be accepted.
+//!
+//! ## Supported messages (all require prior AUTH)
+//!
+//! - `["AUTH", <kind-22242-event>]`   — Authenticate (must be first)
+//! - `["EVENT", <event>]`             — Submit a future-dated event for scheduling.
+//!                                      The event pubkey must match the authenticated pubkey.
+//! - `["EVENT", <kind-5-event>]`      — Cancel pending scheduled events (NIP-09).
+//!                                      References target event IDs via `e` tags.
+//!                                      Only the owning pubkey may cancel their own events.
+//! - `["REQ", <sub_id>, <filter>]`    — Query your own scheduled events.
+//!                                      Always returns only events belonging to the
+//!                                      authenticated pubkey — the filter's `authors` field
+//!                                      is ignored to prevent data leakage.
+//! - `["CLOSE", <sub_id>]`            — Close a subscription.
+//!
+//! ## Publishing
 //!
 //! The scheduler only accepts events with `created_at` in the future.
 //! A background task checks every 60 seconds for events due to be published,
@@ -29,6 +46,7 @@ use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tokio::sync::broadcast;
 use tokio_tungstenite::tungstenite;
+use uuid::Uuid;
 
 use crate::crawler::relay_router::RelayRouter;
 
@@ -104,11 +122,35 @@ async fn ws_handler(
 }
 
 // ---------------------------------------------------------------------------
+// Per-connection authentication state (NIP-42)
+// ---------------------------------------------------------------------------
+
+struct ConnectionState {
+    /// Random challenge sent to the client on connect.
+    auth_challenge: String,
+    /// Pubkey of the authenticated client, set after successful AUTH.
+    auth_pubkey: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
 // Connection handler
 // ---------------------------------------------------------------------------
 
 async fn handle_connection(socket: WebSocket, state: SchedulerState) {
     let (mut sink, mut stream) = socket.split();
+
+    // NIP-42: send AUTH challenge immediately on connect.
+    let challenge = Uuid::new_v4().to_string();
+    let auth_msg = serde_json::to_string(&serde_json::json!(["AUTH", challenge]))
+        .expect("json serialization cannot fail");
+    if sink.send(Message::Text(auth_msg.into())).await.is_err() {
+        return;
+    }
+
+    let mut conn = ConnectionState {
+        auth_challenge: challenge,
+        auth_pubkey: None,
+    };
 
     while let Some(msg_result) = stream.next().await {
         let msg = match msg_result {
@@ -121,7 +163,7 @@ async fn handle_connection(socket: WebSocket, state: SchedulerState) {
 
         match msg {
             Message::Text(text) => {
-                let responses = handle_nostr_message(&text, &state).await;
+                let responses = handle_nostr_message(&text, &state, &mut conn).await;
                 for r in responses {
                     if sink.send(Message::Text(r.into())).await.is_err() {
                         break;
@@ -145,7 +187,11 @@ async fn handle_connection(socket: WebSocket, state: SchedulerState) {
 // Nostr protocol handling
 // ---------------------------------------------------------------------------
 
-async fn handle_nostr_message(text: &str, state: &SchedulerState) -> Vec<String> {
+async fn handle_nostr_message(
+    text: &str,
+    state: &SchedulerState,
+    conn: &mut ConnectionState,
+) -> Vec<String> {
     let parsed: Value = match serde_json::from_str(text) {
         Ok(v) => v,
         Err(_) => return vec![notice("invalid JSON")],
@@ -162,18 +208,121 @@ async fn handle_nostr_message(text: &str, state: &SchedulerState) -> Vec<String>
     };
 
     match msg_type {
-        "EVENT" => handle_event(arr, state).await,
-        "REQ" => handle_req(arr, state).await,
+        "AUTH" => handle_auth(arr, conn),
+        "EVENT" => handle_event(arr, state, conn).await,
+        "REQ" => handle_req(arr, state, conn).await,
         "CLOSE" => handle_close(arr),
         _ => vec![notice(&format!("unknown message type: {msg_type}"))],
     }
 }
 
 // ---------------------------------------------------------------------------
-// EVENT handler — accept future-dated events
+// AUTH handler — NIP-42 client authentication
 // ---------------------------------------------------------------------------
 
-async fn handle_event(arr: &[Value], state: &SchedulerState) -> Vec<String> {
+fn handle_auth(arr: &[Value], conn: &mut ConnectionState) -> Vec<String> {
+    if arr.len() < 2 {
+        return vec![notice("AUTH requires an event object")];
+    }
+
+    let event = &arr[1];
+
+    let id = match event.get("id").and_then(|v| v.as_str()) {
+        Some(s) => s,
+        None => return vec![ok_msg("", false, "missing event id")],
+    };
+
+    let pubkey = match event.get("pubkey").and_then(|v| v.as_str()) {
+        Some(s) => s,
+        None => return vec![ok_msg(id, false, "missing pubkey")],
+    };
+
+    let created_at = match event.get("created_at").and_then(|v| v.as_i64()) {
+        Some(ts) => ts,
+        None => return vec![ok_msg(id, false, "missing or invalid created_at")],
+    };
+
+    let kind = match event.get("kind").and_then(|v| v.as_i64()) {
+        Some(k) => k,
+        None => return vec![ok_msg(id, false, "missing or invalid kind")],
+    };
+
+    if kind != 22242 {
+        return vec![ok_msg(id, false, "auth event must be kind 22242")];
+    }
+
+    let content = event.get("content").and_then(|v| v.as_str()).unwrap_or("");
+
+    let sig = match event.get("sig").and_then(|v| v.as_str()) {
+        Some(s) => s,
+        None => return vec![ok_msg(id, false, "missing signature")],
+    };
+
+    let tags = event
+        .get("tags")
+        .cloned()
+        .unwrap_or_else(|| Value::Array(vec![]));
+
+    if let Err(e) = verify_event_id(id, pubkey, created_at, kind, &tags, content) {
+        return vec![ok_msg(id, false, &e)];
+    }
+
+    if let Err(e) = verify_signature(id, pubkey, sig) {
+        return vec![ok_msg(id, false, &e)];
+    }
+
+    // created_at must be within 10 minutes of now
+    let now = Utc::now().timestamp();
+    if (now - created_at).abs() > 600 {
+        return vec![ok_msg(
+            id,
+            false,
+            "invalid: auth event created_at too far from current time",
+        )];
+    }
+
+    // Must have a challenge tag matching our challenge
+    let challenge_val = tags
+        .as_array()
+        .and_then(|arr| {
+            arr.iter().find(|tag| {
+                tag.as_array()
+                    .and_then(|t| t.first())
+                    .and_then(|v| v.as_str())
+                    == Some("challenge")
+            })
+        })
+        .and_then(|tag| tag.as_array()?.get(1)?.as_str());
+
+    match challenge_val {
+        Some(c) if c == conn.auth_challenge => {}
+        Some(_) => return vec![ok_msg(id, false, "invalid: challenge mismatch")],
+        None => return vec![ok_msg(id, false, "invalid: missing challenge tag")],
+    }
+
+    conn.auth_pubkey = Some(pubkey.to_string());
+    tracing::info!(pubkey = %pubkey, "scheduler: client authenticated");
+    vec![ok_msg(id, true, "")]
+}
+
+// ---------------------------------------------------------------------------
+// EVENT handler — accept future-dated events (requires AUTH)
+// ---------------------------------------------------------------------------
+
+async fn handle_event(
+    arr: &[Value],
+    state: &SchedulerState,
+    conn: &ConnectionState,
+) -> Vec<String> {
+    let auth_pubkey = match &conn.auth_pubkey {
+        Some(pk) => pk.clone(),
+        None => {
+            return vec![notice(
+                "restricted: authentication required — send AUTH first",
+            )]
+        }
+    };
+
     if arr.len() < 2 {
         return vec![notice("EVENT requires an event object")];
     }
@@ -218,17 +367,31 @@ async fn handle_event(arr: &[Value], state: &SchedulerState) -> Vec<String> {
 
     // --- Validation ---
 
-    // 1. Verify event id (sha256 of serialized event)
+    // 1. Authenticated pubkey must own this event
+    if pubkey != auth_pubkey {
+        return vec![ok_msg(
+            id,
+            false,
+            "restricted: event pubkey does not match authenticated pubkey",
+        )];
+    }
+
+    // 2. Verify event id (sha256 of serialized event)
     if let Err(e) = verify_event_id(id, pubkey, created_at, kind, &tags, content) {
         return vec![ok_msg(id, false, &e)];
     }
 
-    // 2. Verify Schnorr signature
+    // 3. Verify Schnorr signature
     if let Err(e) = verify_signature(id, pubkey, sig) {
         return vec![ok_msg(id, false, &e)];
     }
 
-    // 3. Must be in the future
+    // 4. Kind-5 (NIP-09 deletion) — cancel the referenced scheduled events
+    if kind == 5 {
+        return handle_deletion(id, pubkey, &tags, state).await;
+    }
+
+    // 5. Must be in the future
     let now = Utc::now().timestamp();
     if created_at <= now {
         return vec![ok_msg(
@@ -238,7 +401,7 @@ async fn handle_event(arr: &[Value], state: &SchedulerState) -> Vec<String> {
         )];
     }
 
-    // 4. Must be at least MIN_FUTURE_SECS ahead
+    // 6. Must be at least MIN_FUTURE_SECS ahead
     if created_at - now < MIN_FUTURE_SECS {
         return vec![ok_msg(
             id,
@@ -247,7 +410,7 @@ async fn handle_event(arr: &[Value], state: &SchedulerState) -> Vec<String> {
         )];
     }
 
-    // 5. Must not be too far in the future
+    // 7. Must not be too far in the future
     if created_at - now > MAX_FUTURE_SECS {
         return vec![ok_msg(
             id,
@@ -256,7 +419,7 @@ async fn handle_event(arr: &[Value], state: &SchedulerState) -> Vec<String> {
         )];
     }
 
-    // 6. Check per-pubkey limit
+    // 8. Check per-pubkey limit
     let pending_count: (i64,) = sqlx::query_as(
         "SELECT COUNT(*) FROM scheduled_events WHERE pubkey = $1 AND status = 'pending'",
     )
@@ -273,7 +436,7 @@ async fn handle_event(arr: &[Value], state: &SchedulerState) -> Vec<String> {
         )];
     }
 
-    // 7. Check for duplicate
+    // 9. Check for duplicate
     let exists: bool =
         sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM scheduled_events WHERE id = $1)")
             .bind(id)
@@ -329,10 +492,90 @@ async fn handle_event(arr: &[Value], state: &SchedulerState) -> Vec<String> {
 }
 
 // ---------------------------------------------------------------------------
-// REQ handler — query own scheduled events
+// Deletion handler — cancel scheduled events via kind-5 (NIP-09)
 // ---------------------------------------------------------------------------
 
-async fn handle_req(arr: &[Value], state: &SchedulerState) -> Vec<String> {
+async fn handle_deletion(
+    del_event_id: &str,
+    pubkey: &str,
+    tags: &Value,
+    state: &SchedulerState,
+) -> Vec<String> {
+    let event_ids: Vec<String> = tags
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|tag| {
+                    let t = tag.as_array()?;
+                    if t.first()?.as_str() == Some("e") {
+                        Some(t.get(1)?.as_str()?.to_string())
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if event_ids.is_empty() {
+        return vec![ok_msg(
+            del_event_id,
+            false,
+            "deletion event has no 'e' tags",
+        )];
+    }
+
+    // Only cancel pending events that belong to the authenticated pubkey.
+    // Events in any other status (publishing/published/failed) are untouched.
+    let result = sqlx::query(
+        r#"
+        UPDATE scheduled_events
+        SET status = 'cancelled'
+        WHERE id = ANY($1)
+          AND pubkey = $2
+          AND status = 'pending'
+        "#,
+    )
+    .bind(&event_ids)
+    .bind(pubkey)
+    .execute(&state.pool)
+    .await;
+
+    match result {
+        Ok(r) => {
+            let cancelled = r.rows_affected();
+            tracing::info!(
+                pubkey = %pubkey,
+                cancelled = cancelled,
+                "scheduler: events cancelled"
+            );
+            vec![ok_msg(
+                del_event_id,
+                true,
+                &format!("cancelled {cancelled} scheduled event(s)"),
+            )]
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "failed to cancel scheduled events");
+            vec![ok_msg(del_event_id, false, "error: failed to cancel events")]
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// REQ handler — query own scheduled events (requires AUTH)
+// ---------------------------------------------------------------------------
+
+async fn handle_req(arr: &[Value], state: &SchedulerState, conn: &ConnectionState) -> Vec<String> {
+    let auth_pubkey = match &conn.auth_pubkey {
+        Some(pk) => pk.clone(),
+        None => {
+            return vec![notice(
+                "restricted: authentication required — send AUTH first",
+            )]
+        }
+    };
+
     if arr.len() < 3 {
         return vec![notice("REQ requires subscription_id and at least one filter")];
     }
@@ -343,40 +586,26 @@ async fn handle_req(arr: &[Value], state: &SchedulerState) -> Vec<String> {
     };
 
     let filter = &arr[2];
-
-    // Only allow querying by author (pubkey) — users can only see their own scheduled events
-    let authors: Vec<&str> = filter
-        .get("authors")
-        .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
-        .unwrap_or_default();
-
-    if authors.is_empty() {
-        return vec![
-            notice("filter must include 'authors' — you can only query your own scheduled events"),
-            eose(&sub_id),
-        ];
-    }
-
     let limit = filter
         .get("limit")
         .and_then(|v| v.as_i64())
         .unwrap_or(50)
         .clamp(1, 200);
 
-    // Query scheduled events for these authors
-    // Return events in a custom envelope so clients know the status
+    // Always query ONLY the authenticated pubkey regardless of any authors filter.
+    // This is the critical isolation guarantee — clients can never retrieve another
+    // pubkey's scheduled events, even by manipulating the filter.
     let rows = sqlx::query_as::<_, ScheduledEventRow>(
         r#"
         SELECT id, pubkey, kind, created_at, content, tags, sig, raw, status,
                relays_sent, relays_failed, submitted_at, published_at, error_message
         FROM scheduled_events
-        WHERE pubkey = ANY($1)
+        WHERE pubkey = $1
         ORDER BY created_at ASC
         LIMIT $2
         "#,
     )
-    .bind(&authors.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+    .bind(&auth_pubkey)
     .bind(limit)
     .fetch_all(&state.pool)
     .await;
