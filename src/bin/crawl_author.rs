@@ -34,7 +34,7 @@ async fn main() {
     let command = args.get(1).map(|s| s.as_str()).unwrap_or("help");
 
     match command {
-        "info" | "probe" | "crawl" => {}
+        "info" | "probe" | "crawl" | "engagement" => {}
         _ => {
             print_help();
             return;
@@ -59,6 +59,7 @@ async fn main() {
         "info" => cmd_info(&pool, &pubkey).await,
         "probe" => cmd_probe(&pool, &pubkey, extra_relays).await,
         "crawl" => cmd_crawl(&pool, &pubkey, extra_relays).await,
+        "engagement" => cmd_engagement(&pool, &pubkey, extra_relays).await,
         _ => unreachable!(),
     }
 }
@@ -67,9 +68,10 @@ fn print_help() {
     println!("crawl_author — per-author crawl diagnostic tool");
     println!();
     println!("Commands:");
-    println!("  info  <pubkey>              Show DB state: note count, relay list, crawl cursor");
-    println!("  probe <pubkey> [relay…]     Count notes per relay, no DB changes");
-    println!("  crawl <pubkey> [relay…]     Fetch and insert all notes from relays");
+    println!("  info       <pubkey>              Show DB state: note count, relay list, crawl cursor");
+    println!("  probe      <pubkey> [relay…]     Count notes per relay, no DB changes");
+    println!("  crawl      <pubkey> [relay…]     Fetch and insert all notes from write relays");
+    println!("  engagement <pubkey> [relay…]     Backfill reactions/reposts/zaps from read relays");
     println!();
     println!("  <pubkey> may be hex (64 chars) or npub1… bech32.");
     println!("  If relay URLs are omitted, the author's NIP-65 write relays are used");
@@ -369,6 +371,277 @@ async fn cmd_crawl(pool: &sqlx::PgPool, pubkey: &str, extra_relays: Vec<String>)
     println!("  Net new:      {}", after - before);
 }
 
+/// Backfill engagement (reactions, reposts, zaps) for all of the author's notes in DB.
+///
+/// Uses the author's **read** relays (inbox) — that's where other users send their
+/// reactions. Two passes per relay:
+///   1. `#e` filter — kinds 6, 7, 16, 9735 referencing each note ID (batches of 50)
+///   2. `#p` filter — kind 9735 zaps addressed to the author (catches zaps not linked
+///      to a specific note event ID)
+async fn cmd_engagement(pool: &sqlx::PgPool, pubkey: &str, extra_relays: Vec<String>) {
+    println!("\n=== Engagement backfill: {} ===\n", abbrev(pubkey));
+
+    // Load all kind-1 note IDs for this author from DB
+    let note_ids: Vec<String> = sqlx::query_scalar(
+        "SELECT id FROM events WHERE pubkey = $1 AND kind = 1 ORDER BY created_at DESC",
+    )
+    .bind(pubkey)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+
+    if note_ids.is_empty() {
+        println!("No kind-1 notes found in DB for this author.");
+        println!("Run `crawl` first to fetch their notes.");
+        return;
+    }
+
+    println!("Notes in DB to backfill engagement for: {}", note_ids.len());
+
+    // Engagement comes from the author's READ relays (inbox), not write relays.
+    let relays = resolve_read_relays(pool, pubkey, extra_relays).await;
+    if relays.is_empty() {
+        println!("No relays found. Pass relay URLs directly:");
+        println!("  cargo run --bin crawl_author -- engagement <pubkey> wss://relay.damus.io");
+        return;
+    }
+
+    let redis_url = env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
+    let redis_client = redis::Client::open(redis_url.as_str()).expect("invalid redis url");
+    let follower_cache = nostr_api::follower_cache::FollowerCache::new(pool.clone(), 5, 3600);
+    let wot_cache = nostr_api::wot_cache::WotCache::new(pool.clone(), 21, 900);
+    let repo = nostr_api::db::repository::EventRepository::new(
+        pool.clone(),
+        follower_cache,
+        wot_cache,
+    );
+    let cache = nostr_api::cache::StatsCache::new(redis_client, repo.clone());
+
+    let mut grand_total_engagement = 0u64;
+    let mut grand_total_zaps = 0u64;
+
+    for relay_url in &relays {
+        println!("--- {relay_url} ---");
+
+        // Pass 1: engagement events referencing each note (#e filter)
+        print!("  Pass 1 (#e reactions/reposts/zaps): ");
+        {
+            use std::io::Write as _;
+            let _ = std::io::stdout().flush();
+        }
+        match fetch_engagement_for_notes(relay_url, &note_ids, &repo, &cache).await {
+            Ok(n) => {
+                println!("{n} new events");
+                grand_total_engagement += n;
+            }
+            Err(e) => println!("ERROR: {e}"),
+        }
+
+        // Pass 2: zaps addressed to the author (#p filter).
+        // Zap receipts are authored by the LNURL provider, not the note author,
+        // so they don't show up by pubkey in the #e pass.
+        print!("  Pass 2 (#p zaps):                  ");
+        {
+            use std::io::Write as _;
+            let _ = std::io::stdout().flush();
+        }
+        match fetch_zaps_for_author(relay_url, pubkey, &repo, &cache).await {
+            Ok(n) => {
+                println!("{n} new zaps");
+                grand_total_zaps += n;
+            }
+            Err(e) => println!("ERROR: {e}"),
+        }
+
+        println!();
+    }
+
+    println!("=== Engagement backfill complete ===");
+    println!("  Reactions/reposts/zaps (#e): {grand_total_engagement} new events");
+    println!("  Zaps (#p):                   {grand_total_zaps} new events");
+    println!(
+        "  Total new engagement events: {}",
+        grand_total_engagement + grand_total_zaps
+    );
+}
+
+/// Fetch engagement events (kinds 6, 7, 16, 9735) referencing a set of note IDs.
+/// Opens one WS connection to the relay and sends batches of 50 note IDs per REQ,
+/// reusing the same connection across all chunks.
+async fn fetch_engagement_for_notes(
+    relay_url: &str,
+    note_ids: &[String],
+    repo: &nostr_api::db::repository::EventRepository,
+    cache: &nostr_api::cache::StatsCache,
+) -> Result<u64, String> {
+    let (ws_stream, _) =
+        timeout(Duration::from_secs(10), tokio_tungstenite::connect_async(relay_url))
+            .await
+            .map_err(|_| "connect timeout".to_string())?
+            .map_err(|e| format!("connect error: {e}"))?;
+
+    let (mut ws_write, mut ws_read) = ws_stream.split();
+    let mut total = 0u64;
+    let chunks_total = (note_ids.len() + 49) / 50;
+
+    for (i, chunk) in note_ids.chunks(50).enumerate() {
+        let filter = serde_json::json!({
+            "kinds": [6, 7, 16, 9735],
+            "#e": chunk,
+            "limit": 5000,
+        });
+
+        let sub_id = format!("eng-{}", Uuid::new_v4().simple());
+        let req = serde_json::json!(["REQ", &sub_id, filter]);
+
+        ws_write
+            .send(Message::Text(req.to_string().into()))
+            .await
+            .map_err(|e| format!("send failed: {e}"))?;
+
+        loop {
+            match timeout(Duration::from_secs(15), ws_read.next()).await {
+                Ok(Some(Ok(Message::Text(text)))) => {
+                    let parsed: Value = match serde_json::from_str(&text) {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    };
+                    let arr = match parsed.as_array() {
+                        Some(a) if a.len() >= 2 => a,
+                        _ => continue,
+                    };
+                    match arr[0].as_str() {
+                        Some("EVENT") if arr.len() >= 3 => {
+                            if let Ok(event) = serde_json::from_value::<
+                                nostr_api::db::models::NostrEvent,
+                            >(arr[2].clone())
+                            {
+                                match repo.insert_event(&event, relay_url).await {
+                                    Ok(true) => {
+                                        total += 1;
+                                        cache.on_event_ingested(&event.pubkey, event.kind).await;
+                                    }
+                                    Ok(false) => {}
+                                    Err(e) => {
+                                        tracing::debug!("engagement insert failed: {e}");
+                                    }
+                                }
+                            }
+                        }
+                        Some("EOSE") | Some("CLOSED") | Some("NOTICE") => break,
+                        _ => {}
+                    }
+                }
+                Ok(Some(Ok(Message::Ping(data)))) => {
+                    let _ = ws_write.send(Message::Pong(data)).await;
+                }
+                Ok(Some(Ok(Message::Close(_)))) | Ok(None) => {
+                    return Ok(total);
+                }
+                _ => break,
+            }
+        }
+
+        let close = serde_json::json!(["CLOSE", &sub_id]);
+        let _ = ws_write.send(Message::Text(close.to_string().into())).await;
+
+        // Show progress every 10 chunks for large note sets
+        if chunks_total > 10 && ((i + 1) % 10 == 0 || i + 1 == chunks_total) {
+            print!(
+                "\r  Pass 1 (#e reactions/reposts/zaps): chunk {}/{} — {total} new so far  ",
+                i + 1,
+                chunks_total
+            );
+            use std::io::Write as _;
+            let _ = std::io::stdout().flush();
+        }
+    }
+
+    if chunks_total > 10 {
+        println!(); // newline after inline progress
+    }
+
+    Ok(total)
+}
+
+/// Fetch zap receipts (kind 9735) addressed to a specific author via the `#p` tag.
+async fn fetch_zaps_for_author(
+    relay_url: &str,
+    pubkey: &str,
+    repo: &nostr_api::db::repository::EventRepository,
+    cache: &nostr_api::cache::StatsCache,
+) -> Result<u64, String> {
+    let (ws_stream, _) =
+        timeout(Duration::from_secs(10), tokio_tungstenite::connect_async(relay_url))
+            .await
+            .map_err(|_| "connect timeout".to_string())?
+            .map_err(|e| format!("connect error: {e}"))?;
+
+    let (mut ws_write, mut ws_read) = ws_stream.split();
+
+    let sub_id = format!("zaps-{}", Uuid::new_v4().simple());
+    let req = serde_json::json!(["REQ", &sub_id, {
+        "kinds": [9735],
+        "#p": [pubkey],
+        "limit": 5000,
+    }]);
+
+    ws_write
+        .send(Message::Text(req.to_string().into()))
+        .await
+        .map_err(|e| format!("send failed: {e}"))?;
+
+    let mut total = 0u64;
+
+    loop {
+        match timeout(Duration::from_secs(20), ws_read.next()).await {
+            Ok(Some(Ok(Message::Text(text)))) => {
+                let parsed: Value = match serde_json::from_str(&text) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                let arr = match parsed.as_array() {
+                    Some(a) if a.len() >= 2 => a,
+                    _ => continue,
+                };
+                match arr[0].as_str() {
+                    Some("EVENT") if arr.len() >= 3 => {
+                        if let Ok(event) = serde_json::from_value::<
+                            nostr_api::db::models::NostrEvent,
+                        >(arr[2].clone())
+                        {
+                            if event.kind == 9735 {
+                                match repo.insert_event(&event, relay_url).await {
+                                    Ok(true) => {
+                                        total += 1;
+                                        cache.on_event_ingested(&event.pubkey, event.kind).await;
+                                    }
+                                    Ok(false) => {}
+                                    Err(e) => {
+                                        tracing::debug!("zap insert failed: {e}");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Some("EOSE") | Some("CLOSED") | Some("NOTICE") => break,
+                    _ => {}
+                }
+            }
+            Ok(Some(Ok(Message::Ping(data)))) => {
+                let _ = ws_write.send(Message::Pong(data)).await;
+            }
+            Ok(Some(Ok(Message::Close(_)))) | Ok(None) => break,
+            _ => break,
+        }
+    }
+
+    let close = serde_json::json!(["CLOSE", &sub_id]);
+    let _ = ws_write.send(Message::Text(close.to_string().into())).await;
+
+    Ok(total)
+}
+
 // ── Relay resolution ─────────────────────────────────────────────────────────
 
 /// Return the list of relay URLs to use, in priority order:
@@ -448,6 +721,142 @@ async fn write_relays_from_db(pool: &sqlx::PgPool, pubkey: &str) -> Vec<String> 
             .collect(),
         None => vec![],
     }
+}
+
+/// Resolve read relays (inbox) for the engagement command.
+/// Same priority order as resolve_relays, but filters for read-capable relays.
+async fn resolve_read_relays(
+    pool: &sqlx::PgPool,
+    pubkey: &str,
+    explicit: Vec<String>,
+) -> Vec<String> {
+    if !explicit.is_empty() {
+        return explicit;
+    }
+
+    let db_relays = read_relays_from_db(pool, pubkey).await;
+    if !db_relays.is_empty() {
+        println!("Using NIP-65 read relays from DB ({} relay(s)):", db_relays.len());
+        for r in &db_relays {
+            println!("  {r}");
+        }
+        println!();
+        return db_relays;
+    }
+
+    println!("NIP-65 not in DB — fetching live from bootstrap relays...");
+    let bootstrap = [
+        "wss://relay.damus.io",
+        "wss://nos.lol",
+        "wss://relay.nostr.band",
+        "wss://nostr.mom",
+        "wss://relay.primal.net",
+    ];
+
+    for relay in &bootstrap {
+        match fetch_nip65_read_relays_live(relay, pubkey).await {
+            Ok(relays) if !relays.is_empty() => {
+                println!("Found NIP-65 on {relay} ({} read relay(s)):", relays.len());
+                for r in &relays {
+                    println!("  {r}");
+                }
+                println!();
+                return relays;
+            }
+            _ => {}
+        }
+    }
+
+    println!("No NIP-65 relay list found anywhere.");
+    println!("Using bootstrap relays as fallback:");
+    let fallback: Vec<String> = bootstrap.iter().map(|s| s.to_string()).collect();
+    for r in &fallback {
+        println!("  {r}");
+    }
+    println!();
+    fallback
+}
+
+async fn read_relays_from_db(pool: &sqlx::PgPool, pubkey: &str) -> Vec<String> {
+    let row = sqlx::query_as::<_, (serde_json::Value,)>(
+        "SELECT tags FROM events WHERE pubkey = $1 AND kind = 10002
+         ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(pubkey)
+    .fetch_optional(pool)
+    .await
+    .unwrap_or(None);
+
+    match row {
+        Some((tags,)) => parse_relay_tags_json(tags.as_array().unwrap_or(&vec![]))
+            .into_iter()
+            .filter(|(_, read, _)| *read)
+            .map(|(url, _, _)| url)
+            .collect(),
+        None => vec![],
+    }
+}
+
+/// Fetch kind-10002 for an author from a single relay and return read relay URLs.
+async fn fetch_nip65_read_relays_live(
+    relay_url: &str,
+    pubkey: &str,
+) -> Result<Vec<String>, String> {
+    let (ws_stream, _) =
+        timeout(Duration::from_secs(10), tokio_tungstenite::connect_async(relay_url))
+            .await
+            .map_err(|_| "connect timeout".to_string())?
+            .map_err(|e| e.to_string())?;
+
+    let (mut ws_write, mut ws_read) = ws_stream.split();
+
+    let sub_id = format!("rl-{}", Uuid::new_v4().simple());
+    let req = serde_json::json!(["REQ", &sub_id, {
+        "kinds": [10002],
+        "authors": [pubkey],
+        "limit": 1
+    }]);
+
+    ws_write
+        .send(Message::Text(req.to_string().into()))
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let mut result = vec![];
+
+    loop {
+        match timeout(Duration::from_secs(10), ws_read.next()).await {
+            Ok(Some(Ok(Message::Text(text)))) => {
+                let parsed: Value = match serde_json::from_str(&text) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                let arr = match parsed.as_array() {
+                    Some(a) if a.len() >= 3 => a,
+                    _ => continue,
+                };
+                match arr[0].as_str() {
+                    Some("EVENT") => {
+                        if let Some(tags) = arr[2].get("tags").and_then(|t| t.as_array()) {
+                            result = parse_relay_tags_json(tags)
+                                .into_iter()
+                                .filter(|(_, read, _)| *read)
+                                .map(|(url, _, _)| url)
+                                .collect();
+                        }
+                    }
+                    Some("EOSE") | Some("CLOSED") => break,
+                    _ => {}
+                }
+            }
+            Ok(Some(Ok(Message::Ping(data)))) => {
+                let _ = ws_write.send(Message::Pong(data)).await;
+            }
+            _ => break,
+        }
+    }
+
+    Ok(result)
 }
 
 /// Fetch kind-10002 for an author from a single relay and return write relay URLs.
