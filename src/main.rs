@@ -247,7 +247,7 @@ async fn main() {
         None
     };
 
-    // Background: refresh profile_search materialized view every 5 minutes.
+    // Background: refresh profile_search materialized view once per day.
     let refresh_repo = repo.clone();
     tokio::spawn(async move {
         // Initial delay: let the service stabilize before first refresh.
@@ -257,7 +257,7 @@ async fn main() {
                 Ok(()) => tracing::info!("refreshed profile_search materialized view"),
                 Err(e) => tracing::warn!("failed to refresh profile_search: {e}"),
             }
-            tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+            tokio::time::sleep(std::time::Duration::from_secs(86400)).await;
         }
     });
 
