@@ -36,28 +36,79 @@ impl StatsCache {
     }
 
     /// Record a newly ingested event in Redis counters.
+    ///
+    /// Tracks global stats (existing) plus daily DAU (HyperLogLog) and daily
+    /// posts (kind-1 counter). Daily zap sats are tracked separately via
+    /// `record_daily_zap_sats` from the zap metadata extraction path.
     pub async fn on_event_ingested(&self, pubkey: &str, kind: i64) {
         let Ok(mut conn) = self.redis.get_multiplexed_async_connection().await else {
             return;
         };
+
+        // Today's date key (UTC) for daily stats — keys auto-expire after 48h.
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let dau_key = key(&format!("daily:dau:{today}"));
+        let posts_key = key(&format!("daily:posts:{today}"));
+
+        let mut pipe = redis::pipe();
+        pipe.atomic()
+            // Global counters (existing)
+            .cmd("INCR").arg(key("total_events"))
+            .cmd("PFADD").arg(key("unique_pubkeys")).arg(pubkey)
+            .cmd("HINCRBY").arg(key("events_by_kind")).arg(kind.to_string()).arg(1i64)
+            .cmd("INCR").arg(key("ingestion_window"))
+            // Daily DAU via HyperLogLog
+            .cmd("PFADD").arg(&dau_key).arg(pubkey);
+
+        // Daily posts counter (kind 1 only)
+        if kind == 1 {
+            pipe.cmd("INCR").arg(&posts_key);
+        }
+
+        let _: Result<(), _> = pipe.query_async(&mut conn).await;
+
+        // Set TTLs — ingestion window resets every 60s, daily keys expire after 48h
         let _: Result<(), _> = redis::pipe()
-            .atomic()
-            .cmd("INCR")
-            .arg(key("total_events"))
-            .cmd("PFADD")
-            .arg(key("unique_pubkeys"))
-            .arg(pubkey)
-            .cmd("HINCRBY")
-            .arg(key("events_by_kind"))
-            .arg(kind.to_string())
-            .arg(1i64)
-            .cmd("INCR")
-            .arg(key("ingestion_window"))
+            .cmd("EXPIRE").arg(key("ingestion_window")).arg(60i64)
+            .cmd("EXPIRE").arg(&dau_key).arg(172_800i64)
+            .cmd("EXPIRE").arg(&posts_key).arg(172_800i64)
             .query_async(&mut conn)
             .await;
+    }
 
-        // Set TTL on the sliding window counter (resets every 60s for rate calc)
-        let _: Result<i64, _> = conn.expire(&key("ingestion_window"), 60).await;
+    /// Get daily DAU and posts from Redis HLL + counters.
+    ///
+    /// Returns `None` if Redis keys don't exist yet (cold start / restart).
+    /// Zap sats are NOT included here — they're queried from the DB using the
+    /// indexed `zap_metadata.created_at` column (5ms with index).
+    pub async fn get_daily_dau_posts(&self) -> Option<(i64, i64)> {
+        let Ok(mut conn) = self.redis.get_multiplexed_async_connection().await else {
+            return None;
+        };
+
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let dau_key = key(&format!("daily:dau:{today}"));
+        let posts_key = key(&format!("daily:posts:{today}"));
+
+        // If the DAU key doesn't exist, this is a cold start.
+        let exists: bool = redis::cmd("EXISTS")
+            .arg(&dau_key)
+            .query_async(&mut conn)
+            .await
+            .unwrap_or(false);
+        if !exists {
+            return None;
+        }
+
+        let dau: i64 = redis::cmd("PFCOUNT")
+            .arg(&dau_key)
+            .query_async(&mut conn)
+            .await
+            .unwrap_or(0);
+
+        let daily_posts: i64 = conn.get(&posts_key).await.unwrap_or(0);
+
+        Some((dau, daily_posts))
     }
 
     /// Get global stats, preferring cached values, falling back to DB.

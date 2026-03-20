@@ -1593,6 +1593,23 @@ impl EventRepository {
         })
     }
 
+    /// Daily zap sats only (last 24h). Uses the indexed `zap_metadata.created_at` column.
+    /// ~5ms with the index vs minutes without.
+    pub async fn daily_zap_sats(&self) -> Result<i64, AppError> {
+        let since = chrono::Utc::now().timestamp() - 86400;
+        let total_sats: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COALESCE(SUM(amount_msats) / 1000, 0)::bigint
+            FROM zap_metadata
+            WHERE created_at >= $1
+            "#,
+        )
+        .bind(since)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(total_sats)
+    }
+
     /// Top zappers: users ranked by total sats sent or received in the specified timeframe.
     pub async fn top_zappers(
         &self,

@@ -599,6 +599,11 @@ pub async fn get_most_shared_authors(
 }
 
 /// Get daily network stats (DAU, total sats, daily posts).
+///
+/// DAU and daily posts are served from Redis (HyperLogLog + counter) for O(1)
+/// lookups. Zap sats use a lightweight indexed DB query (~5ms). Falls back to
+/// full DB query on cold start (first request after restart before any events
+/// have been ingested).
 pub async fn get_daily_stats(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
     let cache_key = "home:daily_stats";
     if let Some(cached) = state.cache.get_json(cache_key).await {
@@ -607,11 +612,25 @@ pub async fn get_daily_stats(State(state): State<AppState>) -> Result<Json<Value
         }
     }
 
-    let stats = state.repo.daily_stats().await?;
-    let response = serde_json::to_value(stats).unwrap();
+    let stats = if let Some((dau, daily_posts)) = state.cache.get_daily_dau_posts().await {
+        // Fast path: DAU + posts from Redis, only zap sats from DB (indexed, ~5ms).
+        let total_sats = state.repo.daily_zap_sats().await.unwrap_or(0);
+        crate::db::models::DailyStats {
+            daily_active_users: dau,
+            total_sats_sent: total_sats,
+            daily_posts,
+        }
+    } else {
+        // Cold start: full DB fallback (slow, but only happens once after restart).
+        state.repo.daily_stats().await?
+    };
+
+    let response = serde_json::to_value(&stats).unwrap();
 
     if let Ok(json_str) = serde_json::to_string(&response) {
-        state.cache.set_json(cache_key, &json_str, 600).await;
+        // Cache for 60s — data is live from Redis anyway, this just prevents
+        // redundant DB zap queries under load.
+        state.cache.set_json(cache_key, &json_str, 60).await;
     }
 
     Ok(Json(response))
