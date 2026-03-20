@@ -348,7 +348,9 @@ async fn cmd_crawl(pool: &sqlx::PgPool, pubkey: &str, extra_relays: Vec<String>)
             Err(e) => {
                 let msg = e.to_string();
                 if msg.contains("does not support negentropy") || msg.contains("negentropy disabled") {
-                    println!("  Strategy: paginated REQ (relay does not support negentropy)");
+                    // Relay supports negentropy globally but rejects per-author filtered queries.
+                    // This is a relay policy — fall back to paginated REQ.
+                    println!("  Strategy: paginated REQ (relay rejects per-author negentropy filter)");
                 } else {
                     println!("  Negentropy failed ({msg}), falling back to paginated REQ...");
                 }
@@ -532,7 +534,16 @@ async fn fetch_engagement_for_notes(
                                 }
                             }
                         }
-                        Some("EOSE") | Some("CLOSED") | Some("NOTICE") => break,
+                        Some("EOSE") => break,
+                        Some("CLOSED") => {
+                            let reason = arr.get(2).and_then(|v| v.as_str()).unwrap_or("?");
+                            tracing::debug!(relay = relay_url, "engagement sub CLOSED: {reason}");
+                            return Ok(total);
+                        }
+                        Some("NOTICE") => {
+                            let msg = arr.get(1).and_then(|v| v.as_str()).unwrap_or("?");
+                            tracing::debug!(relay = relay_url, "relay NOTICE during engagement fetch: {msg}");
+                        }
                         _ => {}
                     }
                 }
@@ -575,6 +586,8 @@ async fn fetch_zaps_for_author(
     repo: &nostr_api::db::repository::EventRepository,
     cache: &nostr_api::cache::StatsCache,
 ) -> Result<u64, String> {
+    let page_size: usize = 500;
+
     let (ws_stream, _) =
         timeout(Duration::from_secs(10), tokio_tungstenite::connect_async(relay_url))
             .await
@@ -583,65 +596,102 @@ async fn fetch_zaps_for_author(
 
     let (mut ws_write, mut ws_read) = ws_stream.split();
 
-    let sub_id = format!("zaps-{}", Uuid::new_v4().simple());
-    let req = serde_json::json!(["REQ", &sub_id, {
-        "kinds": [9735],
-        "#p": [pubkey],
-        "limit": 5000,
-    }]);
-
-    ws_write
-        .send(Message::Text(req.to_string().into()))
-        .await
-        .map_err(|e| format!("send failed: {e}"))?;
-
     let mut total = 0u64;
+    let mut until: Option<i64> = None;
 
     loop {
-        match timeout(Duration::from_secs(20), ws_read.next()).await {
-            Ok(Some(Ok(Message::Text(text)))) => {
-                let parsed: Value = match serde_json::from_str(&text) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
-                let arr = match parsed.as_array() {
-                    Some(a) if a.len() >= 2 => a,
-                    _ => continue,
-                };
-                match arr[0].as_str() {
-                    Some("EVENT") if arr.len() >= 3 => {
-                        if let Ok(event) = serde_json::from_value::<
-                            nostr_api::db::models::NostrEvent,
-                        >(arr[2].clone())
-                        {
-                            if event.kind == 9735 {
-                                match repo.insert_event(&event, relay_url).await {
-                                    Ok(true) => {
-                                        total += 1;
-                                        cache.on_event_ingested(&event.pubkey, event.kind).await;
-                                    }
-                                    Ok(false) => {}
-                                    Err(e) => {
-                                        tracing::debug!("zap insert failed: {e}");
-                                    }
+        let mut filter = serde_json::json!({
+            "kinds": [9735],
+            "#p": [pubkey],
+            "limit": page_size,
+        });
+        if let Some(u) = until {
+            filter["until"] = serde_json::json!(u);
+        }
+
+        let sub_id = format!("zaps-{}", Uuid::new_v4().simple());
+        let req = serde_json::json!(["REQ", &sub_id, filter]);
+
+        ws_write
+            .send(Message::Text(req.to_string().into()))
+            .await
+            .map_err(|e| format!("send failed: {e}"))?;
+
+        let mut page: Vec<(nostr_api::db::models::NostrEvent, i64)> = Vec::new();
+
+        loop {
+            match timeout(Duration::from_secs(20), ws_read.next()).await {
+                Ok(Some(Ok(Message::Text(text)))) => {
+                    let parsed: Value = match serde_json::from_str(&text) {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    };
+                    let arr = match parsed.as_array() {
+                        Some(a) if a.len() >= 2 => a,
+                        _ => continue,
+                    };
+                    match arr[0].as_str() {
+                        Some("EVENT") if arr.len() >= 3 => {
+                            if let Ok(event) = serde_json::from_value::<
+                                nostr_api::db::models::NostrEvent,
+                            >(arr[2].clone())
+                            {
+                                if event.kind == 9735 {
+                                    let ts = event.created_at;
+                                    page.push((event, ts));
                                 }
                             }
                         }
+                        Some("EOSE") => break,
+                        Some("CLOSED") => {
+                            let reason = arr.get(2).and_then(|v| v.as_str()).unwrap_or("?");
+                            tracing::debug!(relay = relay_url, "zap sub CLOSED: {reason}");
+                            return Ok(total);
+                        }
+                        Some("NOTICE") => {
+                            // Log but don't abort — relay may send informational notices
+                            let msg = arr.get(1).and_then(|v| v.as_str()).unwrap_or("?");
+                            tracing::debug!(relay = relay_url, "relay NOTICE during zap fetch: {msg}");
+                        }
+                        _ => {}
                     }
-                    Some("EOSE") | Some("CLOSED") | Some("NOTICE") => break,
-                    _ => {}
                 }
+                Ok(Some(Ok(Message::Ping(data)))) => {
+                    let _ = ws_write.send(Message::Pong(data)).await;
+                }
+                Ok(Some(Ok(Message::Close(_)))) | Ok(None) => {
+                    return Ok(total);
+                }
+                _ => break,
             }
-            Ok(Some(Ok(Message::Ping(data)))) => {
-                let _ = ws_write.send(Message::Pong(data)).await;
+        }
+
+        let close = serde_json::json!(["CLOSE", &sub_id]);
+        let _ = ws_write.send(Message::Text(close.to_string().into())).await;
+
+        let page_len = page.len();
+        let oldest_ts = page.iter().map(|(_, ts)| *ts).min();
+
+        for (event, _) in page {
+            match repo.insert_event(&event, relay_url).await {
+                Ok(true) => {
+                    total += 1;
+                    cache.on_event_ingested(&event.pubkey, event.kind).await;
+                }
+                Ok(false) => {}
+                Err(e) => tracing::debug!("zap insert failed: {e}"),
             }
-            Ok(Some(Ok(Message::Close(_)))) | Ok(None) => break,
-            _ => break,
+        }
+
+        if page_len < page_size {
+            break;
+        }
+
+        match oldest_ts {
+            Some(ts) => until = Some(ts - 1),
+            None => break,
         }
     }
-
-    let close = serde_json::json!(["CLOSE", &sub_id]);
-    let _ = ws_write.send(Message::Text(close.to_string().into())).await;
 
     Ok(total)
 }
