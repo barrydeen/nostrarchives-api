@@ -170,6 +170,38 @@ impl StatsCache {
         let _: Result<(), _> = conn.del(&key(cache_key)).await;
     }
 
+    /// Delete all keys whose cache_key starts with `prefix` (e.g. "analytics:top_posters").
+    /// Uses SCAN to avoid blocking Redis.
+    pub async fn delete_by_prefix(&self, prefix: &str) {
+        let Ok(mut conn) = self.redis.get_multiplexed_async_connection().await else {
+            return;
+        };
+        let pattern = format!("{}:*", key(prefix));
+        let mut cursor: u64 = 0;
+        loop {
+            let (next_cursor, keys): (u64, Vec<String>) =
+                match redis::cmd("SCAN")
+                    .arg(cursor)
+                    .arg("MATCH")
+                    .arg(&pattern)
+                    .arg("COUNT")
+                    .arg(100u64)
+                    .query_async(&mut conn)
+                    .await
+                {
+                    Ok(result) => result,
+                    Err(_) => break,
+                };
+            if !keys.is_empty() {
+                let _: Result<(), _> = conn.del(keys).await;
+            }
+            cursor = next_cursor;
+            if cursor == 0 {
+                break;
+            }
+        }
+    }
+
     /// Generic JSON cache: set with TTL
     pub async fn set_json(&self, cache_key: &str, json: &str, ttl: u64) {
         let Ok(mut conn) = self.redis.get_multiplexed_async_connection().await else {
