@@ -99,12 +99,32 @@ async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
             include_str!("../../migrations/017_update_profile_search.sql"),
         ),
         (
+            "018_backfill_zap_amounts",
+            include_str!("../../migrations/018_backfill_zap_amounts.sql"),
+        ),
+        (
             "019_analytics_materialized_views",
             include_str!("../../migrations/019_analytics_materialized_views.sql"),
         ),
         (
             "020_scheduled_events",
             include_str!("../../migrations/020_scheduled_events.sql"),
+        ),
+        (
+            "021_exponential_backfill",
+            include_str!("../../migrations/021_exponential_backfill.sql"),
+        ),
+        (
+            "022_missing_events",
+            include_str!("../../migrations/022_missing_events.sql"),
+        ),
+        (
+            "023_reset_zap_negentropy",
+            include_str!("../../migrations/023_reset_zap_negentropy.sql"),
+        ),
+        (
+            "024_analytics_leaderboard_views",
+            include_str!("../../migrations/024_analytics_leaderboard_views.sql"),
         ),
     ];
 
