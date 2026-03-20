@@ -252,28 +252,39 @@ async fn main() {
     tokio::spawn(async move {
         // Initial delay: let the service stabilize before first refresh.
         tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
         loop {
-            interval.tick().await;
             match refresh_repo.refresh_profile_search().await {
                 Ok(()) => tracing::info!("refreshed profile_search materialized view"),
                 Err(e) => tracing::warn!("failed to refresh profile_search: {e}"),
             }
+            tokio::time::sleep(std::time::Duration::from_secs(300)).await;
         }
     });
 
-    // Background: refresh analytics materialized views every 30 minutes.
+    // Background: refresh analytics materialized views every 30 minutes,
+    // then flush the corresponding Redis caches so stale data is never served.
     let analytics_mv_repo = repo.clone();
+    let analytics_mv_cache = stats_cache.clone();
     tokio::spawn(async move {
         // Initial delay: let migrations and profile_search finish first.
         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1800));
         loop {
-            interval.tick().await;
             match analytics_mv_repo.refresh_analytics_views().await {
-                Ok(()) => tracing::info!("refreshed analytics materialized views"),
+                Ok(()) => {
+                    tracing::info!("refreshed analytics materialized views");
+                    for prefix in &[
+                        "analytics:top_posters",
+                        "analytics:most_liked",
+                        "analytics:most_shared",
+                        "clients:leaderboard",
+                        "relays:leaderboard",
+                    ] {
+                        analytics_mv_cache.delete_by_prefix(prefix).await;
+                    }
+                }
                 Err(e) => tracing::warn!("failed to refresh analytics views: {e}"),
             }
+            tokio::time::sleep(std::time::Duration::from_secs(1800)).await;
         }
     });
 
