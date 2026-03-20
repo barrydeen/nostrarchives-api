@@ -130,6 +130,10 @@ async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
             "026_zap_metadata_created_at_index",
             include_str!("../../migrations/026_zap_metadata_created_at_index.sql"),
         ),
+        (
+            "027_hashtag_gin_index",
+            include_str!("../../migrations/027_hashtag_gin_index.sql"),
+        ),
     ];
 
     for (name, sql) in migrations {
