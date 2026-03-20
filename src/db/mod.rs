@@ -126,6 +126,10 @@ async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
             "025_profile_tab_sort_indexes",
             include_str!("../../migrations/025_profile_tab_sort_indexes.sql"),
         ),
+        (
+            "026_zap_metadata_created_at_index",
+            include_str!("../../migrations/026_zap_metadata_created_at_index.sql"),
+        ),
     ];
 
     for (name, sql) in migrations {

@@ -611,7 +611,7 @@ pub async fn get_daily_stats(State(state): State<AppState>) -> Result<Json<Value
     let response = serde_json::to_value(stats).unwrap();
 
     if let Ok(json_str) = serde_json::to_string(&response) {
-        state.cache.set_json(cache_key, &json_str, 120).await;
+        state.cache.set_json(cache_key, &json_str, 600).await;
     }
 
     Ok(Json(response))
