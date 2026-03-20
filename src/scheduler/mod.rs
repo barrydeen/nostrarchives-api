@@ -601,6 +601,7 @@ async fn handle_req(arr: &[Value], state: &SchedulerState, conn: &ConnectionStat
                relays_sent, relays_failed, submitted_at, published_at, error_message
         FROM scheduled_events
         WHERE pubkey = $1
+          AND status != 'cancelled'
         ORDER BY created_at ASC
         LIMIT $2
         "#,
