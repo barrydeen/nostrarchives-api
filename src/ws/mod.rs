@@ -11,6 +11,7 @@ use serde_json::Value;
 use tokio::sync::broadcast;
 
 use crate::api::AppState;
+use crate::nip19;
 use std::collections::HashMap;
 
 /// Feed type determines which query backs a feed endpoint.
@@ -256,6 +257,15 @@ async fn handle_search_req(sub_id: &str, filters: &[Value], state: &AppState) ->
             }
         };
 
+        // Entity resolution: if search term looks like a NIP-19 entity or raw hex,
+        // resolve it directly and return the matching event(s) without doing full-text search.
+        if nip19::looks_like_entity(search_term) {
+            if let Some(event_msgs) = resolve_entity_ws(search_term, sub_id, state).await {
+                messages.extend(event_msgs);
+                continue;
+            }
+        }
+
         let limit = filter
             .get("limit")
             .and_then(|v| v.as_i64())
@@ -441,6 +451,88 @@ async fn handle_search_req(sub_id: &str, filters: &[Value], state: &AppState) ->
 
     messages.push(eose(sub_id));
     messages
+}
+
+// ---------------------------------------------------------------------------
+// Entity resolution helper for NIP-50 search
+// ---------------------------------------------------------------------------
+
+/// Try to resolve a NIP-19 entity or 64-char hex as a Nostr event/profile.
+/// Returns a list of EVENT message strings to send, or `None` if unresolvable.
+async fn resolve_entity_ws(input: &str, sub_id: &str, state: &AppState) -> Option<Vec<String>> {
+    if let Some(entity) = nip19::decode(input) {
+        match &entity {
+            nip19::NostrEntity::Event { id, relays, .. } => {
+                // On-demand fetch if not in DB
+                if state.repo.get_event_by_id(id).await.ok()?.is_none() {
+                    let _ = state.fetcher.fetch_event_by_id(id, relays).await;
+                }
+                if let Some(event) = state.repo.get_event_by_id(id).await.ok()? {
+                    let msg = serde_json::to_string(
+                        &serde_json::json!(["EVENT", sub_id, event.raw.0]),
+                    )
+                    .expect("json serialization cannot fail");
+                    return Some(vec![msg]);
+                }
+                return Some(vec![]); // resolved as entity type but not found in DB
+            }
+            nip19::NostrEntity::Profile { pubkey, relays } => {
+                // On-demand fetch if not in DB
+                let profile_rows = state
+                    .repo
+                    .latest_profile_metadata(&[pubkey.clone()])
+                    .await
+                    .ok()?;
+                if profile_rows.is_empty() {
+                    let _ = state.fetcher.fetch_profile_metadata(pubkey, relays).await;
+                }
+                let events = state
+                    .repo
+                    .profile_events_for_pubkeys(&[pubkey.clone()])
+                    .await
+                    .ok()?;
+                let msgs: Vec<String> = events
+                    .iter()
+                    .map(|e| {
+                        serde_json::to_string(&serde_json::json!(["EVENT", sub_id, e.raw.0]))
+                            .expect("json serialization cannot fail")
+                    })
+                    .collect();
+                return Some(msgs);
+            }
+        }
+    }
+
+    // Raw 64-char hex: resolve via DB (no on-demand fetch to avoid abuse)
+    if nip19::is_hex64(input) {
+        if let Ok(Some((entity_type, id))) = state.repo.resolve_hex(input).await {
+            if entity_type == "event" {
+                if let Ok(Some(event)) = state.repo.get_event_by_id(&id).await {
+                    let msg = serde_json::to_string(
+                        &serde_json::json!(["EVENT", sub_id, event.raw.0]),
+                    )
+                    .expect("json serialization cannot fail");
+                    return Some(vec![msg]);
+                }
+            } else {
+                // Profile hex
+                if let Ok(events) = state.repo.profile_events_for_pubkeys(&[id]).await {
+                    let msgs: Vec<String> = events
+                        .iter()
+                        .map(|e| {
+                            serde_json::to_string(
+                                &serde_json::json!(["EVENT", sub_id, e.raw.0]),
+                            )
+                            .expect("json serialization cannot fail")
+                        })
+                        .collect();
+                    return Some(msgs);
+                }
+            }
+        }
+    }
+
+    None
 }
 
 // ---------------------------------------------------------------------------
