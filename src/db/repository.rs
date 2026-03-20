@@ -1573,13 +1573,13 @@ impl EventRepository {
         .fetch_one(&self.pool)
         .await?;
 
-        // Total sats: sum of zap receipt amounts in last 24h
+        // Total sats: sum of zap receipt amounts in last 24h.
+        // zap_metadata only stores kind-9735 events, so no join with events needed.
         let total_sats: i64 = sqlx::query_scalar(
             r#"
-            SELECT COALESCE(SUM(zm.amount_msats) / 1000, 0)::bigint
-            FROM zap_metadata zm
-            JOIN events e ON e.id = zm.event_id
-            WHERE e.kind = 9735 AND e.created_at >= $1
+            SELECT COALESCE(SUM(amount_msats) / 1000, 0)::bigint
+            FROM zap_metadata
+            WHERE created_at >= $1
             "#,
         )
         .bind(since)
@@ -2690,10 +2690,9 @@ impl EventRepository {
                 WHERE e.created_at >= $2 AND e.created_at < $3
             ),
             zap_sats AS (
-                SELECT COALESCE(SUM(zm.amount_msats) / 1000, 0)::bigint AS total_sats
-                FROM zap_metadata zm
-                JOIN events e ON e.id = zm.event_id
-                WHERE e.kind = 9735 AND e.created_at >= $2 AND e.created_at < $3
+                SELECT COALESCE(SUM(amount_msats) / 1000, 0)::bigint AS total_sats
+                FROM zap_metadata
+                WHERE created_at >= $2 AND created_at < $3
             )
             INSERT INTO daily_analytics (date, active_users, zaps_sent, notes_posted, computed_at)
             SELECT
