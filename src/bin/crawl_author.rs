@@ -326,32 +326,36 @@ async fn cmd_crawl(pool: &sqlx::PgPool, pubkey: &str, extra_relays: Vec<String>)
     for relay_url in &relays {
         println!("--- {relay_url} ---");
 
-        let has_neg = nostr_api::crawler::relay_caps::check_and_update_caps(pool, relay_url)
-            .await
-            .map(|c| c.supports_negentropy)
-            .unwrap_or(false);
-
-        let inserted = if has_neg {
-            println!("  Strategy: negentropy set reconciliation");
-            match syncer.sync_authors(relay_url, &[1], &author_vec).await {
-                Ok(stats) => {
-                    println!("  Discovered (relay has, we don't): {}", stats.events_discovered);
-                    println!("  Fetched:                          {}", stats.events_fetched);
-                    println!("  Inserted into DB:                 {}", stats.events_inserted);
-                    stats.events_inserted
-                }
-                Err(e) => {
-                    println!("  Negentropy failed ({e}), falling back to paginated REQ...");
-                    let n = crawl_via_paginated_req(relay_url, pubkey, &repo, &cache).await;
-                    println!("  Inserted (REQ fallback): {n}");
-                    n
-                }
+        // Always try negentropy first — don't trust the DB cache, which may be stale
+        // or have been reset by the running service. Fall back to REQ only on failure.
+        let inserted = match syncer.sync_authors(relay_url, &[1], &author_vec).await {
+            Ok(stats) => {
+                println!("  Strategy: negentropy set reconciliation");
+                println!("  Discovered (relay has, we don't): {}", stats.events_discovered);
+                println!("  Fetched:                          {}", stats.events_fetched);
+                println!("  Inserted into DB:                 {}", stats.events_inserted);
+                // Update DB cache so the main crawler knows this relay supports negentropy
+                let caps = nostr_api::crawler::relay_caps::RelayCaps {
+                    relay_url: relay_url.clone(),
+                    supports_negentropy: true,
+                    max_limit: None,
+                    nip11: None,
+                    last_checked_at: chrono::Utc::now(),
+                };
+                let _ = nostr_api::crawler::relay_caps::upsert_relay_caps(pool, &caps).await;
+                stats.events_inserted
             }
-        } else {
-            println!("  Strategy: paginated REQ (no negentropy)");
-            let n = crawl_via_paginated_req(relay_url, pubkey, &repo, &cache).await;
-            println!("  Inserted: {n}");
-            n
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("does not support negentropy") || msg.contains("negentropy disabled") {
+                    println!("  Strategy: paginated REQ (relay does not support negentropy)");
+                } else {
+                    println!("  Negentropy failed ({msg}), falling back to paginated REQ...");
+                }
+                let n = crawl_via_paginated_req(relay_url, pubkey, &repo, &cache).await;
+                println!("  Inserted: {n}");
+                n
+            }
         };
 
         relay_inserted.push((relay_url.clone(), inserted));
