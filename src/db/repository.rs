@@ -2456,19 +2456,34 @@ impl EventRepository {
             return Ok((Vec::new(), Vec::new()));
         }
 
-        // v2: engagement from counter columns, no event_refs join needed
-        let rows = sqlx::query(
-            r#"
-            WITH tagged_notes AS (
+        // Build GIN-indexed containment conditions: tags @> '[["t","bitcoin"]]' OR ...
+        // Each param is a jsonb array-of-arrays matching the stored tags structure.
+        // This hits idx_events_kind1_tags_gin instead of scanning all rows with jsonb_array_elements.
+        let tag_params: Vec<serde_json::Value> = tags_lower
+            .iter()
+            .map(|t| serde_json::json!([["t", t]]))
+            .collect();
+
+        let mut qb = sqlx::QueryBuilder::<sqlx::Postgres>::new(
+            r#"WITH tagged_notes AS (
                 SELECT DISTINCT e.id, e.pubkey, e.created_at, e.kind, e.content, e.sig,
                        e.tags, e.raw, e.relay_url, e.received_at,
                        e.reaction_count, e.repost_count, e.reply_count,
                        e.zap_count, e.zap_amount_msats
-                FROM events e,
-                     jsonb_array_elements(e.tags) AS tag_elem
-                WHERE e.kind = 1
-                  AND tag_elem->>0 = 't'
-                  AND LOWER(tag_elem->>1) = ANY($1)
+                FROM events e
+                WHERE e.kind = 1 AND ("#,
+        );
+
+        for (i, param) in tag_params.iter().enumerate() {
+            if i > 0 {
+                qb.push(" OR ");
+            }
+            qb.push("e.tags @> ");
+            qb.push_bind(param.clone());
+        }
+
+        qb.push(
+            r#")
                 ORDER BY e.created_at DESC
                 LIMIT 200
             )
@@ -2487,14 +2502,19 @@ impl EventRepository {
                 )::bigint AS score
             FROM tagged_notes tn
             ORDER BY score DESC, tn.created_at DESC
-            LIMIT $2 OFFSET $3
-            "#,
-        )
-        .bind(&tags_lower)
-        .bind(limit)
-        .bind(offset)
-        .fetch_all(&self.pool)
-        .await?;
+            LIMIT "#,
+        );
+        qb.push_bind(limit);
+        qb.push(" OFFSET ");
+        qb.push_bind(offset);
+
+        // Run inside a transaction so SET LOCAL statement_timeout is scoped to this query only.
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("SET LOCAL statement_timeout = '5000'")
+            .execute(&mut *tx)
+            .await?;
+        let rows = qb.build().fetch_all(&mut *tx).await?;
+        tx.commit().await?;
 
         let mut pubkeys = Vec::new();
         let notes = rows
