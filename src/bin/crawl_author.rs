@@ -34,7 +34,7 @@ async fn main() {
     let command = args.get(1).map(|s| s.as_str()).unwrap_or("help");
 
     match command {
-        "info" | "probe" | "crawl" => {}
+        "info" | "probe" | "crawl" | "engagement" => {}
         _ => {
             print_help();
             return;
@@ -59,6 +59,7 @@ async fn main() {
         "info" => cmd_info(&pool, &pubkey).await,
         "probe" => cmd_probe(&pool, &pubkey, extra_relays).await,
         "crawl" => cmd_crawl(&pool, &pubkey, extra_relays).await,
+        "engagement" => cmd_engagement(&pool, &pubkey, extra_relays).await,
         _ => unreachable!(),
     }
 }
@@ -67,9 +68,10 @@ fn print_help() {
     println!("crawl_author — per-author crawl diagnostic tool");
     println!();
     println!("Commands:");
-    println!("  info  <pubkey>              Show DB state: note count, relay list, crawl cursor");
-    println!("  probe <pubkey> [relay…]     Count notes per relay, no DB changes");
-    println!("  crawl <pubkey> [relay…]     Fetch and insert all notes from relays");
+    println!("  info       <pubkey>              Show DB state: note count, relay list, crawl cursor");
+    println!("  probe      <pubkey> [relay…]     Count notes per relay, no DB changes");
+    println!("  crawl      <pubkey> [relay…]     Fetch and insert all notes from relays");
+    println!("  engagement <pubkey> [relay…]     Backfill reactions, reposts, zaps for all DB notes");
     println!();
     println!("  <pubkey> may be hex (64 chars) or npub1… bech32.");
     println!("  If relay URLs are omitted, the author's NIP-65 write relays are used");
@@ -367,6 +369,275 @@ async fn cmd_crawl(pool: &sqlx::PgPool, pubkey: &str, extra_relays: Vec<String>)
     println!("  Notes before: {before}");
     println!("  Notes after:  {after}");
     println!("  Net new:      {}", after - before);
+}
+
+/// Backfill engagement (reactions, reposts, zaps) for all of the author's notes in DB.
+///
+/// Two passes per relay:
+///   1. `#e` filter — kinds 6, 7, 16, 9735 referencing each note ID (batches of 50)
+///   2. `#p` filter — kind 9735 zaps addressed to the author (catches zaps the #e pass misses)
+async fn cmd_engagement(pool: &sqlx::PgPool, pubkey: &str, extra_relays: Vec<String>) {
+    println!("\n=== Engagement backfill: {} ===\n", abbrev(pubkey));
+
+    // Load all kind-1 note IDs for this author from DB
+    let note_ids: Vec<String> = sqlx::query_scalar(
+        "SELECT id FROM events WHERE pubkey = $1 AND kind = 1 ORDER BY created_at DESC",
+    )
+    .bind(pubkey)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+
+    if note_ids.is_empty() {
+        println!("No kind-1 notes found in DB for this author.");
+        println!("Run `crawl` first to fetch their notes.");
+        return;
+    }
+
+    println!("Notes in DB to backfill engagement for: {}", note_ids.len());
+
+    let relays = resolve_relays(pool, pubkey, extra_relays).await;
+    if relays.is_empty() {
+        println!("No relays found. Pass relay URLs directly:");
+        println!("  cargo run --bin crawl_author -- engagement <pubkey> wss://relay.damus.io");
+        return;
+    }
+
+    let redis_url = env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
+    let redis_client = redis::Client::open(redis_url.as_str()).expect("invalid redis url");
+    let follower_cache = nostr_api::follower_cache::FollowerCache::new(pool.clone(), 5, 3600);
+    let wot_cache = nostr_api::wot_cache::WotCache::new(pool.clone(), 21, 900);
+    let repo = nostr_api::db::repository::EventRepository::new(
+        pool.clone(),
+        follower_cache,
+        wot_cache,
+    );
+    let cache = nostr_api::cache::StatsCache::new(redis_client, repo.clone());
+
+    let mut grand_total_engagement = 0u64;
+    let mut grand_total_zaps = 0u64;
+
+    for relay_url in &relays {
+        println!("--- {relay_url} ---");
+
+        // Pass 1: engagement events referencing each note (#e filter)
+        print!("  Pass 1 (#e reactions/reposts/zaps): ");
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+
+        match fetch_engagement_for_notes(relay_url, &note_ids, &repo, &cache).await {
+            Ok(n) => {
+                println!("{n} new events");
+                grand_total_engagement += n;
+            }
+            Err(e) => println!("ERROR: {e}"),
+        }
+
+        // Pass 2: zaps addressed to the author (#p filter)
+        // Necessary because zap receipts are authored by the LNURL provider,
+        // not the note author, so they don't appear in the #e pass.
+        print!("  Pass 2 (#p zaps):                  ");
+        let _ = std::io::stdout().flush();
+
+        match fetch_zaps_for_author(relay_url, pubkey, &repo, &cache).await {
+            Ok(n) => {
+                println!("{n} new zaps");
+                grand_total_zaps += n;
+            }
+            Err(e) => println!("ERROR: {e}"),
+        }
+
+        println!();
+    }
+
+    println!("=== Engagement backfill complete ===");
+    println!(
+        "  Reactions/reposts/zaps (#e): {grand_total_engagement} new events"
+    );
+    println!("  Zaps (#p):                   {grand_total_zaps} new events");
+    println!(
+        "  Total new engagement events: {}",
+        grand_total_engagement + grand_total_zaps
+    );
+}
+
+/// Fetch engagement events (kinds 6, 7, 16, 9735) referencing a set of note IDs.
+/// Opens one WS connection to the relay and sends batches of 50 note IDs per REQ.
+async fn fetch_engagement_for_notes(
+    relay_url: &str,
+    note_ids: &[String],
+    repo: &nostr_api::db::repository::EventRepository,
+    cache: &nostr_api::cache::StatsCache,
+) -> Result<u64, String> {
+    let (ws_stream, _) =
+        timeout(Duration::from_secs(10), tokio_tungstenite::connect_async(relay_url))
+            .await
+            .map_err(|_| "connect timeout".to_string())?
+            .map_err(|e| format!("connect error: {e}"))?;
+
+    let (mut ws_write, mut ws_read) = ws_stream.split();
+    let mut total = 0u64;
+    let chunks_total = note_ids.chunks(50).count();
+
+    for (i, chunk) in note_ids.chunks(50).enumerate() {
+        let filter = serde_json::json!({
+            "kinds": [6, 7, 16, 9735],
+            "#e": chunk,
+            "limit": 5000,
+        });
+
+        let sub_id = format!("eng-{}", Uuid::new_v4().simple());
+        let req = serde_json::json!(["REQ", &sub_id, filter]);
+
+        ws_write
+            .send(Message::Text(req.to_string().into()))
+            .await
+            .map_err(|e| format!("send failed: {e}"))?;
+
+        loop {
+            match timeout(Duration::from_secs(15), ws_read.next()).await {
+                Ok(Some(Ok(Message::Text(text)))) => {
+                    let parsed: Value = match serde_json::from_str(&text) {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    };
+                    let arr = match parsed.as_array() {
+                        Some(a) if a.len() >= 2 => a,
+                        _ => continue,
+                    };
+                    match arr[0].as_str() {
+                        Some("EVENT") if arr.len() >= 3 => {
+                            if let Ok(event) = serde_json::from_value::<
+                                nostr_api::db::models::NostrEvent,
+                            >(arr[2].clone())
+                            {
+                                match repo.insert_event(&event, relay_url).await {
+                                    Ok(true) => {
+                                        total += 1;
+                                        cache.on_event_ingested(&event.pubkey, event.kind).await;
+                                    }
+                                    Ok(false) => {}
+                                    Err(e) => {
+                                        tracing::debug!("engagement insert failed: {e}");
+                                    }
+                                }
+                            }
+                        }
+                        Some("EOSE") | Some("CLOSED") | Some("NOTICE") => break,
+                        _ => {}
+                    }
+                }
+                Ok(Some(Ok(Message::Ping(data)))) => {
+                    let _ = ws_write.send(Message::Pong(data)).await;
+                }
+                Ok(Some(Ok(Message::Close(_)))) | Ok(None) => {
+                    return Ok(total);
+                }
+                _ => break,
+            }
+        }
+
+        let close = serde_json::json!(["CLOSE", &sub_id]);
+        let _ = ws_write.send(Message::Text(close.to_string().into())).await;
+
+        // Progress for large note sets (every 10 chunks)
+        if (i + 1) % 10 == 0 || i + 1 == chunks_total {
+            print!(
+                "\r  Pass 1 (#e reactions/reposts/zaps): chunk {}/{} — {total} new so far",
+                i + 1,
+                chunks_total
+            );
+            use std::io::Write;
+            let _ = std::io::stdout().flush();
+        }
+    }
+
+    if chunks_total > 1 {
+        println!(); // newline after progress
+    }
+
+    Ok(total)
+}
+
+/// Fetch zap receipts (kind 9735) addressed to a specific author via the `#p` tag.
+/// Opens one WS connection and sends a single REQ (one author = one chunk).
+async fn fetch_zaps_for_author(
+    relay_url: &str,
+    pubkey: &str,
+    repo: &nostr_api::db::repository::EventRepository,
+    cache: &nostr_api::cache::StatsCache,
+) -> Result<u64, String> {
+    let (ws_stream, _) =
+        timeout(Duration::from_secs(10), tokio_tungstenite::connect_async(relay_url))
+            .await
+            .map_err(|_| "connect timeout".to_string())?
+            .map_err(|e| format!("connect error: {e}"))?;
+
+    let (mut ws_write, mut ws_read) = ws_stream.split();
+
+    let filter = serde_json::json!({
+        "kinds": [9735],
+        "#p": [pubkey],
+        "limit": 5000,
+    });
+
+    let sub_id = format!("zaps-{}", Uuid::new_v4().simple());
+    let req = serde_json::json!(["REQ", &sub_id, filter]);
+
+    ws_write
+        .send(Message::Text(req.to_string().into()))
+        .await
+        .map_err(|e| format!("send failed: {e}"))?;
+
+    let mut total = 0u64;
+
+    loop {
+        match timeout(Duration::from_secs(20), ws_read.next()).await {
+            Ok(Some(Ok(Message::Text(text)))) => {
+                let parsed: Value = match serde_json::from_str(&text) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                let arr = match parsed.as_array() {
+                    Some(a) if a.len() >= 2 => a,
+                    _ => continue,
+                };
+                match arr[0].as_str() {
+                    Some("EVENT") if arr.len() >= 3 => {
+                        if let Ok(event) = serde_json::from_value::<
+                            nostr_api::db::models::NostrEvent,
+                        >(arr[2].clone())
+                        {
+                            if event.kind == 9735 {
+                                match repo.insert_event(&event, relay_url).await {
+                                    Ok(true) => {
+                                        total += 1;
+                                        cache.on_event_ingested(&event.pubkey, event.kind).await;
+                                    }
+                                    Ok(false) => {}
+                                    Err(e) => {
+                                        tracing::debug!("zap insert failed: {e}");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Some("EOSE") | Some("CLOSED") | Some("NOTICE") => break,
+                    _ => {}
+                }
+            }
+            Ok(Some(Ok(Message::Ping(data)))) => {
+                let _ = ws_write.send(Message::Pong(data)).await;
+            }
+            Ok(Some(Ok(Message::Close(_)))) | Ok(None) => break,
+            _ => break,
+        }
+    }
+
+    let close = serde_json::json!(["CLOSE", &sub_id]);
+    let _ = ws_write.send(Message::Text(close.to_string().into())).await;
+
+    Ok(total)
 }
 
 // ── Relay resolution ─────────────────────────────────────────────────────────
