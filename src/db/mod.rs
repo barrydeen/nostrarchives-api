@@ -134,6 +134,10 @@ async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
             "027_hashtag_gin_index",
             include_str!("../../migrations/027_hashtag_gin_index.sql"),
         ),
+        (
+            "028_perf_missing_indexes",
+            include_str!("../../migrations/028_perf_missing_indexes.sql"),
+        ),
     ];
 
     for (name, sql) in migrations {

@@ -85,14 +85,20 @@ impl WotCache {
                 FROM follows
                 GROUP BY followed_pubkey
                 HAVING COUNT(*) >= $1
+            ),
+            quality AS (
+                SELECT f.followed_pubkey AS pubkey,
+                       COUNT(*)::bigint AS quality_followers
+                FROM follows f
+                INNER JOIN level1 l ON l.pubkey = f.follower_pubkey
+                GROUP BY f.followed_pubkey
+                HAVING COUNT(*) >= $1
             )
-            SELECT f.followed_pubkey AS pubkey,
-                   COUNT(*)::bigint AS quality_followers,
-                   (SELECT COALESCE(cnt, 0) FROM level1 WHERE pubkey = f.followed_pubkey)::bigint AS total_followers
-            FROM follows f
-            INNER JOIN level1 l ON l.pubkey = f.follower_pubkey
-            GROUP BY f.followed_pubkey
-            HAVING COUNT(*) >= $1
+            SELECT q.pubkey,
+                   q.quality_followers,
+                   COALESCE(l.cnt, 0)::bigint AS total_followers
+            FROM quality q
+            LEFT JOIN level1 l ON l.pubkey = q.pubkey
             "#,
         )
         .bind(self.threshold)
