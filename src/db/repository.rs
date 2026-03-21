@@ -2708,23 +2708,14 @@ impl EventRepository {
             .timestamp();
         let end_ts = start_ts + 86400;
 
-        // Credible actors: pubkeys with 3+ followers (eliminates bots/throwaways)
-        // active_users: distinct credible pubkeys who broadcasted any event
-        // notes_posted: kind-1 events from credible pubkeys only
-        // zaps_sent: total sats (not event count) from zap receipts in the period
+        // Events are already WoT-filtered at ingestion time, so no need for
+        // a credible_actors join here — just query events directly.
         sqlx::query(
             r#"
-            WITH credible_actors AS (
-                SELECT followed_pubkey AS pubkey
-                FROM follows
-                GROUP BY followed_pubkey
-                HAVING COUNT(*) >= 3
-            ),
-            day_events AS (
-                SELECT e.pubkey, e.kind, e.id
-                FROM events e
-                INNER JOIN credible_actors ca ON ca.pubkey = e.pubkey
-                WHERE e.created_at >= $2 AND e.created_at < $3
+            WITH day_events AS (
+                SELECT pubkey, kind
+                FROM events
+                WHERE created_at >= $2 AND created_at < $3
             ),
             zap_sats AS (
                 SELECT COALESCE(SUM(amount_msats) / 1000, 0)::bigint AS total_sats
