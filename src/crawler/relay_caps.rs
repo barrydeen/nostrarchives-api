@@ -142,6 +142,68 @@ pub async fn probe_neg_open(relay_url: &str) -> Result<bool, AppError> {
 }
 
 // ---------------------------------------------------------------------------
+// NEG-OPEN probe with author filter
+// ---------------------------------------------------------------------------
+
+/// Probe whether a relay supports negentropy with an `authors` filter.
+/// Some relays support negentropy but reject when `authors` is included.
+pub async fn probe_negentropy_with_authors(relay_url: &str) -> Result<bool, AppError> {
+    let (mut ws, _) = timeout(Duration::from_secs(5), connect_async(relay_url))
+        .await
+        .map_err(|_| AppError::Internal(format!("WS connect timeout: {relay_url}")))?
+        .map_err(|e| AppError::Internal(format!("WS connect {relay_url}: {e}")))?;
+
+    let mut storage = NegentropyStorageVector::new();
+    storage
+        .seal()
+        .map_err(|e| AppError::Internal(format!("neg seal: {e}")))?;
+    let mut neg = Negentropy::owned(storage, 0)
+        .map_err(|e| AppError::Internal(format!("neg new: {e}")))?;
+    let init_msg = neg
+        .initiate()
+        .map_err(|e| AppError::Internal(format!("neg initiate: {e}")))?;
+
+    let sub_id = "neg-probe-authors";
+    let dummy_pubkey = "0".repeat(64);
+    let filter = serde_json::json!({"kinds": [1], "authors": [dummy_pubkey]});
+    let neg_open = serde_json::json!(["NEG-OPEN", sub_id, filter, hex::encode(&init_msg)]);
+
+    ws.send(Message::Text(neg_open.to_string().into()))
+        .await
+        .map_err(|e| AppError::Internal(format!("WS send: {e}")))?;
+
+    let result = timeout(Duration::from_secs(5), async {
+        while let Some(msg) = ws.next().await {
+            let msg = match msg {
+                Ok(m) => m,
+                Err(_) => return false,
+            };
+            if let Message::Text(txt) = msg {
+                let txt_str: &str = txt.as_ref();
+                if let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(txt_str) {
+                    if let Some(cmd) = arr.first().and_then(|v| v.as_str()) {
+                        match cmd {
+                            "NEG-MSG" => return true,
+                            "NEG-ERR" | "NOTICE" => return false,
+                            _ => continue,
+                        }
+                    }
+                }
+            }
+        }
+        false
+    })
+    .await
+    .unwrap_or(false);
+
+    let neg_close = serde_json::json!(["NEG-CLOSE", sub_id]);
+    let _ = ws.send(Message::Text(neg_close.to_string().into())).await;
+    let _ = ws.close(None).await;
+
+    Ok(result)
+}
+
+// ---------------------------------------------------------------------------
 // DB persistence
 // ---------------------------------------------------------------------------
 
