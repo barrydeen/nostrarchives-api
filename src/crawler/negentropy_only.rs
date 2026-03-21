@@ -52,18 +52,22 @@ impl NegentropyOnlyCrawler {
         let mut confirmed = Vec::new();
 
         for relay_url in &self.pinned_relays {
-            match relay_caps::probe_negentropy_with_authors(relay_url).await {
+            // Use basic NEG-OPEN probe (no author filter) since the author-filtered
+            // probe can give false negatives when the relay responds with an immediate
+            // empty reconciliation for a dummy pubkey. Per-author syncs with real
+            // pubkeys work fine at runtime; errors are handled gracefully per-relay.
+            match relay_caps::probe_neg_open(relay_url).await {
                 Ok(true) => {
                     tracing::info!(
                         relay = %relay_url,
-                        "negentropy_only: relay confirmed (negentropy + author filter)"
+                        "negentropy_only: relay confirmed (negentropy support)"
                     );
                     confirmed.push(relay_url.clone());
                 }
                 Ok(false) => {
                     tracing::warn!(
                         relay = %relay_url,
-                        "negentropy_only: relay does NOT support negentropy with author filter"
+                        "negentropy_only: relay does NOT support negentropy"
                     );
                 }
                 Err(e) => {
