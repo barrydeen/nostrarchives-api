@@ -40,6 +40,10 @@ pub struct Config {
     pub scheduler_ws_listen_addr: String,
     pub indexer_enabled: bool,
     pub indexer_ws_listen_addr: String,
+    /// Crawl mode: "hybrid" (default) or "negentropy_only" (simple per-author negentropy sync).
+    pub crawl_mode: String,
+    /// Pinned relays for negentropy_only mode (tested at boot for negentropy+author support).
+    pub negentropy_pinned_relays: Vec<String>,
 }
 
 impl Config {
@@ -222,6 +226,26 @@ impl Config {
         let indexer_ws_listen_addr =
             env::var("INDEXER_WS_LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:8003".into());
 
+        let crawl_mode = env::var("CRAWL_MODE").unwrap_or_else(|_| "hybrid".into());
+
+        let negentropy_pinned_relays: Vec<String> = env::var("NEGENTROPY_PINNED_RELAYS")
+            .unwrap_or_else(|_| {
+                [
+                    "wss://relay.damus.io",
+                    "wss://nos.lol",
+                    "wss://relay.primal.net",
+                    "wss://relay.nostr.band",
+                    "wss://nostr.wine",
+                    "wss://purplepag.es",
+                    "wss://relay.nos.social",
+                ]
+                .join(",")
+            })
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+
         Self {
             database_url,
             redis_url,
@@ -259,6 +283,8 @@ impl Config {
             scheduler_ws_listen_addr,
             indexer_enabled,
             indexer_ws_listen_addr,
+            crawl_mode,
+            negentropy_pinned_relays,
         }
     }
 }
