@@ -2468,6 +2468,11 @@ impl EventRepository {
             .map(|t| serde_json::json!([["t", t]]))
             .collect();
 
+        // Limit to last 7 days to keep the scan fast for popular hashtags like #bitcoin.
+        // Without this, the GIN index finds 120k+ matching rows and the heap scan times out.
+        // 7 days is enough to fill 200 results for any active hashtag.
+        let since = chrono::Utc::now().timestamp() - 7 * 86400;
+
         let mut qb = sqlx::QueryBuilder::<sqlx::Postgres>::new(
             r#"WITH tagged_notes AS (
                 SELECT DISTINCT e.id, e.pubkey, e.created_at, e.kind, e.content, e.sig,
@@ -2475,8 +2480,10 @@ impl EventRepository {
                        e.reaction_count, e.repost_count, e.reply_count,
                        e.zap_count, e.zap_amount_msats
                 FROM events e
-                WHERE e.kind = 1 AND ("#,
+                WHERE e.kind = 1 AND e.created_at >= "#,
         );
+        qb.push_bind(since);
+        qb.push(" AND (");
 
         for (i, param) in tag_params.iter().enumerate() {
             if i > 0 {
