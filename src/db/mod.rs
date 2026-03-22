@@ -138,6 +138,10 @@ async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
             "028_perf_missing_indexes",
             include_str!("../../migrations/028_perf_missing_indexes.sql"),
         ),
+        (
+            "029_follows_composite_indexes",
+            include_str!("../../migrations/029_follows_composite_indexes.sql"),
+        ),
     ];
 
     for (name, sql) in migrations {

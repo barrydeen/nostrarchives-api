@@ -1293,6 +1293,8 @@ impl EventRepository {
     }
 
     /// Return (follows_count, followers_count) for a pubkey.
+    /// Uses profile_search MV for followers_count (refreshed every 5min) to avoid
+    /// expensive COUNT(*) on large follower sets.
     pub async fn follow_counts(&self, pubkey: &str) -> Result<(i64, i64), AppError> {
         let follows_count: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM follows WHERE follower_pubkey = $1")
@@ -1300,11 +1302,13 @@ impl EventRepository {
                 .fetch_one(&self.pool)
                 .await?;
 
-        let followers_count: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM follows WHERE followed_pubkey = $1")
-                .bind(pubkey)
-                .fetch_one(&self.pool)
-                .await?;
+        let followers_count: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(follower_count, 0) FROM profile_search WHERE pubkey = $1",
+        )
+        .bind(pubkey)
+        .fetch_optional(&self.pool)
+        .await?
+        .unwrap_or(0);
 
         Ok((follows_count, followers_count))
     }
