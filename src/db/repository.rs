@@ -2521,7 +2521,7 @@ impl EventRepository {
 
         // Run inside a transaction so SET LOCAL statement_timeout is scoped to this query only.
         let mut tx = self.pool.begin().await?;
-        sqlx::query("SET LOCAL statement_timeout = '5000'")
+        sqlx::query("SET LOCAL statement_timeout = '15000'")
             .execute(&mut *tx)
             .await?;
         let rows = qb.build().fetch_all(&mut *tx).await?;
