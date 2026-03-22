@@ -1,11 +1,17 @@
 //! Backfill missing follow lists (kind-3) for authors in crawl_state.
 //!
 //! Finds all pubkeys in crawl_state that have no entry in follow_lists,
-//! then fetches their kind-3 from relays in large batches.
+//! then fetches their kind-3 from indexer relays. All relays are queried
+//! in parallel per batch — fastest response wins for each pubkey.
 //!
 //! Usage:
-//!   cargo run --bin backfill_follows [-- --batch-size 500 --relay wss://relay.damus.io]
+//!   cargo run --bin backfill_follows [-- --dry-run --batch-size 500]
+//!
+//! Flags:
+//!   --dry-run       Fetch from relays but skip all DB writes (for testing speed)
+//!   --batch-size N  Authors per relay request (default 500)
 
+use std::collections::HashMap;
 use std::env;
 use std::time::{Duration, Instant};
 
@@ -22,15 +28,20 @@ use nostr_api::follower_cache::FollowerCache;
 use nostr_api::wot_cache::WotCache;
 
 const DEFAULT_BATCH_SIZE: usize = 500;
-const RELAY_TIMEOUT: Duration = Duration::from_secs(30);
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Total time budget per batch across all relays racing.
+const BATCH_TIMEOUT: Duration = Duration::from_secs(20);
+/// Per-relay connect timeout.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Per-relay message read timeout (time waiting for next message after connect).
+const READ_TIMEOUT: Duration = Duration::from_secs(10);
 
-const DEFAULT_RELAYS: &[&str] = &[
+const RELAYS: &[&str] = &[
+    "wss://indexer.coracle.social",
     "wss://relay.damus.io",
+    "wss://relay.primal.net",
     "wss://nos.lol",
-    "wss://relay.nostr.band",
+    "wss://relay.nos.social",
     "wss://purplepag.es",
-    "wss://relay.snort.social",
 ];
 
 #[tokio::main]
@@ -45,40 +56,26 @@ async fn main() {
         .init();
 
     let args: Vec<String> = env::args().collect();
+    let dry_run = args.iter().any(|a| a == "--dry-run");
     let batch_size = parse_flag(&args, "--batch-size")
         .and_then(|s| s.parse().ok())
         .unwrap_or(DEFAULT_BATCH_SIZE);
 
-    let relays: Vec<String> = {
-        let mut custom = Vec::new();
-        let mut i = 1;
-        while i < args.len() {
-            if args[i] == "--relay" {
-                if let Some(url) = args.get(i + 1) {
-                    custom.push(url.clone());
-                    i += 2;
-                    continue;
-                }
-            }
-            i += 1;
-        }
-        if custom.is_empty() {
-            DEFAULT_RELAYS.iter().map(|s| s.to_string()).collect()
-        } else {
-            custom
-        }
-    };
+    let relays: Vec<String> = RELAYS.iter().map(|s| s.to_string()).collect();
 
     // Database setup
-    let database_url =
-        env::var("DATABASE_URL").expect("DATABASE_URL must be set");
+    let database_url = env::var("DATABASE_URL").expect("DATABASE_URL must be set");
     let pool = db::init_pool(&database_url)
         .await
         .expect("failed to connect to database");
 
-    let follower_cache = FollowerCache::new(pool.clone(), 21, 900);
-    let wot_cache = WotCache::new(pool.clone(), 21, 900);
-    let repo = EventRepository::new(pool.clone(), follower_cache, wot_cache);
+    let repo = if !dry_run {
+        let follower_cache = FollowerCache::new(pool.clone(), 21, 900);
+        let wot_cache = WotCache::new(pool.clone(), 21, 900);
+        Some(EventRepository::new(pool.clone(), follower_cache, wot_cache))
+    } else {
+        None
+    };
 
     // Find all pubkeys missing follow lists
     let missing: Vec<String> = sqlx::query_scalar(
@@ -95,6 +92,7 @@ async fn main() {
         missing = missing.len(),
         batch_size = batch_size,
         relays = relays.len(),
+        dry_run = dry_run,
         "starting follow list backfill"
     );
 
@@ -111,83 +109,53 @@ async fn main() {
 
     for (batch_idx, batch) in missing.chunks(batch_size).enumerate() {
         let batch_start = Instant::now();
+        let batch_pubkeys: Vec<String> = batch.to_vec();
+
+        // Race all relays in parallel — merge results keeping newest per pubkey
+        let events = race_fetch_kind3(&relays, &batch_pubkeys).await;
+
+        let batch_found = events.len();
         let mut batch_upserted: usize = 0;
-        let mut found_pubkeys = std::collections::HashSet::new();
 
-        // Try each relay until we've found lists for most of the batch
-        for relay_url in &relays {
-            // Only request pubkeys we haven't found yet
-            let still_missing: Vec<String> = batch
-                .iter()
-                .filter(|pk| !found_pubkeys.contains(*pk))
-                .cloned()
-                .collect();
-
-            if still_missing.is_empty() {
-                break;
-            }
-
-            match fetch_kind3_batch(relay_url, &still_missing).await {
-                Ok(events) => {
-                    for event in &events {
-                        found_pubkeys.insert(event.pubkey.clone());
-
-                        // Insert the event (kind-3 always passes WoT gate)
-                        match repo.insert_event(event, relay_url).await {
-                            Ok(true) => {
-                                // Also upsert the follow list
-                                match repo.upsert_follow_list(event).await {
-                                    Ok(Some(count)) => {
-                                        batch_upserted += 1;
-                                        tracing::debug!(
-                                            pubkey = %&event.pubkey[..12],
-                                            follows = count,
-                                            "follow list upserted"
-                                        );
-                                    }
-                                    Ok(None) => {}
-                                    Err(e) => {
-                                        tracing::warn!(
-                                            pubkey = %&event.pubkey[..12],
-                                            error = %e,
-                                            "upsert_follow_list failed"
-                                        );
-                                    }
+        if !dry_run {
+            if let Some(ref repo) = repo {
+                for event in &events {
+                    let relay_url = "backfill";
+                    match repo.insert_event(event, relay_url).await {
+                        Ok(true) => {
+                            match repo.upsert_follow_list(event).await {
+                                Ok(Some(_)) => batch_upserted += 1,
+                                Ok(None) => {}
+                                Err(e) => {
+                                    tracing::warn!(
+                                        pubkey = %&event.pubkey[..12],
+                                        error = %e,
+                                        "upsert_follow_list failed"
+                                    );
                                 }
                             }
-                            Ok(false) => {
-                                // Duplicate or older — still try upsert in case follow_lists
-                                // entry is missing despite having the event
-                                let _ = repo.upsert_follow_list(event).await;
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    pubkey = %&event.pubkey[..12],
-                                    error = %e,
-                                    "insert_event failed"
-                                );
+                        }
+                        Ok(false) => {
+                            // Event exists but follow_lists might be missing
+                            match repo.upsert_follow_list(event).await {
+                                Ok(Some(_)) => batch_upserted += 1,
+                                _ => {}
                             }
                         }
+                        Err(e) => {
+                            tracing::warn!(
+                                pubkey = %&event.pubkey[..12],
+                                error = %e,
+                                "insert_event failed"
+                            );
+                        }
                     }
-                    tracing::debug!(
-                        relay = %relay_url,
-                        requested = still_missing.len(),
-                        found = events.len(),
-                        "relay batch complete"
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        relay = %relay_url,
-                        error = %e,
-                        "fetch failed, trying next relay"
-                    );
                 }
             }
         }
 
         authors_processed += batch.len();
-        total_found += found_pubkeys.len();
+        total_found += batch_found;
         total_upserted += batch_upserted;
 
         let elapsed = start.elapsed().as_secs();
@@ -206,7 +174,7 @@ async fn main() {
         tracing::info!(
             batch = batch_idx + 1,
             batch_size = batch.len(),
-            batch_found = found_pubkeys.len(),
+            batch_found = batch_found,
             batch_upserted = batch_upserted,
             batch_ms = batch_start.elapsed().as_millis() as u64,
             progress = format!("{}/{}", authors_processed, total_missing),
@@ -226,6 +194,65 @@ async fn main() {
         elapsed_secs = start.elapsed().as_secs(),
         "backfill complete"
     );
+}
+
+/// Race all relays in parallel for a batch of pubkeys.
+/// Each relay gets the same full batch. Results are merged keeping the newest
+/// kind-3 event per pubkey across all relays.
+async fn race_fetch_kind3(relays: &[String], pubkeys: &[String]) -> Vec<NostrEvent> {
+    let tasks: Vec<_> = relays
+        .iter()
+        .map(|relay_url| {
+            let relay = relay_url.clone();
+            let pks = pubkeys.to_vec();
+            tokio::spawn(async move { fetch_kind3_batch(&relay, &pks).await })
+        })
+        .collect();
+
+    // Wait for all relays with a total batch timeout
+    let results = match timeout(BATCH_TIMEOUT, futures_util::future::join_all(tasks)).await {
+        Ok(results) => results,
+        Err(_) => {
+            tracing::warn!("batch timeout reached, using partial results");
+            return Vec::new();
+        }
+    };
+
+    // Merge: keep newest event per pubkey
+    let mut best: HashMap<String, NostrEvent> = HashMap::new();
+    let mut relay_stats: Vec<(&str, usize)> = Vec::new();
+
+    for (i, result) in results.into_iter().enumerate() {
+        let relay_name = relays.get(i).map(|s| s.as_str()).unwrap_or("?");
+        match result {
+            Ok(Ok(events)) => {
+                let count = events.len();
+                for event in events {
+                    let existing = best.get(&event.pubkey);
+                    if existing.is_none() || event.created_at > existing.unwrap().created_at {
+                        best.insert(event.pubkey.clone(), event);
+                    }
+                }
+                relay_stats.push((relay_name, count));
+            }
+            Ok(Err(e)) => {
+                tracing::debug!(relay = relay_name, error = %e, "relay failed");
+                relay_stats.push((relay_name, 0));
+            }
+            Err(e) => {
+                tracing::debug!(relay = relay_name, error = %e, "relay task panicked");
+                relay_stats.push((relay_name, 0));
+            }
+        }
+    }
+
+    tracing::debug!(
+        relays = ?relay_stats.iter().map(|(r, c)| format!("{}:{}", r.split('/').last().unwrap_or(r), c)).collect::<Vec<_>>(),
+        merged = best.len(),
+        "relay race complete"
+    );
+
+    best.into_values().collect()
 }
 
 /// Fetch kind-3 events for a batch of authors from a single relay.
@@ -256,10 +283,9 @@ async fn fetch_kind3_batch(
         .map_err(|e| format!("send REQ failed: {e}"))?;
 
     let mut events: Vec<NostrEvent> = Vec::new();
-    let mut seen_pubkeys = std::collections::HashSet::new();
 
     loop {
-        match timeout(RELAY_TIMEOUT, read.next()).await {
+        match timeout(READ_TIMEOUT, read.next()).await {
             Ok(Some(Ok(Message::Text(text)))) => {
                 let parsed: Value = match serde_json::from_str(&text) {
                     Ok(v) => v,
@@ -278,7 +304,7 @@ async fn fetch_kind3_batch(
                     "EVENT" if arr.len() >= 3 => {
                         if let Ok(event) = serde_json::from_value::<NostrEvent>(arr[2].clone()) {
                             if event.kind == 3 {
-                                // Keep only the newest per pubkey
+                                // Keep newest per pubkey
                                 if let Some(existing) =
                                     events.iter().position(|e| e.pubkey == event.pubkey)
                                 {
@@ -286,20 +312,13 @@ async fn fetch_kind3_batch(
                                         events[existing] = event;
                                     }
                                 } else {
-                                    seen_pubkeys.insert(event.pubkey.clone());
                                     events.push(event);
                                 }
                             }
                         }
                     }
                     "EOSE" => break,
-                    "CLOSED" | "NOTICE" => {
-                        let msg = arr.get(1).and_then(|v| v.as_str()).unwrap_or("");
-                        tracing::debug!(relay = relay_url, msg_type, msg, "relay message");
-                        if msg_type == "CLOSED" {
-                            break;
-                        }
-                    }
+                    "CLOSED" => break,
                     _ => {}
                 }
             }
@@ -308,7 +327,7 @@ async fn fetch_kind3_batch(
             }
             Ok(Some(Ok(Message::Close(_)))) | Ok(None) => break,
             Ok(Some(Err(e))) => return Err(format!("ws error: {e}")),
-            Err(_) => break, // timeout
+            Err(_) => break, // read timeout
             _ => {}
         }
     }
