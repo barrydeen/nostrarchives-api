@@ -513,6 +513,17 @@ async fn main() {
         tracing::info!("indexer relay disabled");
     }
 
+    // Background: hashtag feed refresh (kind-30015 events cached in Redis)
+    if cfg.feeds_enabled {
+        let feeds_repo = state.repo.clone();
+        let feeds_cache = state.cache.clone();
+        let feeds_secret = cfg.feeds_signing_secret;
+        tokio::spawn(ws::refresh_hashtag_feeds(feeds_repo, feeds_cache, feeds_secret));
+        tracing::info!("hashtag feeds background refresh enabled");
+    } else {
+        tracing::info!("hashtag feeds disabled");
+    }
+
     let app = api::router(state).into_make_service_with_connect_info::<SocketAddr>();
     let addr: SocketAddr = cfg.listen_addr.parse().expect("invalid listen address");
 

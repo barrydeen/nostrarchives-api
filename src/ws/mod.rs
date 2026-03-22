@@ -33,6 +33,10 @@ enum FeedKind {
     /// metric: "likes" | "reposts" | "zaps" | "replies"
     /// Pubkey must be supplied as a single-entry `authors` filter in the REQ message.
     RankedNotes { note_type: String, metric: String },
+    /// Hashtag feeds: returns a single kind-30015 (interest set) event containing
+    /// hashtag `t` tags, signed by a service keypair.
+    /// variant: "trending" (top 100 by count) | "all" (count > 5)
+    Hashtags { variant: String },
 }
 
 /// Build the WebSocket relay router.
@@ -55,6 +59,8 @@ pub fn router(state: AppState) -> Router {
         // metric: "likes", "reposts", "zaps", "replies"
         // Pubkey supplied via `authors` filter in the REQ message.
         .route("/profiles/{note_type}/{metric}", any(ws_ranked_notes_handler))
+        // Hashtag feeds: /hashtags/trending and /hashtags/all
+        .route("/hashtags/{variant}", any(ws_hashtags_handler))
         .with_state(state)
 }
 
@@ -117,6 +123,16 @@ async fn ws_ranked_notes_handler(
 ) -> impl IntoResponse {
     ws.on_upgrade(move |socket| {
         handle_connection(socket, state, FeedKind::RankedNotes { note_type, metric })
+    })
+}
+
+async fn ws_hashtags_handler(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+    Path(variant): Path<String>,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| {
+        handle_connection(socket, state, FeedKind::Hashtags { variant })
     })
 }
 
@@ -224,6 +240,9 @@ async fn handle_req(arr: &[Value], state: &AppState, feed_kind: &FeedKind) -> Ve
         }
         FeedKind::RankedNotes { note_type, metric } => {
             handle_ranked_notes_req(&sub_id, &arr[2..], state, &note_type, &metric).await
+        }
+        FeedKind::Hashtags { variant } => {
+            handle_hashtags_req(&sub_id, state, variant).await
         }
     }
 }
@@ -1080,6 +1099,185 @@ async fn handle_ranked_notes_req(
             ]
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Hashtag feeds handler
+// ---------------------------------------------------------------------------
+
+/// Hashtag feeds: serves a pre-computed kind-30015 event from Redis cache.
+///
+/// The background task `refresh_hashtag_feeds` populates two cache keys:
+///   - `feeds:hashtags:trending` — top 100 hashtags by count (24h)
+///   - `feeds:hashtags:all`     — all hashtags with count > 5 (24h)
+///
+/// Each cache value is a complete signed Nostr event JSON.
+///
+/// Protocol:
+///   Client: ["REQ", "<sub_id>", {}]
+///   Relay:  ["EVENT", "<sub_id>", <kind-30015>] ["EOSE", "<sub_id>"]
+async fn handle_hashtags_req(
+    sub_id: &str,
+    state: &AppState,
+    variant: &str,
+) -> Vec<String> {
+    let cache_key = match variant {
+        "trending" | "all" => format!("feeds:hashtags:{variant}"),
+        _ => {
+            return vec![
+                notice(&format!(
+                    "invalid variant: {variant}. Use: trending, all"
+                )),
+                eose(sub_id),
+            ];
+        }
+    };
+
+    tracing::info!(sub_id = %sub_id, variant = %variant, "hashtag feed request");
+
+    match state.cache.get_json(&cache_key).await {
+        Some(cached) => {
+            if let Ok(event) = serde_json::from_str::<Value>(&cached) {
+                let msg = serde_json::to_string(&serde_json::json!(["EVENT", sub_id, event]))
+                    .expect("json serialization cannot fail");
+                tracing::info!(sub_id = %sub_id, variant = %variant, "hashtag feed served (cache hit)");
+                vec![msg, eose(sub_id)]
+            } else {
+                tracing::warn!(variant = %variant, "hashtag feed cache contained invalid JSON");
+                vec![
+                    notice("error: hashtag feed temporarily unavailable"),
+                    eose(sub_id),
+                ]
+            }
+        }
+        None => {
+            tracing::warn!(variant = %variant, "hashtag feed not yet computed");
+            vec![
+                notice("error: hashtag feed not yet computed, try again shortly"),
+                eose(sub_id),
+            ]
+        }
+    }
+}
+
+/// Background task: compute hashtag feeds every hour and cache as signed kind-30015 events.
+///
+/// Produces two events:
+/// - **trending**: top 100 hashtags in 24h, `t` tags ordered by count descending,
+///   `d` tag = "trending"
+/// - **all**: all hashtags with count > 5 in 24h, unordered, `d` tag = "all"
+pub async fn refresh_hashtag_feeds(
+    repo: crate::db::repository::EventRepository,
+    cache: crate::cache::StatsCache,
+    signing_secret: [u8; 32],
+) {
+    use secp256k1::{Secp256k1, SecretKey, Keypair};
+
+    let secp = Secp256k1::new();
+    let secret_key = SecretKey::from_slice(&signing_secret)
+        .expect("invalid 32-byte signing secret");
+    let keypair = Keypair::from_secret_key(&secp, &secret_key);
+    let (xonly, _parity) = keypair.x_only_public_key();
+    let pubkey_hex = hex::encode(xonly.serialize());
+
+    tracing::info!(pubkey = %pubkey_hex, "hashtag feed signer initialized");
+
+    // Initial delay: let the service stabilize
+    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+
+    loop {
+        // --- Trending: top 100 by count ---
+        match repo.trending_hashtags(100, 0).await {
+            Ok(hashtags) => {
+                let event_json = build_kind_30015(
+                    &hashtags,
+                    "trending",
+                    &pubkey_hex,
+                    &keypair,
+                    &secp,
+                );
+                if let Ok(json_str) = serde_json::to_string(&event_json) {
+                    // Cache for 2 hours (refreshed hourly, so always fresh)
+                    cache.set_json("feeds:hashtags:trending", &json_str, 7200).await;
+                    tracing::info!(tags = hashtags.len(), "hashtag feed refreshed: trending");
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "failed to compute trending hashtags feed"),
+        }
+
+        // --- All: hashtags with count > 5 ---
+        // Re-use trending_hashtags with a large limit; it already has HAVING COUNT >= 3,
+        // but we need >= 5. We'll fetch a large set and filter client-side.
+        match repo.trending_hashtags(10_000, 0).await {
+            Ok(hashtags) => {
+                let filtered: Vec<_> = hashtags.into_iter().filter(|h| h.count > 5).collect();
+                let event_json = build_kind_30015(
+                    &filtered,
+                    "all",
+                    &pubkey_hex,
+                    &keypair,
+                    &secp,
+                );
+                if let Ok(json_str) = serde_json::to_string(&event_json) {
+                    cache.set_json("feeds:hashtags:all", &json_str, 7200).await;
+                    tracing::info!(tags = filtered.len(), "hashtag feed refreshed: all");
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "failed to compute all hashtags feed"),
+        }
+
+        // Sleep 1 hour
+        tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+    }
+}
+
+/// Build and sign a kind-30015 Nostr event from a list of hashtags.
+fn build_kind_30015(
+    hashtags: &[crate::db::models::TrendingHashtag],
+    d_tag: &str,
+    pubkey_hex: &str,
+    keypair: &secp256k1::Keypair,
+    secp: &secp256k1::Secp256k1<secp256k1::All>,
+) -> Value {
+    use sha2::{Sha256, Digest};
+
+    let created_at = chrono::Utc::now().timestamp();
+    let kind = 30015_i64;
+
+    let mut tags: Vec<Value> = Vec::with_capacity(hashtags.len() + 1);
+    tags.push(serde_json::json!(["d", d_tag]));
+    for h in hashtags {
+        tags.push(serde_json::json!(["t", h.hashtag]));
+    }
+
+    let content = "";
+
+    // NIP-01: id = sha256(json([0, pubkey, created_at, kind, tags, content]))
+    let serialized = serde_json::to_string(&serde_json::json!([
+        0, pubkey_hex, created_at, kind, tags, content
+    ]))
+    .expect("json serialization cannot fail");
+
+    let mut hasher = Sha256::new();
+    hasher.update(serialized.as_bytes());
+    let id_bytes = hasher.finalize();
+    let id_hex = hex::encode(&id_bytes);
+
+    // Sign with Schnorr
+    let msg = secp256k1::Message::from_digest_slice(&id_bytes)
+        .expect("32-byte hash is always valid");
+    let sig = secp.sign_schnorr_no_aux_rand(&msg, keypair);
+    let sig_hex = hex::encode(sig.serialize());
+
+    serde_json::json!({
+        "id": id_hex,
+        "pubkey": pubkey_hex,
+        "created_at": created_at,
+        "kind": kind,
+        "tags": tags,
+        "content": content,
+        "sig": sig_hex,
+    })
 }
 
 /// Extract raw Nostr events from a cached trending response JSON.
