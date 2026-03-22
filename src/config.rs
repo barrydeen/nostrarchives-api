@@ -44,6 +44,11 @@ pub struct Config {
     pub crawl_mode: String,
     /// Pinned relays for negentropy_only mode (tested at boot for negentropy+author support).
     pub negentropy_pinned_relays: Vec<String>,
+    /// Enable hashtag feeds background refresh + WS endpoints.
+    pub feeds_enabled: bool,
+    /// 32-byte hex secret key for signing kind-30015 feed events.
+    /// If not set, a random key is generated at startup.
+    pub feeds_signing_secret: [u8; 32],
 }
 
 impl Config {
@@ -246,6 +251,29 @@ impl Config {
             .filter(|s| !s.is_empty())
             .collect();
 
+        let feeds_enabled = env::var("ENABLE_FEEDS")
+            .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(true);
+
+        let feeds_signing_secret: [u8; 32] = env::var("FEEDS_SIGNING_SECRET")
+            .ok()
+            .and_then(|v| {
+                let bytes = hex::decode(v.trim()).ok()?;
+                <[u8; 32]>::try_from(bytes.as_slice()).ok()
+            })
+            .unwrap_or_else(|| {
+                use sha2::{Sha256, Digest};
+                // Deterministic fallback derived from DATABASE_URL so the pubkey
+                // is stable across restarts even without an explicit secret.
+                let mut hasher = Sha256::new();
+                hasher.update(b"nostrarchives-feeds-signing-key:");
+                hasher.update(database_url.as_bytes());
+                let hash = hasher.finalize();
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&hash);
+                arr
+            });
+
         Self {
             database_url,
             redis_url,
@@ -285,6 +313,8 @@ impl Config {
             indexer_ws_listen_addr,
             crawl_mode,
             negentropy_pinned_relays,
+            feeds_enabled,
+            feeds_signing_secret,
         }
     }
 }
