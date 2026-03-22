@@ -66,9 +66,8 @@ impl FollowerCache {
             return Ok(true);
         }
 
-        // For unknown pubkeys, allow them (new users need to build followers)
-        // The cache only contains known accounts from profile_search
-        Ok(true)
+        // Unknown pubkeys don't meet the threshold
+        Ok(false)
     }
 
     /// Refresh the cache from the database.
