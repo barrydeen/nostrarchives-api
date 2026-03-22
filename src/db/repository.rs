@@ -2471,19 +2471,19 @@ impl EventRepository {
         // Limit to last 7 days to keep the scan fast for popular hashtags like #bitcoin.
         // Without this, the GIN index finds 120k+ matching rows and the heap scan times out.
         // 7 days is enough to fill 200 results for any active hashtag.
+        // The timestamp is inlined (not a bind param) so the planner can use it for index selection.
         let since = chrono::Utc::now().timestamp() - 7 * 86400;
 
-        let mut qb = sqlx::QueryBuilder::<sqlx::Postgres>::new(
+        let mut qb = sqlx::QueryBuilder::<sqlx::Postgres>::new(format!(
             r#"WITH tagged_notes AS (
                 SELECT DISTINCT e.id, e.pubkey, e.created_at, e.kind, e.content, e.sig,
                        e.tags, e.raw, e.relay_url, e.received_at,
                        e.reaction_count, e.repost_count, e.reply_count,
                        e.zap_count, e.zap_amount_msats
                 FROM events e
-                WHERE e.kind = 1 AND e.created_at >= "#,
-        );
-        qb.push_bind(since);
-        qb.push(" AND (");
+                WHERE e.kind = 1 AND e.created_at >= {since} AND ("#,
+        ));
+
 
         for (i, param) in tag_params.iter().enumerate() {
             if i > 0 {
