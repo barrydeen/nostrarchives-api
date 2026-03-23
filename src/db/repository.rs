@@ -1979,7 +1979,7 @@ impl EventRepository {
             sqlx::query("SET LOCAL enable_bitmapscan = off")
                 .execute(&mut *tx)
                 .await?;
-            sqlx::query("SET LOCAL statement_timeout = '2000'")
+            sqlx::query("SET LOCAL statement_timeout = '5000'")
                 .execute(&mut *tx)
                 .await?;
             let result = sqlx::query(
@@ -2468,7 +2468,7 @@ impl EventRepository {
         sqlx::query("SET LOCAL enable_bitmapscan = off")
             .execute(&mut *tx)
             .await?;
-        sqlx::query("SET LOCAL statement_timeout = '2000'")
+        sqlx::query("SET LOCAL statement_timeout = '5000'")
             .execute(&mut *tx)
             .await?;
 
