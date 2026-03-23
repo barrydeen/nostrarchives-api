@@ -162,6 +162,10 @@ async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
             "034_note_hashtags",
             include_str!("../../migrations/034_note_hashtags.sql"),
         ),
+        (
+            "035_simplify_profile_search",
+            include_str!("../../migrations/035_simplify_profile_search.sql"),
+        ),
     ];
 
     for (name, sql) in migrations {
