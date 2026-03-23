@@ -81,16 +81,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .fetch_one(&pool)
             .await?;
 
-    let (purge_count,): (i64,) = sqlx::query_as(
+    let (keep_count,): (i64,) = sqlx::query_as(
         "SELECT COUNT(*) FROM events e
-         WHERE e.kind = 1
-           AND e.pubkey = ANY($1)",
+         INNER JOIN wot_scores w ON w.pubkey = e.pubkey AND w.passes_wot = true
+         WHERE e.kind = 1",
     )
-    .bind(&pubkeys.iter().map(|p| p.0.clone()).collect::<Vec<_>>())
     .fetch_one(&pool)
     .await?;
 
-    let keep_count = total_kind1 - purge_count;
+    let purge_count = total_kind1 - keep_count;
 
     println!("\n--- Purge Summary ---");
     println!("Total kind-1 notes:     {total_kind1}");
