@@ -1333,32 +1333,60 @@ impl EventRepository {
             _ => "reaction_count",
         };
 
-        let sql = format!(
-            r#"
-            SELECT
-                e.id, e.pubkey, e.created_at, e.kind, e.content, e.sig,
-                e.tags, e.raw, e.relay_url, e.received_at,
-                e.reaction_count::bigint AS reactions,
-                e.repost_count::bigint AS reposts,
-                e.reply_count::bigint AS replies,
-                e.zap_count::bigint AS zaps,
-                e.zap_amount_msats,
-                {order_col}::bigint AS metric_count
-            FROM events e
-            WHERE e.kind = 1
-              AND ($1::bigint IS NULL OR e.created_at >= $1)
-              AND {order_col} > 0
-            ORDER BY {order_col} DESC, e.created_at DESC
-            LIMIT $2 OFFSET $3
-            "#
-        );
-
-        let rows = sqlx::query(&sql)
-            .bind(since)
-            .bind(limit * 4)
-            .bind(offset)
-            .fetch_all(&self.pool)
-            .await?;
+        // Split into two query paths so Postgres can use the composite
+        // indexes (idx_events_k1_created_{metric}) for time-bounded queries.
+        // The OR pattern ($1 IS NULL OR created_at >= $1) prevents index usage.
+        let rows = if let Some(since_ts) = since {
+            let sql = format!(
+                r#"
+                SELECT
+                    e.id, e.pubkey, e.created_at, e.kind, e.content, e.sig,
+                    e.tags, e.raw, e.relay_url, e.received_at,
+                    e.reaction_count::bigint AS reactions,
+                    e.repost_count::bigint AS reposts,
+                    e.reply_count::bigint AS replies,
+                    e.zap_count::bigint AS zaps,
+                    e.zap_amount_msats,
+                    {order_col}::bigint AS metric_count
+                FROM events e
+                WHERE e.kind = 1
+                  AND e.created_at >= $1
+                  AND {order_col} > 0
+                ORDER BY {order_col} DESC, e.created_at DESC
+                LIMIT $2 OFFSET $3
+                "#
+            );
+            sqlx::query(&sql)
+                .bind(since_ts)
+                .bind(limit * 4)
+                .bind(offset)
+                .fetch_all(&self.pool)
+                .await?
+        } else {
+            let sql = format!(
+                r#"
+                SELECT
+                    e.id, e.pubkey, e.created_at, e.kind, e.content, e.sig,
+                    e.tags, e.raw, e.relay_url, e.received_at,
+                    e.reaction_count::bigint AS reactions,
+                    e.repost_count::bigint AS reposts,
+                    e.reply_count::bigint AS replies,
+                    e.zap_count::bigint AS zaps,
+                    e.zap_amount_msats,
+                    {order_col}::bigint AS metric_count
+                FROM events e
+                WHERE e.kind = 1
+                  AND {order_col} > 0
+                ORDER BY {order_col} DESC, e.created_at DESC
+                LIMIT $2 OFFSET $3
+                "#
+            );
+            sqlx::query(&sql)
+                .bind(limit * 4)
+                .bind(offset)
+                .fetch_all(&self.pool)
+                .await?
+        };
 
         let is_zap = ref_type == "zap";
 
