@@ -1,5 +1,8 @@
 //! CLI tool to purge kind-1 notes from authors who don't pass the WoT filter.
 //!
+//! Strategy: materialize non-WoT pubkeys into a temp table once, then batch-delete
+//! using an indexed join — avoids the expensive NOT IN subquery on every batch.
+//!
 //! Usage:
 //!   cargo run --bin purge_non_wot                  # dry run (default)
 //!   cargo run --bin purge_non_wot -- --execute      # actually delete
@@ -35,7 +38,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let pool = PgPoolOptions::new()
         .max_connections(5)
-        .acquire_timeout(std::time::Duration::from_secs(10))
+        .acquire_timeout(std::time::Duration::from_secs(30))
         .connect(&database_url)
         .await?;
 
@@ -46,34 +49,64 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await?;
     println!("WoT-passing pubkeys: {wot_count}");
 
-    // Step 2: Count kind-1 events to purge
+    if wot_count == 0 {
+        println!("ERROR: wot_scores is empty — refusing to purge (would delete everything)");
+        return Ok(());
+    }
+
+    // Step 2: Build temp table of non-WoT pubkeys that have kind-1 events
+    println!("\nIdentifying non-WoT authors with kind-1 notes...");
+    let build_start = Instant::now();
+
+    sqlx::query("DROP TABLE IF EXISTS _purge_pubkeys")
+        .execute(&pool)
+        .await?;
+
+    sqlx::query(
+        "CREATE UNLOGGED TABLE _purge_pubkeys AS
+         SELECT DISTINCT e.pubkey
+         FROM events e
+         LEFT JOIN wot_scores w ON w.pubkey = e.pubkey AND w.passes_wot = true
+         WHERE e.kind = 1 AND w.pubkey IS NULL",
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query("CREATE INDEX ON _purge_pubkeys (pubkey)")
+        .execute(&pool)
+        .await?;
+
+    let (purge_authors,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM _purge_pubkeys")
+            .fetch_one(&pool)
+            .await?;
+
+    println!(
+        "Found {purge_authors} non-WoT authors in {:.1}s",
+        build_start.elapsed().as_secs_f64()
+    );
+
+    // Step 3: Count events to purge
     let (total_kind1,): (i64,) =
         sqlx::query_as("SELECT COUNT(*) FROM events WHERE kind = 1")
             .fetch_one(&pool)
             .await?;
 
-    let (keep_count,): (i64,) = sqlx::query_as(
+    let (purge_count,): (i64,) = sqlx::query_as(
         "SELECT COUNT(*) FROM events e
-         INNER JOIN wot_scores w ON w.pubkey = e.pubkey AND w.passes_wot = true
+         INNER JOIN _purge_pubkeys p ON p.pubkey = e.pubkey
          WHERE e.kind = 1",
     )
     .fetch_one(&pool)
     .await?;
 
-    let purge_count = total_kind1 - keep_count;
-    let purge_authors: (i64,) = sqlx::query_as(
-        "SELECT COUNT(DISTINCT e.pubkey) FROM events e
-         WHERE e.kind = 1
-           AND e.pubkey NOT IN (SELECT pubkey FROM wot_scores WHERE passes_wot = true)",
-    )
-    .fetch_one(&pool)
-    .await?;
+    let keep_count = total_kind1 - purge_count;
 
     println!("\n--- Purge Summary ---");
     println!("Total kind-1 notes:     {total_kind1}");
     println!("Notes to KEEP (in WoT): {keep_count}");
     println!("Notes to PURGE:         {purge_count}");
-    println!("Authors to purge:       {}", purge_authors.0);
+    println!("Authors to purge:       {purge_authors}");
     println!(
         "Purge percentage:       {:.1}%",
         if total_kind1 > 0 {
@@ -85,11 +118,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if purge_count == 0 {
         println!("\nNothing to purge!");
+        cleanup_temp(&pool).await;
         return Ok(());
     }
 
     if !execute {
         println!("\n** DRY RUN — pass --execute to actually delete **");
+        cleanup_temp(&pool).await;
         return Ok(());
     }
 
@@ -100,13 +135,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut total_deleted: i64 = 0;
 
     loop {
-        // Delete a batch of kind-1 events from non-WoT authors
         let result = sqlx::query(
             "DELETE FROM events
              WHERE id IN (
                  SELECT e.id FROM events e
+                 INNER JOIN _purge_pubkeys p ON p.pubkey = e.pubkey
                  WHERE e.kind = 1
-                   AND e.pubkey NOT IN (SELECT pubkey FROM wot_scores WHERE passes_wot = true)
                  LIMIT $1
              )",
         )
@@ -133,13 +167,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let elapsed = start.elapsed();
-    println!("\nDone! Deleted {total_deleted} events in {:.1}s", elapsed.as_secs_f64());
+    println!(
+        "\nDone! Deleted {total_deleted} kind-1 events in {:.1}s",
+        elapsed.as_secs_f64()
+    );
 
-    // Also clean up orphaned kind-0 metadata from purged authors
+    // Clean up orphaned kind-0 metadata from purged authors
+    println!("\nCleaning up orphaned kind-0 metadata...");
     let meta_result = sqlx::query(
         "DELETE FROM events
          WHERE kind = 0
-           AND pubkey NOT IN (SELECT pubkey FROM wot_scores WHERE passes_wot = true)
+           AND pubkey IN (SELECT pubkey FROM _purge_pubkeys)
            AND pubkey NOT IN (SELECT DISTINCT pubkey FROM events WHERE kind != 0)",
     )
     .execute(&pool)
@@ -149,7 +187,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         meta_result.rows_affected()
     );
 
+    cleanup_temp(&pool).await;
     println!("\nRecommendation: run VACUUM FULL events; to reclaim disk space");
 
     Ok(())
+}
+
+async fn cleanup_temp(pool: &sqlx::PgPool) {
+    let _ = sqlx::query("DROP TABLE IF EXISTS _purge_pubkeys")
+        .execute(pool)
+        .await;
 }
