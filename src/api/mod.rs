@@ -32,36 +32,9 @@ async fn cache_control_middleware(
     let path = req.uri().path().to_string();
     let mut response = next.run(req).await;
 
-    if path == "/health" {
-        return response;
-    }
-
-    let max_age = if path.contains("/analytics/") {
-        3600
-    } else if path.contains("/notes/top") {
-        300
-    } else if path.contains("/stats") {
-        120
-    } else if path.contains("/search") {
-        60
-    } else if path.contains("/hashtags/") {
-        300
-    } else if path.contains("/profiles/metadata") {
-        300
-    } else if path.contains("/clients/") {
-        600
-    } else {
-        60
-    };
-
     response.headers_mut().insert(
         axum::http::header::CACHE_CONTROL,
-        format!(
-            "public, max-age={max_age}, stale-while-revalidate={}",
-            max_age * 2
-        )
-        .parse()
-        .unwrap(),
+        "no-store".parse().unwrap(),
     );
 
     response
