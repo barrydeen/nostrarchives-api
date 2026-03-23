@@ -16,8 +16,9 @@ CREATE TABLE IF NOT EXISTS note_hashtags (
 -- Primary lookup: find notes by hashtag, ordered by recency
 CREATE INDEX idx_note_hashtags_lookup ON note_hashtags (hashtag, created_at DESC);
 
--- Reverse lookup: find hashtags for a given event (for deletion/maintenance)
-CREATE INDEX idx_note_hashtags_event ON note_hashtags (event_id);
+-- Note: no index on event_id — it misleads the query planner into using it
+-- for DISTINCT operations instead of the hashtag lookup index. If needed
+-- for maintenance, create it temporarily.
 
 -- Populate from existing kind-1 events with t-tags.
 -- Extract hashtags from the jsonb tags array where tag[0] = 't'.

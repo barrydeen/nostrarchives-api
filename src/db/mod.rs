@@ -154,6 +154,14 @@ async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
             "032_drop_event_tags",
             include_str!("../../migrations/032_drop_event_tags.sql"),
         ),
+        (
+            "033_search_index",
+            include_str!("../../migrations/033_search_index.sql"),
+        ),
+        (
+            "034_note_hashtags",
+            include_str!("../../migrations/034_note_hashtags.sql"),
+        ),
     ];
 
     for (name, sql) in migrations {

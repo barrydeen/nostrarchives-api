@@ -23,6 +23,13 @@ CREATE INDEX idx_search_index_content_fts ON search_index USING GIN (content_tsv
 -- For time-filtered queries and ordering
 CREATE INDEX idx_search_index_created ON search_index (created_at DESC);
 
+-- Engagement score index: enables index scan ordered by engagement, filtering by tsvector.
+-- For common terms ("bitcoin", 10% match rate), Postgres scans ~2000 high-engagement rows
+-- to find 200 matches instead of bitmap-scanning 800k+ rows.
+CREATE INDEX idx_search_index_engagement ON search_index (
+    (reaction_count * 100 + reply_count * 500 + repost_count * 1000 + zap_count * 2000) DESC
+);
+
 -- Populate from existing kind-1 events
 INSERT INTO search_index (event_id, pubkey, created_at, content_tsv, reaction_count, reply_count, repost_count, zap_count, zap_amount_msats)
 SELECT id, pubkey, created_at, content_tsv, reaction_count, reply_count, repost_count, zap_count, zap_amount_msats

@@ -1965,59 +1965,119 @@ impl EventRepository {
         Ok(results)
     }
 
-    /// Search notes with full-text search, ranked by relevance and engagement.
-    /// v3: ranks against lightweight search_index table, joins back to events for full data.
+    /// Search notes with full-text search, ranked by engagement + relevance.
+    /// v4: hybrid strategy — engagement-ordered scan for common terms, GIN fallback for rare terms.
     pub async fn search_notes(
         &self,
         query: &str,
         limit: i64,
         offset: i64,
     ) -> Result<Vec<super::models::NoteSearchResult>, AppError> {
-        let rows = sqlx::query(
-            r#"
-            WITH ranked AS (
+        // Phase 1: try engagement-ordered scan (fast for common terms)
+        let fast_result = {
+            let mut tx = self.pool.begin().await?;
+            sqlx::query("SET LOCAL enable_bitmapscan = off")
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("SET LOCAL statement_timeout = '2000'")
+                .execute(&mut *tx)
+                .await?;
+            let result = sqlx::query(
+                r#"
+                WITH ranked AS (
+                    SELECT s.event_id, s.created_at,
+                        s.reaction_count, s.reply_count, s.repost_count, s.zap_count
+                    FROM search_index s, plainto_tsquery('english', $1) query
+                    WHERE s.content_tsv @@ query
+                    ORDER BY (s.reaction_count * 100 + s.reply_count * 500
+                              + s.repost_count * 1000 + s.zap_count * 2000) DESC
+                    LIMIT 200
+                )
                 SELECT
-                    s.event_id,
-                    s.created_at,
-                    s.reaction_count, s.reply_count, s.repost_count, s.zap_count,
-                    ts_rank(s.content_tsv, query) AS text_rank
-                FROM search_index s, plainto_tsquery('english', $1) query
-                WHERE s.content_tsv @@ query
-                ORDER BY ts_rank(s.content_tsv, query) DESC
-                LIMIT 200
+                    e.id, e.pubkey, e.created_at, e.kind, e.content, e.sig,
+                    e.tags, e.raw, e.relay_url, e.received_at,
+                    r.reaction_count::bigint AS reactions,
+                    r.reply_count::bigint AS replies,
+                    r.repost_count::bigint AS reposts,
+                    r.zap_count::bigint AS zaps,
+                    (
+                        LN(
+                            r.reaction_count * 100 +
+                            r.reply_count * 500 +
+                            r.repost_count * 1000 +
+                            r.zap_count * 2000 + 1
+                        ) * 10 +
+                        CASE
+                            WHEN r.created_at > EXTRACT(EPOCH FROM NOW())::bigint - 86400 THEN 50
+                            WHEN r.created_at > EXTRACT(EPOCH FROM NOW())::bigint - 604800 THEN 25
+                            ELSE 0
+                        END
+                    )::float8 AS rank_score
+                FROM ranked r
+                JOIN events e ON e.id = r.event_id
+                ORDER BY rank_score DESC
+                LIMIT $2 OFFSET $3
+                "#,
             )
-            SELECT
-                e.id, e.pubkey, e.created_at, e.kind, e.content, e.sig,
-                e.tags, e.raw, e.relay_url, e.received_at,
-                r.reaction_count::bigint AS reactions,
-                r.reply_count::bigint AS replies,
-                r.repost_count::bigint AS reposts,
-                r.zap_count::bigint AS zaps,
-                (
-                    r.text_rank * 1000 +
-                    LN(
-                        r.reaction_count * 100 +
-                        r.reply_count * 500 +
-                        r.repost_count * 1000 +
-                        r.zap_count * 2000 + 1
-                    ) * 10 +
-                    CASE
-                        WHEN r.created_at > EXTRACT(EPOCH FROM NOW())::bigint - 86400 THEN 50
-                        WHEN r.created_at > EXTRACT(EPOCH FROM NOW())::bigint - 604800 THEN 25
-                        ELSE 0
-                    END
-                )::float8 AS rank_score
-            FROM ranked r
-            JOIN events e ON e.id = r.event_id
-            ORDER BY rank_score DESC
-            LIMIT $2 OFFSET $3
-            "#,
-        )
-        .bind(query)
-        .bind(limit)
-        .bind(offset)
-        .fetch_all(&self.pool)
-        .await?;
+            .bind(query)
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&mut *tx)
+            .await;
+            let _ = tx.commit().await;
+            result
+        };
+
+        // Phase 2: fall back to GIN bitmap scan if engagement scan timed out or returned empty
+        let rows = match fast_result {
+            Ok(ref rows) if !rows.is_empty() => fast_result?,
+            _ => {
+                sqlx::query(
+                    r#"
+                    WITH ranked AS (
+                        SELECT
+                            s.event_id, s.created_at,
+                            s.reaction_count, s.reply_count, s.repost_count, s.zap_count,
+                            ts_rank(s.content_tsv, query) AS text_rank
+                        FROM search_index s, plainto_tsquery('english', $1) query
+                        WHERE s.content_tsv @@ query
+                        ORDER BY ts_rank(s.content_tsv, query) DESC
+                        LIMIT 200
+                    )
+                    SELECT
+                        e.id, e.pubkey, e.created_at, e.kind, e.content, e.sig,
+                        e.tags, e.raw, e.relay_url, e.received_at,
+                        r.reaction_count::bigint AS reactions,
+                        r.reply_count::bigint AS replies,
+                        r.repost_count::bigint AS reposts,
+                        r.zap_count::bigint AS zaps,
+                        (
+                            r.text_rank * 1000 +
+                            LN(
+                                r.reaction_count * 100 +
+                                r.reply_count * 500 +
+                                r.repost_count * 1000 +
+                                r.zap_count * 2000 + 1
+                            ) * 10 +
+                            CASE
+                                WHEN r.created_at > EXTRACT(EPOCH FROM NOW())::bigint - 86400 THEN 50
+                                WHEN r.created_at > EXTRACT(EPOCH FROM NOW())::bigint - 604800 THEN 25
+                                ELSE 0
+                            END
+                        )::float8 AS rank_score
+                    FROM ranked r
+                    JOIN events e ON e.id = r.event_id
+                    ORDER BY rank_score DESC
+                    LIMIT $2 OFFSET $3
+                    "#,
+                )
+                .bind(query)
+                .bind(limit)
+                .bind(offset)
+                .fetch_all(&self.pool)
+                .await?
+            }
+        };
 
         let results = rows
             .into_iter()
@@ -2367,17 +2427,142 @@ impl EventRepository {
         Ok(rows)
     }
 
-    /// Search notes and return raw kind-1 events, ranked by FTS relevance + engagement.
+    /// Search notes and return raw kind-1 events, ranked by engagement + FTS relevance.
     /// Used by the NIP-50 WebSocket search relay.
-    /// v2: uses counter columns instead of event_refs join.
+    ///
+    /// Hybrid strategy for speed across both common and rare terms:
+    /// 1. Try engagement-ordered index scan (fast for common terms like "bitcoin")
+    ///    with a 2s timeout. Scans notes by engagement score, filters by text match.
+    /// 2. If that times out (rare terms), fall back to GIN bitmap scan which is
+    ///    faster for low-selectivity queries.
     pub async fn search_notes_as_events(
         &self,
         query: &str,
         limit: i64,
         authors: &[&str],
     ) -> Result<Vec<StoredEvent>, AppError> {
+        // Phase 1: try engagement-ordered scan (fast for common terms)
+        let fast_result = self
+            .search_notes_engagement_scan(query, limit, authors)
+            .await;
+
+        match fast_result {
+            Ok(rows) if !rows.is_empty() => return Ok(rows),
+            _ => {}
+        }
+
+        // Phase 2: fall back to GIN bitmap scan (handles rare terms)
+        self.search_notes_gin_scan(query, limit, authors).await
+    }
+
+    /// Engagement-ordered FTS: scans search_index by engagement score DESC,
+    /// filtering by tsvector match. Very fast for common terms (10% match rate
+    /// = ~2000 rows scanned to find 200 matches). Times out for rare terms.
+    async fn search_notes_engagement_scan(
+        &self,
+        query: &str,
+        limit: i64,
+        authors: &[&str],
+    ) -> Result<Vec<StoredEvent>, AppError> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("SET LOCAL enable_bitmapscan = off")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("SET LOCAL statement_timeout = '2000'")
+            .execute(&mut *tx)
+            .await?;
+
+        let result = if authors.is_empty() {
+            sqlx::query_as::<_, StoredEvent>(
+                r#"
+                WITH ranked AS (
+                    SELECT s.event_id, s.created_at,
+                        s.reaction_count, s.reply_count, s.repost_count, s.zap_count
+                    FROM search_index s, plainto_tsquery('english', $1) query
+                    WHERE s.content_tsv @@ query
+                    ORDER BY (s.reaction_count * 100 + s.reply_count * 500
+                              + s.repost_count * 1000 + s.zap_count * 2000) DESC
+                    LIMIT 200
+                )
+                SELECT
+                    e.id, e.pubkey, e.created_at, e.kind, e.content, e.sig,
+                    e.tags, e.raw, e.relay_url, e.received_at
+                FROM ranked r
+                JOIN events e ON e.id = r.event_id
+                ORDER BY (
+                    LN(
+                        r.reaction_count * 100 +
+                        r.reply_count * 500 +
+                        r.repost_count * 1000 +
+                        r.zap_count * 2000 + 1
+                    ) * 10 +
+                    CASE
+                        WHEN r.created_at > EXTRACT(EPOCH FROM NOW())::bigint - 86400 THEN 50
+                        WHEN r.created_at > EXTRACT(EPOCH FROM NOW())::bigint - 604800 THEN 25
+                        ELSE 0
+                    END
+                ) DESC
+                LIMIT $2
+                "#,
+            )
+            .bind(query)
+            .bind(limit)
+            .fetch_all(&mut *tx)
+            .await
+        } else {
+            sqlx::query_as::<_, StoredEvent>(
+                r#"
+                WITH ranked AS (
+                    SELECT s.event_id, s.created_at,
+                        s.reaction_count, s.reply_count, s.repost_count, s.zap_count
+                    FROM search_index s, plainto_tsquery('english', $1) query
+                    WHERE s.content_tsv @@ query
+                      AND s.pubkey = ANY($3)
+                    ORDER BY (s.reaction_count * 100 + s.reply_count * 500
+                              + s.repost_count * 1000 + s.zap_count * 2000) DESC
+                    LIMIT 200
+                )
+                SELECT
+                    e.id, e.pubkey, e.created_at, e.kind, e.content, e.sig,
+                    e.tags, e.raw, e.relay_url, e.received_at
+                FROM ranked r
+                JOIN events e ON e.id = r.event_id
+                ORDER BY (
+                    LN(
+                        r.reaction_count * 100 +
+                        r.reply_count * 500 +
+                        r.repost_count * 1000 +
+                        r.zap_count * 2000 + 1
+                    ) * 10 +
+                    CASE
+                        WHEN r.created_at > EXTRACT(EPOCH FROM NOW())::bigint - 86400 THEN 50
+                        WHEN r.created_at > EXTRACT(EPOCH FROM NOW())::bigint - 604800 THEN 25
+                        ELSE 0
+                    END
+                ) DESC
+                LIMIT $2
+                "#,
+            )
+            .bind(query)
+            .bind(limit)
+            .bind(authors)
+            .fetch_all(&mut *tx)
+            .await
+        };
+
+        let _ = tx.commit().await;
+        Ok(result?)
+    }
+
+    /// GIN bitmap scan FTS: uses the GIN index to find all matches, ranks by
+    /// ts_rank + engagement. Slower for common terms but reliable for rare terms.
+    async fn search_notes_gin_scan(
+        &self,
+        query: &str,
+        limit: i64,
+        authors: &[&str],
+    ) -> Result<Vec<StoredEvent>, AppError> {
         if authors.is_empty() {
-            // No author filter — rank against lightweight search_index, join back to events
             let rows = sqlx::query_as::<_, StoredEvent>(
                 r#"
                 WITH ranked AS (
@@ -2420,7 +2605,6 @@ impl EventRepository {
 
             Ok(rows)
         } else {
-            // Author-filtered search — rank against lightweight search_index, join back to events
             let rows = sqlx::query_as::<_, StoredEvent>(
                 r#"
                 WITH ranked AS (
@@ -2489,7 +2673,7 @@ impl EventRepository {
 
     /// Fetch notes matching ANY of the given hashtags, ranked by engagement score.
     /// Implements NIP-01 `#t` tag filter semantics (OR across values).
-    /// Uses note_hashtags btree index for fast lookups, joins to events for full data.
+    /// Uses note_hashtags btree index for fast lookups, limits before joining to events.
     pub async fn notes_by_hashtags(
         &self,
         hashtags: &[String],
@@ -2511,34 +2695,31 @@ impl EventRepository {
 
         let rows = sqlx::query(
             r#"
-            WITH tagged_notes AS (
-                SELECT DISTINCT ON (e.id)
-                       e.id, e.pubkey, e.created_at, e.kind, e.content, e.sig,
-                       e.tags, e.raw, e.relay_url, e.received_at,
-                       e.reaction_count, e.repost_count, e.reply_count,
-                       e.zap_count, e.zap_amount_msats
-                FROM note_hashtags nh
-                JOIN events e ON e.id = nh.event_id
-                WHERE nh.hashtag = ANY($1)
-                  AND nh.created_at >= $2
-                ORDER BY e.id, e.created_at DESC
+            WITH recent_ids AS (
+                SELECT event_id, MAX(created_at) AS created_at
+                FROM note_hashtags
+                WHERE hashtag = ANY($1)
+                  AND created_at >= $2
+                GROUP BY event_id
+                ORDER BY created_at DESC
                 LIMIT 200
             )
             SELECT
-                tn.id, tn.pubkey, tn.created_at, tn.kind, tn.content, tn.sig,
-                tn.tags, tn.raw, tn.relay_url, tn.received_at,
-                (tn.zap_amount_msats / 1000)::bigint AS zap_sats,
-                tn.repost_count::bigint AS repost_count,
-                tn.reply_count::bigint AS reply_count,
-                tn.reaction_count::bigint AS reaction_count,
+                e.id, e.pubkey, e.created_at, e.kind, e.content, e.sig,
+                e.tags, e.raw, e.relay_url, e.received_at,
+                (e.zap_amount_msats / 1000)::bigint AS zap_sats,
+                e.repost_count::bigint AS repost_count,
+                e.reply_count::bigint AS reply_count,
+                e.reaction_count::bigint AS reaction_count,
                 (
-                    tn.zap_amount_msats / 1000
-                    + tn.repost_count * 1000
-                    + tn.reply_count * 500
-                    + tn.reaction_count * 100
+                    e.zap_amount_msats / 1000
+                    + e.repost_count * 1000
+                    + e.reply_count * 500
+                    + e.reaction_count * 100
                 )::bigint AS score
-            FROM tagged_notes tn
-            ORDER BY score DESC, tn.created_at DESC
+            FROM recent_ids m
+            JOIN events e ON e.id = m.event_id
+            ORDER BY score DESC, e.created_at DESC
             LIMIT $3 OFFSET $4
             "#,
         )
