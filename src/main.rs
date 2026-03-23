@@ -349,18 +349,14 @@ async fn main() {
         }
     });
 
-    // Background: pre-compute slow homepage queries every 5 minutes.
-    // trending_notes (36s uncached), trending_users (26s), trending_hashtags (14s)
-    // are too expensive to compute on-demand. This task keeps the cache warm so
-    // handlers always serve from cache.
+    // Background: pre-compute slow queries every 5 minutes.
+    // Keeps Redis cache warm so neither HTTP handlers nor WS feeds ever compute on-demand.
     let home_repo = repo.clone();
     let home_cache = stats_cache.clone();
     tokio::spawn(async move {
-        // Short initial delay — compute immediately on startup so cache is warm.
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         loop {
-            // Pre-compute for the limit/offset combos the frontend uses.
-            // Trending notes: limit 10 and 20 (homepage + trending page)
+            // ── Homepage trending notes (limit 10, 20) ──────────────────
             for limit in [10i64, 20] {
                 match home_repo.trending_notes(limit, 0).await {
                     Ok(notes) => {
@@ -378,7 +374,7 @@ async fn main() {
                 }
             }
 
-            // Trending users: limit 12 (homepage)
+            // ── Homepage trending users / hashtags ──────────────────────
             match home_repo.trending_users(12, 0).await {
                 Ok(users) => {
                     let response = serde_json::json!({ "users": users });
@@ -390,7 +386,6 @@ async fn main() {
                 Err(e) => tracing::warn!(error = %e, "failed to pre-compute trending users"),
             }
 
-            // Trending hashtags: limit 20 (homepage)
             match home_repo.trending_hashtags(20, 0).await {
                 Ok(hashtags) => {
                     let response = serde_json::json!({ "hashtags": hashtags });
@@ -400,6 +395,83 @@ async fn main() {
                     tracing::info!("pre-computed trending hashtags");
                 }
                 Err(e) => tracing::warn!(error = %e, "failed to pre-compute trending hashtags"),
+            }
+
+            // ── Trending page + WS feeds (top notes by metric/range) ────
+            // Pre-compute limit=20 (HTTP trending page) and limit=100 (WS feeds).
+            // Uses the same cache key format as set_trending: "trending:{metric}:{range}:{limit}:0"
+            let metrics = ["reactions", "replies", "reposts", "zaps"];
+            let ranges_with_since: Vec<(&str, Option<i64>)> = {
+                let now = chrono::Utc::now().timestamp();
+                vec![
+                    ("today", Some(now - 86_400)),
+                    ("7d", Some(now - 7 * 86_400)),
+                    ("30d", Some(now - 30 * 86_400)),
+                    ("1y", Some(now - 365 * 86_400)),
+                    ("all", None),
+                ]
+            };
+
+            for metric in &metrics {
+                let ref_type = match *metric {
+                    "reactions" => "reaction",
+                    "replies" => "reply",
+                    "reposts" => "repost",
+                    "zaps" => "zap",
+                    _ => continue,
+                };
+
+                for (range, since) in &ranges_with_since {
+                    for limit in [20i64, 100] {
+                        match home_repo.top_notes_unified(ref_type, *since, limit, 0).await {
+                            Ok((ranked, profile_rows)) => {
+                                let profiles: std::collections::HashMap<String, serde_json::Value> = profile_rows
+                                    .into_iter()
+                                    .filter_map(|row| {
+                                        serde_json::from_str::<serde_json::Value>(&row.content).ok().map(|v| {
+                                            let entry = serde_json::json!({
+                                                "name": v.get("name").and_then(|n| n.as_str()).filter(|s| !s.trim().is_empty()),
+                                                "display_name": v.get("display_name").or_else(|| v.get("displayName")).and_then(|n| n.as_str()).filter(|s| !s.trim().is_empty()),
+                                                "picture": v.get("picture").or_else(|| v.get("image")).and_then(|n| n.as_str()).filter(|s| !s.trim().is_empty()),
+                                                "nip05": v.get("nip05").and_then(|n| n.as_str()).filter(|s| !s.trim().is_empty()),
+                                            });
+                                            (row.pubkey.clone(), entry)
+                                        })
+                                    })
+                                    .collect();
+
+                                let notes: Vec<serde_json::Value> = ranked
+                                    .into_iter()
+                                    .map(|entry| serde_json::json!({
+                                        "count": entry.count,
+                                        "total_sats": entry.total_sats,
+                                        "reactions": entry.reactions,
+                                        "replies": entry.replies,
+                                        "reposts": entry.reposts,
+                                        "zap_sats": entry.zap_sats,
+                                        "event": entry.event,
+                                    }))
+                                    .collect();
+
+                                let response = serde_json::json!({
+                                    "metric": metric,
+                                    "range": range,
+                                    "notes": notes,
+                                    "profiles": profiles,
+                                });
+                                if let Ok(json_str) = serde_json::to_string(&response) {
+                                    home_cache.set_trending(metric, range, limit, 0, &json_str).await;
+                                }
+                            }
+                            Err(e) => tracing::warn!(
+                                metric, range, limit,
+                                error = %e,
+                                "failed to pre-compute top notes"
+                            ),
+                        }
+                    }
+                }
+                tracing::info!(metric, "pre-computed top notes (all ranges)");
             }
 
             tokio::time::sleep(std::time::Duration::from_secs(300)).await;
