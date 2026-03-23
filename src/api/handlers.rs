@@ -1081,7 +1081,7 @@ pub async fn get_profile_notes(
         }
     }
 
-    let (events, total) = state.repo.profile_notes(&pubkey, limit, offset, sort).await?;
+    let events = state.repo.profile_notes(&pubkey, limit, offset, sort).await?;
 
     let event_ids: Vec<String> = events.iter().map(|e| e.id.clone()).collect();
     let interactions = state.repo.batch_get_interactions(&event_ids).await?;
@@ -1100,7 +1100,6 @@ pub async fn get_profile_notes(
 
     let response = json!({
         "events": enriched,
-        "total": total,
         "profiles": profiles,
     });
 
@@ -1129,7 +1128,7 @@ pub async fn get_profile_replies(
         }
     }
 
-    let (events, total) = state.repo.profile_replies(&pubkey, limit, offset, sort).await?;
+    let events = state.repo.profile_replies(&pubkey, limit, offset, sort).await?;
 
     let event_ids: Vec<String> = events.iter().map(|e| e.id.clone()).collect();
     let interactions = state.repo.batch_get_interactions(&event_ids).await?;
@@ -1148,7 +1147,6 @@ pub async fn get_profile_replies(
 
     let response = json!({
         "events": enriched,
-        "total": total,
         "profiles": profiles,
     });
 

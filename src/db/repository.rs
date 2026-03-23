@@ -2826,14 +2826,7 @@ impl EventRepository {
         limit: i64,
         offset: i64,
         sort: &str,
-    ) -> Result<(Vec<StoredEvent>, i64), AppError> {
-        let total: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM events WHERE pubkey = $1 AND kind = 1 AND NOT is_reply",
-        )
-        .bind(pubkey)
-        .fetch_one(&self.pool)
-        .await?;
-
+    ) -> Result<Vec<StoredEvent>, AppError> {
         let order_clause = match sort {
             "likes" => "ORDER BY reaction_count DESC, created_at DESC",
             "zaps" => "ORDER BY zap_amount_msats DESC, created_at DESC",
@@ -2859,7 +2852,7 @@ impl EventRepository {
             .fetch_all(&self.pool)
             .await?;
 
-        Ok((events, total))
+        Ok(events)
     }
 
     /// Profile replies: kind 1 events by pubkey that ARE replies.
@@ -2869,14 +2862,7 @@ impl EventRepository {
         limit: i64,
         offset: i64,
         sort: &str,
-    ) -> Result<(Vec<StoredEvent>, i64), AppError> {
-        let total: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM events WHERE pubkey = $1 AND kind = 1 AND is_reply",
-        )
-        .bind(pubkey)
-        .fetch_one(&self.pool)
-        .await?;
-
+    ) -> Result<Vec<StoredEvent>, AppError> {
         let order_clause = match sort {
             "likes" => "ORDER BY reaction_count DESC, created_at DESC",
             "zaps" => "ORDER BY zap_amount_msats DESC, created_at DESC",
@@ -2902,7 +2888,7 @@ impl EventRepository {
             .fetch_all(&self.pool)
             .await?;
 
-        Ok((events, total))
+        Ok(events)
     }
 
     /// Zaps sent by a pubkey (sender is in the embedded zap request).
