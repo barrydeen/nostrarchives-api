@@ -1378,7 +1378,7 @@ impl EventRepository {
                 WHERE e.kind = 1
                   AND {order_col} > 0
                 ORDER BY {order_col} DESC, e.created_at DESC
-                LIMIT $2 OFFSET $3
+                LIMIT $1 OFFSET $2
                 "#
             );
             sqlx::query(&sql)
