@@ -1966,7 +1966,7 @@ impl EventRepository {
     }
 
     /// Search notes with full-text search, ranked by relevance and engagement.
-    /// v2: uses counter columns instead of event_refs join.
+    /// v3: ranks against lightweight search_index table, joins back to events for full data.
     pub async fn search_notes(
         &self,
         query: &str,
@@ -1977,18 +1977,18 @@ impl EventRepository {
             r#"
             WITH ranked AS (
                 SELECT
-                    e.id, e.pubkey, e.created_at, e.kind, e.content, e.sig,
-                    e.tags, e.raw, e.relay_url, e.received_at,
-                    e.reaction_count, e.reply_count, e.repost_count, e.zap_count,
-                    ts_rank(e.content_tsv, query) AS text_rank
-                FROM events e, plainto_tsquery('english', $1) query
-                WHERE e.kind = 1 AND e.content_tsv @@ query
-                ORDER BY ts_rank(e.content_tsv, query) DESC
+                    s.event_id,
+                    s.created_at,
+                    s.reaction_count, s.reply_count, s.repost_count, s.zap_count,
+                    ts_rank(s.content_tsv, query) AS text_rank
+                FROM search_index s, plainto_tsquery('english', $1) query
+                WHERE s.content_tsv @@ query
+                ORDER BY ts_rank(s.content_tsv, query) DESC
                 LIMIT 200
             )
             SELECT
-                r.id, r.pubkey, r.created_at, r.kind, r.content, r.sig,
-                r.tags, r.raw, r.relay_url, r.received_at,
+                e.id, e.pubkey, e.created_at, e.kind, e.content, e.sig,
+                e.tags, e.raw, e.relay_url, e.received_at,
                 r.reaction_count::bigint AS reactions,
                 r.reply_count::bigint AS replies,
                 r.repost_count::bigint AS reposts,
@@ -2008,6 +2008,7 @@ impl EventRepository {
                     END
                 )::float8 AS rank_score
             FROM ranked r
+            JOIN events e ON e.id = r.event_id
             ORDER BY rank_score DESC
             LIMIT $2 OFFSET $3
             "#,
@@ -2376,24 +2377,25 @@ impl EventRepository {
         authors: &[&str],
     ) -> Result<Vec<StoredEvent>, AppError> {
         if authors.is_empty() {
-            // No author filter — original query
+            // No author filter — rank against lightweight search_index, join back to events
             let rows = sqlx::query_as::<_, StoredEvent>(
                 r#"
                 WITH ranked AS (
                     SELECT
-                        e.id, e.pubkey, e.created_at, e.kind, e.content, e.sig,
-                        e.tags, e.raw, e.relay_url, e.received_at,
-                        e.reaction_count, e.reply_count, e.repost_count, e.zap_count,
-                        ts_rank(e.content_tsv, query) AS text_rank
-                    FROM events e, plainto_tsquery('english', $1) query
-                    WHERE e.kind = 1 AND e.content_tsv @@ query
-                    ORDER BY ts_rank(e.content_tsv, query) DESC
+                        s.event_id,
+                        s.created_at,
+                        s.reaction_count, s.reply_count, s.repost_count, s.zap_count,
+                        ts_rank(s.content_tsv, query) AS text_rank
+                    FROM search_index s, plainto_tsquery('english', $1) query
+                    WHERE s.content_tsv @@ query
+                    ORDER BY ts_rank(s.content_tsv, query) DESC
                     LIMIT 200
                 )
                 SELECT
-                    r.id, r.pubkey, r.created_at, r.kind, r.content, r.sig,
-                    r.tags, r.raw, r.relay_url, r.received_at
+                    e.id, e.pubkey, e.created_at, e.kind, e.content, e.sig,
+                    e.tags, e.raw, e.relay_url, e.received_at
                 FROM ranked r
+                JOIN events e ON e.id = r.event_id
                 ORDER BY (
                     r.text_rank * 1000 +
                     LN(
@@ -2418,26 +2420,26 @@ impl EventRepository {
 
             Ok(rows)
         } else {
-            // Author-filtered search
+            // Author-filtered search — rank against lightweight search_index, join back to events
             let rows = sqlx::query_as::<_, StoredEvent>(
                 r#"
                 WITH ranked AS (
                     SELECT
-                        e.id, e.pubkey, e.created_at, e.kind, e.content, e.sig,
-                        e.tags, e.raw, e.relay_url, e.received_at,
-                        e.reaction_count, e.reply_count, e.repost_count, e.zap_count,
-                        ts_rank(e.content_tsv, query) AS text_rank
-                    FROM events e, plainto_tsquery('english', $1) query
-                    WHERE e.kind = 1
-                      AND e.content_tsv @@ query
-                      AND e.pubkey = ANY($3)
-                    ORDER BY ts_rank(e.content_tsv, query) DESC
+                        s.event_id,
+                        s.created_at,
+                        s.reaction_count, s.reply_count, s.repost_count, s.zap_count,
+                        ts_rank(s.content_tsv, query) AS text_rank
+                    FROM search_index s, plainto_tsquery('english', $1) query
+                    WHERE s.content_tsv @@ query
+                      AND s.pubkey = ANY($3)
+                    ORDER BY ts_rank(s.content_tsv, query) DESC
                     LIMIT 200
                 )
                 SELECT
-                    r.id, r.pubkey, r.created_at, r.kind, r.content, r.sig,
-                    r.tags, r.raw, r.relay_url, r.received_at
+                    e.id, e.pubkey, e.created_at, e.kind, e.content, e.sig,
+                    e.tags, e.raw, e.relay_url, e.received_at
                 FROM ranked r
+                JOIN events e ON e.id = r.event_id
                 ORDER BY (
                     r.text_rank * 1000 +
                     LN(
@@ -2487,6 +2489,7 @@ impl EventRepository {
 
     /// Fetch notes matching ANY of the given hashtags, ranked by engagement score.
     /// Implements NIP-01 `#t` tag filter semantics (OR across values).
+    /// Uses note_hashtags btree index for fast lookups, joins to events for full data.
     pub async fn notes_by_hashtags(
         &self,
         hashtags: &[String],
@@ -2503,42 +2506,22 @@ impl EventRepository {
             return Ok((Vec::new(), Vec::new()));
         }
 
-        // Build GIN-indexed containment conditions: tags @> '[["t","bitcoin"]]' OR ...
-        // Each param is a jsonb array-of-arrays matching the stored tags structure.
-        // This hits idx_events_kind1_tags_gin instead of scanning all rows with jsonb_array_elements.
-        let tag_params: Vec<serde_json::Value> = tags_lower
-            .iter()
-            .map(|t| serde_json::json!([["t", t]]))
-            .collect();
-
-        // Limit to last 7 days to keep the scan fast for popular hashtags like #bitcoin.
-        // Without this, the GIN index finds 120k+ matching rows and the heap scan times out.
-        // 7 days is enough to fill 200 results for any active hashtag.
-        // The timestamp is inlined (not a bind param) so the planner can use it for index selection.
+        // Limit to last 7 days for popular hashtags.
         let since = chrono::Utc::now().timestamp() - 7 * 86400;
 
-        let mut qb = sqlx::QueryBuilder::<sqlx::Postgres>::new(format!(
-            r#"WITH tagged_notes AS (
-                SELECT DISTINCT e.id, e.pubkey, e.created_at, e.kind, e.content, e.sig,
+        let rows = sqlx::query(
+            r#"
+            WITH tagged_notes AS (
+                SELECT DISTINCT ON (e.id)
+                       e.id, e.pubkey, e.created_at, e.kind, e.content, e.sig,
                        e.tags, e.raw, e.relay_url, e.received_at,
                        e.reaction_count, e.repost_count, e.reply_count,
                        e.zap_count, e.zap_amount_msats
-                FROM events e
-                WHERE e.kind = 1 AND e.created_at >= {since} AND ("#,
-        ));
-
-
-        for (i, param) in tag_params.iter().enumerate() {
-            if i > 0 {
-                qb.push(" OR ");
-            }
-            qb.push("e.tags @> ");
-            qb.push_bind(param.clone());
-        }
-
-        qb.push(
-            r#")
-                ORDER BY e.created_at DESC
+                FROM note_hashtags nh
+                JOIN events e ON e.id = nh.event_id
+                WHERE nh.hashtag = ANY($1)
+                  AND nh.created_at >= $2
+                ORDER BY e.id, e.created_at DESC
                 LIMIT 200
             )
             SELECT
@@ -2556,19 +2539,15 @@ impl EventRepository {
                 )::bigint AS score
             FROM tagged_notes tn
             ORDER BY score DESC, tn.created_at DESC
-            LIMIT "#,
-        );
-        qb.push_bind(limit);
-        qb.push(" OFFSET ");
-        qb.push_bind(offset);
-
-        // Run inside a transaction so SET LOCAL statement_timeout is scoped to this query only.
-        let mut tx = self.pool.begin().await?;
-        sqlx::query("SET LOCAL statement_timeout = '15000'")
-            .execute(&mut *tx)
-            .await?;
-        let rows = qb.build().fetch_all(&mut *tx).await?;
-        tx.commit().await?;
+            LIMIT $3 OFFSET $4
+            "#,
+        )
+        .bind(&tags_lower)
+        .bind(since)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await?;
 
         let mut pubkeys = Vec::new();
         let notes = rows
@@ -2649,6 +2628,7 @@ impl EventRepository {
     }
 
     /// Get trending hashtags from kind-1 notes in the last 24 hours.
+    /// Uses note_hashtags btree index instead of jsonb_array_elements scan.
     pub async fn trending_hashtags(
         &self,
         limit: i64,
@@ -2658,16 +2638,12 @@ impl EventRepository {
 
         let rows = sqlx::query_as::<_, (String, i64)>(
             r#"
-            SELECT LOWER(tag_elem->>1) AS hashtag,
-                   COUNT(DISTINCT e.id)::bigint AS cnt
-            FROM events e,
-                 jsonb_array_elements(e.tags) AS tag_elem
-            WHERE tag_elem->>0 = 't'
-              AND e.kind = 1
-              AND e.created_at >= $1
-              AND LENGTH(tag_elem->>1) BETWEEN 1 AND 100
-            GROUP BY LOWER(tag_elem->>1)
-            HAVING COUNT(DISTINCT e.id) >= 3
+            SELECT nh.hashtag,
+                   COUNT(DISTINCT nh.event_id)::bigint AS cnt
+            FROM note_hashtags nh
+            WHERE nh.created_at >= $1
+            GROUP BY nh.hashtag
+            HAVING COUNT(DISTINCT nh.event_id) >= 3
             ORDER BY cnt DESC
             LIMIT $2 OFFSET $3
             "#,
