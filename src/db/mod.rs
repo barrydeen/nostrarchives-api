@@ -142,6 +142,10 @@ async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
             "029_follows_composite_indexes",
             include_str!("../../migrations/029_follows_composite_indexes.sql"),
         ),
+        (
+            "030_trending_covering_index",
+            include_str!("../../migrations/030_trending_covering_index.sql"),
+        ),
     ];
 
     for (name, sql) in migrations {

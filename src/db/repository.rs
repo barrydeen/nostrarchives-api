@@ -1426,27 +1426,42 @@ impl EventRepository {
     ) -> Result<Vec<TrendingNote>, AppError> {
         let since = chrono::Utc::now().timestamp() - 86400;
 
+        // Two-step query: first score candidates via the covering index
+        // (index-only scan on idx_events_trending_candidates), then fetch
+        // full rows for only the top N candidates.
         let rows = sqlx::query(
             r#"
-            SELECT
-                e.id, e.pubkey, e.created_at, e.kind, e.content, e.sig, e.tags, e.raw,
-                e.relay_url, e.received_at,
-                (e.zap_amount_msats / 1000)::bigint AS zap_sats,
-                e.repost_count::bigint AS repost_count,
-                e.reply_count::bigint AS reply_count,
-                e.reaction_count::bigint AS reaction_count,
-                (
-                    e.zap_amount_msats / 1000
-                    + e.repost_count * 1000
-                    + e.reply_count * 500
-                    + e.reaction_count * 100
-                )::bigint AS score
-            FROM events e
-            WHERE e.kind = 1
-              AND e.created_at >= $1
-              AND (e.reaction_count + e.repost_count + e.reply_count + e.zap_count) > 0
-            ORDER BY score DESC, e.created_at DESC
-            LIMIT $2 OFFSET $3
+            WITH top AS (
+                SELECT id, pubkey,
+                    (zap_amount_msats / 1000)::bigint AS zap_sats,
+                    repost_count::bigint AS repost_count,
+                    reply_count::bigint AS reply_count,
+                    reaction_count::bigint AS reaction_count,
+                    (
+                        zap_amount_msats / 1000
+                        + repost_count * 1000
+                        + reply_count * 500
+                        + reaction_count * 100
+                    )::bigint AS score,
+                    created_at
+                FROM events
+                WHERE kind = 1
+                  AND created_at >= $1
+                  AND (reaction_count + repost_count + reply_count + zap_count) > 0
+                ORDER BY (
+                    zap_amount_msats / 1000
+                    + repost_count * 1000
+                    + reply_count * 500
+                    + reaction_count * 100
+                ) DESC, created_at DESC
+                LIMIT $2 OFFSET $3
+            )
+            SELECT e.id, e.pubkey, e.created_at, e.kind, e.content, e.sig, e.tags, e.raw,
+                   e.relay_url, e.received_at,
+                   t.zap_sats, t.repost_count, t.reply_count, t.reaction_count, t.score
+            FROM top t
+            JOIN events e ON e.id = t.id
+            ORDER BY t.score DESC, t.created_at DESC
             "#,
         )
         .bind(since)
