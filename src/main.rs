@@ -349,6 +349,63 @@ async fn main() {
         }
     });
 
+    // Background: pre-compute slow homepage queries every 5 minutes.
+    // trending_notes (36s uncached), trending_users (26s), trending_hashtags (14s)
+    // are too expensive to compute on-demand. This task keeps the cache warm so
+    // handlers always serve from cache.
+    let home_repo = repo.clone();
+    let home_cache = stats_cache.clone();
+    tokio::spawn(async move {
+        // Short initial delay — compute immediately on startup so cache is warm.
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        loop {
+            // Pre-compute for the limit/offset combos the frontend uses.
+            // Trending notes: limit 10 and 20 (homepage + trending page)
+            for limit in [10i64, 20] {
+                match home_repo.trending_notes(limit, 0).await {
+                    Ok(notes) => {
+                        let response = serde_json::json!({ "notes": notes });
+                        if let Ok(json_str) = serde_json::to_string(&response) {
+                            home_cache.set_json(
+                                &format!("home:trending:{limit}:0"),
+                                &json_str,
+                                600,
+                            ).await;
+                        }
+                        tracing::info!(limit, "pre-computed trending notes");
+                    }
+                    Err(e) => tracing::warn!(error = %e, "failed to pre-compute trending notes"),
+                }
+            }
+
+            // Trending users: limit 12 (homepage)
+            match home_repo.trending_users(12, 0).await {
+                Ok(users) => {
+                    let response = serde_json::json!({ "users": users });
+                    if let Ok(json_str) = serde_json::to_string(&response) {
+                        home_cache.set_json("home:trending_users:12:0", &json_str, 600).await;
+                    }
+                    tracing::info!("pre-computed trending users");
+                }
+                Err(e) => tracing::warn!(error = %e, "failed to pre-compute trending users"),
+            }
+
+            // Trending hashtags: limit 20 (homepage)
+            match home_repo.trending_hashtags(20, 0).await {
+                Ok(hashtags) => {
+                    let response = serde_json::json!({ "hashtags": hashtags });
+                    if let Ok(json_str) = serde_json::to_string(&response) {
+                        home_cache.set_json("home:trending_hashtags:20:0", &json_str, 600).await;
+                    }
+                    tracing::info!("pre-computed trending hashtags");
+                }
+                Err(e) => tracing::warn!(error = %e, "failed to pre-compute trending hashtags"),
+            }
+
+            tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+        }
+    });
+
     // Initialize on-demand relay fetcher
     let relay_router = crawler::relay_router::RelayRouter::new(pool.clone());
     let fetcher = Arc::new(relay::fetcher::RelayFetcher::new(
