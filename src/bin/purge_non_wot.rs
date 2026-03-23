@@ -1,15 +1,20 @@
 //! CLI tool to purge kind-1 notes from authors who don't pass the WoT filter.
 //!
-//! Strategy: drop FK CASCADE constraints, bulk delete, clean orphans, re-add FKs.
-//! This avoids the CASCADE overhead that makes per-row deletes extremely slow.
+//! Strategy: delete one author's notes at a time with a short sleep between
+//! each author. This keeps transactions small and avoids lock contention with
+//! the live service. Safe to run in the background.
 //!
 //! Usage:
-//!   cargo run --bin purge_non_wot                  # dry run (default)
-//!   cargo run --bin purge_non_wot -- --execute      # actually delete
+//!   cargo run --bin purge_non_wot                       # dry run
+//!   cargo run --bin purge_non_wot -- --execute           # delete (50ms sleep)
+//!   cargo run --bin purge_non_wot -- --execute --sleep 0 # no sleep (faster)
 
 use std::time::Instant;
 
 use sqlx::postgres::PgPoolOptions;
+use tokio::time::{sleep, Duration};
+
+const DEFAULT_SLEEP_MS: u64 = 50;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -23,17 +28,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let args: Vec<String> = std::env::args().collect();
     let execute = args.iter().any(|a| a == "--execute");
+    let sleep_ms = args
+        .iter()
+        .position(|a| a == "--sleep")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_SLEEP_MS);
 
     let database_url =
         std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
 
     let pool = PgPoolOptions::new()
-        .max_connections(5)
+        .max_connections(3)
         .acquire_timeout(std::time::Duration::from_secs(30))
         .connect(&database_url)
         .await?;
 
-    // Step 1: Count WoT-passing pubkeys
+    // Step 1: Safety check
     let (wot_count,): (i64,) =
         sqlx::query_as("SELECT COUNT(*) FROM wot_scores WHERE passes_wot = true")
             .fetch_one(&pool)
@@ -41,43 +52,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("WoT-passing pubkeys: {wot_count}");
 
     if wot_count == 0 {
-        println!("ERROR: wot_scores is empty — refusing to purge (would delete everything)");
+        println!("ERROR: wot_scores is empty — refusing to purge");
         return Ok(());
     }
 
-    // Step 2: Build temp table of non-WoT pubkeys that have kind-1 events
+    // Step 2: Get list of non-WoT pubkeys that have kind-1 events
     println!("Identifying non-WoT authors with kind-1 notes...");
     let build_start = Instant::now();
 
-    sqlx::query("DROP TABLE IF EXISTS _purge_pubkeys")
-        .execute(&pool)
-        .await?;
-
-    sqlx::query(
-        "CREATE UNLOGGED TABLE _purge_pubkeys AS
-         SELECT DISTINCT e.pubkey
+    let pubkeys: Vec<(String,)> = sqlx::query_as(
+        "SELECT DISTINCT e.pubkey
          FROM events e
          LEFT JOIN wot_scores w ON w.pubkey = e.pubkey AND w.passes_wot = true
          WHERE e.kind = 1 AND w.pubkey IS NULL",
     )
-    .execute(&pool)
+    .fetch_all(&pool)
     .await?;
 
-    sqlx::query("CREATE INDEX ON _purge_pubkeys (pubkey)")
-        .execute(&pool)
-        .await?;
-
-    let (purge_authors,): (i64,) =
-        sqlx::query_as("SELECT COUNT(*) FROM _purge_pubkeys")
-            .fetch_one(&pool)
-            .await?;
-
+    let purge_authors = pubkeys.len();
     println!(
         "Found {purge_authors} non-WoT authors in {:.1}s",
         build_start.elapsed().as_secs_f64()
     );
 
-    // Step 3: Count events to purge
+    // Step 3: Count
     let (total_kind1,): (i64,) =
         sqlx::query_as("SELECT COUNT(*) FROM events WHERE kind = 1")
             .fetch_one(&pool)
@@ -85,9 +83,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let (purge_count,): (i64,) = sqlx::query_as(
         "SELECT COUNT(*) FROM events e
-         INNER JOIN _purge_pubkeys p ON p.pubkey = e.pubkey
-         WHERE e.kind = 1",
+         WHERE e.kind = 1
+           AND e.pubkey = ANY($1)",
     )
+    .bind(&pubkeys.iter().map(|p| p.0.clone()).collect::<Vec<_>>())
     .fetch_one(&pool)
     .await?;
 
@@ -109,118 +108,79 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if purge_count == 0 {
         println!("\nNothing to purge!");
-        cleanup_temp(&pool).await;
         return Ok(());
     }
 
     if !execute {
         println!("\n** DRY RUN — pass --execute to actually delete **");
-        cleanup_temp(&pool).await;
         return Ok(());
     }
 
-    // === EXECUTE MODE ===
-    let total_start = Instant::now();
+    // === EXECUTE: delete per-author ===
+    println!("\nPurging one author at a time ({sleep_ms}ms sleep between)...\n");
 
-    // Step 4: Drop FK constraints (eliminates CASCADE overhead)
-    println!("\nDropping FK constraints...");
-    let fks = [
-        ("event_tags", "event_tags_event_id_fkey", "event_id", "id"),
-        ("event_refs", "event_refs_source_event_id_fkey", "source_event_id", "id"),
-        ("follow_lists", "follow_lists_event_id_fkey", "event_id", "id"),
-        ("follows", "follows_source_event_id_fkey", "source_event_id", "id"),
-    ];
+    let start = Instant::now();
+    let mut total_deleted: u64 = 0;
+    let mut authors_done: usize = 0;
 
-    for (table, constraint, _, _) in &fks {
-        let sql = format!("ALTER TABLE {table} DROP CONSTRAINT IF EXISTS {constraint}");
-        sqlx::query(&sql).execute(&pool).await?;
-        println!("  dropped {table}.{constraint}");
+    for (pubkey,) in &pubkeys {
+        let result = sqlx::query(
+            "DELETE FROM events WHERE pubkey = $1 AND kind = 1",
+        )
+        .bind(pubkey)
+        .execute(&pool)
+        .await?;
+
+        let deleted = result.rows_affected();
+        total_deleted += deleted;
+        authors_done += 1;
+
+        if authors_done % 500 == 0 || authors_done == purge_authors {
+            let elapsed = start.elapsed().as_secs();
+            let rate = if elapsed > 0 { total_deleted / elapsed } else { total_deleted };
+            let pct = 100.0 * authors_done as f64 / purge_authors as f64;
+            println!(
+                "  authors {authors_done}/{purge_authors} ({pct:.1}%) — {total_deleted} events deleted — {rate} events/sec"
+            );
+        }
+
+        if sleep_ms > 0 {
+            sleep(Duration::from_millis(sleep_ms)).await;
+        }
     }
 
-    // Step 5: Bulk delete kind-1 events (no CASCADE = fast)
-    println!("\nDeleting {purge_count} kind-1 notes...");
-    let del_start = Instant::now();
-    let result = sqlx::query(
-        "DELETE FROM events e
-         USING _purge_pubkeys p
-         WHERE e.pubkey = p.pubkey AND e.kind = 1",
-    )
-    .execute(&pool)
-    .await?;
+    let elapsed = start.elapsed();
     println!(
-        "  deleted {} events in {:.1}s",
-        result.rows_affected(),
-        del_start.elapsed().as_secs_f64()
+        "\nDone! Deleted {total_deleted} events from {authors_done} authors in {:.1}s",
+        elapsed.as_secs_f64()
     );
 
-    // Step 6: Clean up orphaned rows in referencing tables
-    println!("\nCleaning orphaned event_refs...");
-    let t = Instant::now();
-    let r = sqlx::query(
-        "DELETE FROM event_refs
-         WHERE source_event_id NOT IN (SELECT id FROM events)",
+    // Step 5: Validate NOT VALID FK constraints if any exist
+    println!("\nChecking FK constraint validity...");
+    let not_valid: Vec<(String, String)> = sqlx::query_as(
+        "SELECT tc.table_name::text, tc.constraint_name::text
+         FROM information_schema.table_constraints tc
+         JOIN pg_constraint c ON c.conname = tc.constraint_name
+         WHERE tc.constraint_type = 'FOREIGN KEY'
+           AND NOT c.convalidated
+           AND tc.table_name IN ('event_refs', 'follows', 'follow_lists')",
     )
-    .execute(&pool)
+    .fetch_all(&pool)
     .await?;
-    println!("  removed {} event_refs in {:.1}s", r.rows_affected(), t.elapsed().as_secs_f64());
 
-    println!("Cleaning orphaned follows...");
-    let t = Instant::now();
-    let r = sqlx::query(
-        "DELETE FROM follows
-         WHERE source_event_id NOT IN (SELECT id FROM events)",
-    )
-    .execute(&pool)
-    .await?;
-    println!("  removed {} follows in {:.1}s", r.rows_affected(), t.elapsed().as_secs_f64());
-
-    println!("Cleaning orphaned follow_lists...");
-    let t = Instant::now();
-    let r = sqlx::query(
-        "DELETE FROM follow_lists
-         WHERE event_id NOT IN (SELECT id FROM events)",
-    )
-    .execute(&pool)
-    .await?;
-    println!("  removed {} follow_lists in {:.1}s", r.rows_affected(), t.elapsed().as_secs_f64());
-
-    // Step 7: Clean up orphaned kind-0 metadata
-    println!("Cleaning orphaned kind-0 metadata...");
-    let t = Instant::now();
-    let r = sqlx::query(
-        "DELETE FROM events
-         WHERE kind = 0
-           AND pubkey IN (SELECT pubkey FROM _purge_pubkeys)
-           AND pubkey NOT IN (SELECT DISTINCT pubkey FROM events WHERE kind != 0)",
-    )
-    .execute(&pool)
-    .await?;
-    println!("  removed {} metadata events in {:.1}s", r.rows_affected(), t.elapsed().as_secs_f64());
-
-    // Step 8: Re-add FK constraints
-    println!("\nRe-adding FK constraints...");
-    for (table, constraint, col, ref_col) in &fks {
-        let sql = format!(
-            "ALTER TABLE {table} ADD CONSTRAINT {constraint}
-             FOREIGN KEY ({col}) REFERENCES events ({ref_col}) ON DELETE CASCADE"
-        );
-        sqlx::query(&sql).execute(&pool).await?;
-        println!("  restored {table}.{constraint}");
+    if not_valid.is_empty() {
+        println!("  all FK constraints are valid");
+    } else {
+        for (table, constraint) in &not_valid {
+            println!("  validating {table}.{constraint}...");
+            let t = Instant::now();
+            let sql = format!("ALTER TABLE {table} VALIDATE CONSTRAINT {constraint}");
+            sqlx::query(&sql).execute(&pool).await?;
+            println!("    validated in {:.1}s", t.elapsed().as_secs_f64());
+        }
     }
 
-    cleanup_temp(&pool).await;
-
-    println!(
-        "\nDone! Total time: {:.1}s",
-        total_start.elapsed().as_secs_f64()
-    );
-    println!("Recommendation: run VACUUM FULL events; to reclaim disk space");
+    println!("\nAll clean. Run VACUUM events; when convenient to reclaim space.");
 
     Ok(())
-}
-
-async fn cleanup_temp(pool: &sqlx::PgPool) {
-    let _ = sqlx::query("DROP TABLE IF EXISTS _purge_pubkeys")
-        .execute(pool)
-        .await;
 }
