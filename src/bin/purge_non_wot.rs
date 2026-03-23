@@ -1,0 +1,155 @@
+//! CLI tool to purge kind-1 notes from authors who don't pass the WoT filter.
+//!
+//! Usage:
+//!   cargo run --bin purge_non_wot                  # dry run (default)
+//!   cargo run --bin purge_non_wot -- --execute      # actually delete
+//!   cargo run --bin purge_non_wot -- --batch 5000   # custom batch size
+
+use std::time::Instant;
+
+use sqlx::postgres::PgPoolOptions;
+
+const DEFAULT_BATCH_SIZE: i64 = 10_000;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    dotenvy::dotenv().ok();
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "info".into()),
+        )
+        .init();
+
+    let args: Vec<String> = std::env::args().collect();
+    let execute = args.iter().any(|a| a == "--execute");
+    let batch_size = args
+        .iter()
+        .position(|a| a == "--batch")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(DEFAULT_BATCH_SIZE);
+
+    let database_url =
+        std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
+
+    let pool = PgPoolOptions::new()
+        .max_connections(5)
+        .acquire_timeout(std::time::Duration::from_secs(10))
+        .connect(&database_url)
+        .await?;
+
+    // Step 1: Count WoT-passing pubkeys
+    let (wot_count,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM wot_scores WHERE passes_wot = true")
+            .fetch_one(&pool)
+            .await?;
+    println!("WoT-passing pubkeys: {wot_count}");
+
+    // Step 2: Count kind-1 events to purge
+    let (total_kind1,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM events WHERE kind = 1")
+            .fetch_one(&pool)
+            .await?;
+
+    let (keep_count,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM events e
+         INNER JOIN wot_scores w ON w.pubkey = e.pubkey AND w.passes_wot = true
+         WHERE e.kind = 1",
+    )
+    .fetch_one(&pool)
+    .await?;
+
+    let purge_count = total_kind1 - keep_count;
+    let purge_authors: (i64,) = sqlx::query_as(
+        "SELECT COUNT(DISTINCT e.pubkey) FROM events e
+         WHERE e.kind = 1
+           AND e.pubkey NOT IN (SELECT pubkey FROM wot_scores WHERE passes_wot = true)",
+    )
+    .fetch_one(&pool)
+    .await?;
+
+    println!("\n--- Purge Summary ---");
+    println!("Total kind-1 notes:     {total_kind1}");
+    println!("Notes to KEEP (in WoT): {keep_count}");
+    println!("Notes to PURGE:         {purge_count}");
+    println!("Authors to purge:       {}", purge_authors.0);
+    println!(
+        "Purge percentage:       {:.1}%",
+        if total_kind1 > 0 {
+            100.0 * purge_count as f64 / total_kind1 as f64
+        } else {
+            0.0
+        }
+    );
+
+    if purge_count == 0 {
+        println!("\nNothing to purge!");
+        return Ok(());
+    }
+
+    if !execute {
+        println!("\n** DRY RUN — pass --execute to actually delete **");
+        return Ok(());
+    }
+
+    println!("\nDeleting in batches of {batch_size}...");
+    println!("(CASCADE will auto-clean event_refs, follows, follow_lists)\n");
+
+    let start = Instant::now();
+    let mut total_deleted: i64 = 0;
+
+    loop {
+        // Delete a batch of kind-1 events from non-WoT authors
+        let result = sqlx::query(
+            "DELETE FROM events
+             WHERE id IN (
+                 SELECT e.id FROM events e
+                 WHERE e.kind = 1
+                   AND e.pubkey NOT IN (SELECT pubkey FROM wot_scores WHERE passes_wot = true)
+                 LIMIT $1
+             )",
+        )
+        .bind(batch_size)
+        .execute(&pool)
+        .await?;
+
+        let deleted = result.rows_affected() as i64;
+        if deleted == 0 {
+            break;
+        }
+
+        total_deleted += deleted;
+        let elapsed = start.elapsed().as_secs();
+        let rate = if elapsed > 0 {
+            total_deleted / elapsed as i64
+        } else {
+            total_deleted
+        };
+        println!(
+            "  deleted {total_deleted}/{purge_count} ({:.1}%) — {rate} events/sec",
+            100.0 * total_deleted as f64 / purge_count as f64
+        );
+    }
+
+    let elapsed = start.elapsed();
+    println!("\nDone! Deleted {total_deleted} events in {:.1}s", elapsed.as_secs_f64());
+
+    // Also clean up orphaned kind-0 metadata from purged authors
+    let meta_result = sqlx::query(
+        "DELETE FROM events
+         WHERE kind = 0
+           AND pubkey NOT IN (SELECT pubkey FROM wot_scores WHERE passes_wot = true)
+           AND pubkey NOT IN (SELECT DISTINCT pubkey FROM events WHERE kind != 0)",
+    )
+    .execute(&pool)
+    .await?;
+    println!(
+        "Cleaned up {} orphaned kind-0 metadata events",
+        meta_result.rows_affected()
+    );
+
+    println!("\nRecommendation: run VACUUM FULL events; to reclaim disk space");
+
+    Ok(())
+}
