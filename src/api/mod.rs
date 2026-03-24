@@ -11,6 +11,7 @@ use tower_http::cors::CorsLayer;
 use crate::cache::StatsCache;
 use crate::crawler::queue::CrawlQueue;
 use crate::db::repository::EventRepository;
+use crate::live_metrics::LiveMetricsTracker;
 use crate::profile_search_cache::ProfileSearchCache;
 use crate::ratelimit::{rate_limit_middleware, RateLimiter};
 use crate::relay::fetcher::RelayFetcher;
@@ -23,6 +24,7 @@ pub struct AppState {
     pub crawl_queue: Option<CrawlQueue>,
     pub fetcher: Arc<RelayFetcher>,
     pub profile_search_cache: ProfileSearchCache,
+    pub live_tracker: Option<Arc<LiveMetricsTracker>>,
 }
 
 async fn cache_control_middleware(
@@ -38,6 +40,18 @@ async fn cache_control_middleware(
     );
 
     response
+}
+
+/// WebSocket upgrade handler for live metrics streaming.
+async fn ws_live_metrics(
+    ws: axum::extract::WebSocketUpgrade,
+    axum::extract::State(state): axum::extract::State<AppState>,
+) -> impl axum::response::IntoResponse {
+    ws.on_upgrade(move |socket| async move {
+        if let Some(tracker) = state.live_tracker {
+            crate::live_metrics::handle_live_metrics_ws(socket, tracker).await;
+        }
+    })
 }
 
 /// Build the axum router with all routes.
@@ -106,9 +120,14 @@ pub fn router(state: AppState) -> Router {
         ))
         .layer(middleware::from_fn(cache_control_middleware));
 
+    // WebSocket routes are NOT rate-limited
+    let ws_routes = Router::new()
+        .route("/v1/ws/live-metrics", get(ws_live_metrics));
+
     // Health check is NOT rate-limited (monitoring/uptime checks)
     Router::new()
         .route("/health", get(handlers::health))
+        .merge(ws_routes)
         .merge(api_routes)
         .layer(CorsLayer::permissive())
         .with_state(state)

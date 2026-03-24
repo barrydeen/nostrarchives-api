@@ -4,6 +4,7 @@ pub mod crawler;
 pub mod db;
 pub mod error;
 pub mod follower_cache;
+pub mod live_metrics;
 pub mod nip19;
 pub mod relay;
 pub mod wot_cache;

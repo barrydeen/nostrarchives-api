@@ -1,8 +1,11 @@
+use std::sync::Arc;
+
 use redis::AsyncCommands;
 
 use crate::db::models::{GlobalStats, KindCount};
 use crate::db::repository::EventRepository;
 use crate::error::AppError;
+use crate::live_metrics::LiveMetricsTracker;
 
 const PREFIX: &str = "nostr";
 const STATS_TTL: u64 = 60; // seconds
@@ -28,11 +31,17 @@ fn key(suffix: &str) -> String {
 pub struct StatsCache {
     redis: redis::Client,
     repo: EventRepository,
+    live_tracker: Option<Arc<LiveMetricsTracker>>,
 }
 
 impl StatsCache {
     pub fn new(redis: redis::Client, repo: EventRepository) -> Self {
-        Self { redis, repo }
+        Self { redis, repo, live_tracker: None }
+    }
+
+    /// Attach a live metrics tracker for real-time event streaming.
+    pub fn set_live_tracker(&mut self, tracker: Arc<LiveMetricsTracker>) {
+        self.live_tracker = Some(tracker);
     }
 
     /// Record a newly ingested event in Redis counters.
@@ -74,6 +83,22 @@ impl StatsCache {
             .cmd("EXPIRE").arg(&posts_key).arg(172_800i64)
             .query_async(&mut conn)
             .await;
+
+        // Forward to live metrics tracker (online + notes only; zap sats handled separately)
+        if let Some(ref tracker) = self.live_tracker {
+            tracker.record_event(pubkey, kind, 0).await;
+        }
+    }
+
+    /// Record zap sats in the live metrics tracker (called from the ingester
+    /// after extracting the zap amount from kind-9735 events).
+    pub async fn record_live_zap(&self, zap_sats: i64) {
+        if zap_sats <= 0 {
+            return;
+        }
+        if let Some(ref tracker) = self.live_tracker {
+            tracker.record_zap_sats(zap_sats).await;
+        }
     }
 
     /// Get daily DAU and posts from Redis HLL + counters.
