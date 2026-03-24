@@ -1,33 +1,8 @@
 # nostrarchives-api
 
-Nostr event ingestion and REST API. Connects to configurable relays, stores every event in PostgreSQL with full indexing, and caches aggregate stats in Redis. Powers [nostrarchives.com](https://nostrarchives.com).
+Nostr event ingestion, REST API, and WebSocket relay service. Connects to configurable relays, stores events in PostgreSQL with full indexing, and caches aggregate stats in Redis. Powers [nostrarchives.com](https://nostrarchives.com).
 
-## Architecture
-
-```
-[Relay 1] ──┐
-[Relay 2] ──┤──> [mpsc channel] ──> [Ingestion Worker] ──> [PostgreSQL]
-[Relay 3] ──┘                                          └──> [Redis Counters]
-                                                              ↑
-                                [axum API Server] ────────────┘
-```
-
-- **Relay connections** run as independent tokio tasks with auto-reconnect and exponential backoff
-- **Event processing** funnels through a single worker via bounded channel (backpressure built in)
-- **PostgreSQL** stores events with indexes on pubkey, kind, created_at, relay, tags (GIN), and full-text search (tsvector)
-- **Redis** caches running counters: total events, unique pubkeys (HyperLogLog), events by kind, ingestion rate
-
-## Features
-
-- Full Nostr event ingestion from multiple relays with deduplication
-- Full-text search across event content
-- Social graph tracking (follows/followers)
-- Trending notes (by likes, zaps — all-time and rolling 24h)
-- Intelligent historical crawler with author prioritization by follower count
-- Dynamic relay discovery via NIP-65
-- Profile search with fuzzy matching (trigram indexes)
-- Thread traversal and interaction counts
-- NIP-19 entity resolution (npub, note, nprofile, nevent)
+The frontend lives at [nostrarchives-frontend](https://github.com/barrydeen/nostrarchives-frontend).
 
 ## Prerequisites
 
@@ -35,132 +10,283 @@ Nostr event ingestion and REST API. Connects to configurable relays, stores ever
 - **PostgreSQL** (14+)
 - **Redis** (6+)
 
-## Setup
+## Installation
 
 ```bash
-# Clone the repo
 git clone https://github.com/barrydeen/nostrarchives-api.git
 cd nostrarchives-api
 
-# Configure environment
 cp .env.example .env
-# Edit .env with your database/redis/relay configuration
+# Edit .env — at minimum set DATABASE_URL and REDIS_URL
 
-# Create the database
 createdb nostr_api
 
 # Run (migrations apply automatically on startup)
 cargo run
 ```
 
-## API Endpoints
+### Build Commands
+
+```bash
+cargo build                          # debug build
+cargo build --release                # production build
+cargo run                            # run (loads .env automatically)
+cargo run --bin purge_non_wot        # run purge utility
+cargo check                          # type check without building
+cargo clippy                         # lints
+cargo fmt                            # format
+cargo test                           # tests
+```
+
+## Deployment
+
+The production setup runs on a Hetzner server behind nginx. The service is managed via systemd.
+
+```bash
+# On the server
+cd /opt/apps/nostr-api
+git pull origin main
+cargo build --release
+systemctl restart nostr-api
+```
+
+The service listens on four ports (see below). Nginx reverse-proxies these to public subdomains:
+
+| Subdomain | Port | Service |
+|-----------|------|---------|
+| `api.nostrarchives.com` | 8000 | REST API + live metrics WebSocket |
+| `relay.nostrarchives.com` | 8001 | NIP-50 search relay + feed WebSockets |
+| `scheduler.nostrarchives.com` | 8002 | Scheduler relay (future-dated events) |
+| `indexer.nostrarchives.com` | 8003 | Indexer relay (kinds 0, 3, 10002 only) |
+
+## REST API Endpoints
+
+All endpoints are rate-limited at 120 req/min per IP unless noted. Whitelist IPs via `RATELIMIT_WHITELIST`.
+
+### Health & Stats
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/health` | Health check |
-| GET | `/v1/stats` | Global stats (cached) |
-| GET | `/v1/events` | Query events with filters |
-| GET | `/v1/events/{id}` | Get event by ID |
-| GET | `/v1/events/{id}/thread` | Thread context (ancestors + replies/reactions/etc.) |
-| GET | `/v1/events/{id}/interactions` | Lightweight interaction counts |
-| GET | `/v1/events/{id}/refs/{ref_type}` | Events referencing the target by type |
-| GET | `/v1/social/{pubkey}` | Follow/follower counts + lists for a pubkey |
-| GET | `/v1/notes/likes/top` | Top liked notes (all time) |
-| GET | `/v1/notes/likes/top/today` | Top liked notes (rolling 24h) |
-| GET | `/v1/notes/zaps/top` | Top zapped notes (all time) |
-| GET | `/v1/notes/zaps/top/today` | Top zapped notes (rolling 24h) |
-| GET | `/v1/notes/trending/{metric}/{range}` | Unified trending endpoint |
+| GET | `/health` | Health check (not rate-limited) |
+| GET | `/v1/stats` | Global stats (total events, pubkeys, events by kind) |
+| GET | `/v1/stats/daily` | Daily network stats (DAU, posts, sats) |
+| GET | `/v1/stats/follower-cache` | Cache monitoring (WoT, follower, profile search) |
 | GET | `/v1/crawler/stats` | Crawler progress and queue stats |
 
-### Query Parameters (`/v1/events`)
+### Events
 
-| Param | Type | Description |
-|-------|------|-------------|
-| `pubkey` | string | Filter by author public key |
-| `kind` | int | Filter by event kind |
-| `since` | int | Events created after (unix timestamp) |
-| `until` | int | Events created before (unix timestamp) |
-| `search` | string | Full-text search on content |
-| `limit` | int | Max results (default 50, max 500) |
-| `offset` | int | Pagination offset |
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/v1/events?pubkey=&kind=&since=&until=&search=&limit=&offset=` | Query events with filters |
+| GET | `/v1/events/{id}` | Single event by ID |
+| GET | `/v1/events/{id}/thread` | Thread context (ancestors + replies + reactions) |
+| GET | `/v1/events/{id}/interactions` | Lightweight interaction counts |
+| GET | `/v1/events/{id}/refs/{ref_type}` | Events referencing target (`reply`/`reaction`/`repost`/`zap`/`mention`/`root`) |
+| GET | `/v1/pages/note/{id}` | Note detail page (event + profiles + stats) |
 
-### Query Parameters (`/v1/events/{id}/thread` and `/v1/events/{id}/refs/{ref_type}`)
+### Profiles & Social
 
-| Param | Type | Description |
-|-------|------|-------------|
-| `limit` | int | Max related events returned (default 50, max 500) |
-| `ref_type` | string | `refs` endpoint only — one of `reply`, `reaction`, `repost`, `zap`, `mention`, `root` |
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/v1/social/{pubkey}` | Follow/follower counts and lists |
+| POST | `/v1/profiles/metadata` | Batch fetch metadata for multiple pubkeys |
+| GET | `/v1/profiles/{pubkey}/notes` | Root notes by author |
+| GET | `/v1/profiles/{pubkey}/replies` | Replies by author |
+| GET | `/v1/profiles/{pubkey}/zaps/sent` | Zaps sent by pubkey |
+| GET | `/v1/profiles/{pubkey}/zaps/received` | Zaps received by pubkey |
+| GET | `/v1/profiles/{pubkey}/zap-stats` | Zap statistics (total sats, count) |
 
-### Query Parameters (`/v1/social/{pubkey}`)
+### Search
 
-| Param | Type | Description |
-|-------|------|-------------|
-| `follows_limit` | int | Max follow entries returned (default 100, max 500) |
-| `followers_limit` | int | Max follower entries returned (default 100, max 500) |
-| `follows_offset` | int | Offset into the follow list (default 0) |
-| `followers_offset` | int | Offset into the follower list (default 0) |
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/v1/search?q=&type=&limit=&offset=` | Full-text search (profiles + notes) |
+| GET | `/v1/search/suggest?q=&limit=` | Autocomplete suggestions |
+| GET | `/v1/notes/search?q=&author=&reply_to=&order=` | Advanced note search |
 
-### Query Parameters (`/v1/notes/.../top`)
+### Trending & Leaderboards
 
-| Param | Type | Description |
-|-------|------|-------------|
-| `limit` | int | Max notes returned (default 100, max 100) |
-| `offset` | int | Pagination offset (default 0) |
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/v1/notes/top?metric=&range=&limit=&offset=` | Top notes by metric × range |
+| GET | `/v1/notes/trending?limit=` | Trending notes (composite score) |
+| GET | `/v1/users/new?limit=` | Recently joined users |
+| GET | `/v1/users/trending?limit=` | Trending users (follower gain) |
+| GET | `/v1/users/zappers?direction=&range=&limit=` | Top zappers (sent/received) |
+| GET | `/v1/hashtags/trending?limit=` | Trending hashtags |
+| GET | `/v1/hashtags/{tag}/notes?limit=&offset=` | Notes for a hashtag |
+
+### Analytics
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/v1/analytics/daily?days=30` | Daily analytics (DAU, posts, zaps) |
+| GET | `/v1/analytics/top-posters?range=&limit=` | Top posting authors |
+| GET | `/v1/analytics/most-liked?range=&limit=` | Most liked authors |
+| GET | `/v1/analytics/most-shared?range=&limit=` | Most shared authors |
+| GET | `/v1/clients/leaderboard?limit=` | Top Nostr clients |
+| GET | `/v1/relays/leaderboard?limit=` | Top relays |
+
+### WebSocket
+
+| Path | Description |
+|------|-------------|
+| `/v1/ws/live-metrics` | Live metrics stream — JSON `{"online","sats","notes"}` (not rate-limited) |
+
+## WebSocket Relay (Port 8001)
+
+NIP-50 compatible search relay with extended feed endpoints. All feeds use Nostr REQ/CLOSE/EVENT protocol.
+
+| Path | Description |
+|------|-------------|
+| `/` | NIP-50 full-text search (kinds 0 + 1). Supports `#t` tag filters, NIP-19 entity resolution |
+| `/notes/trending/{metric}/{range}` | Trending notes. metric: `reactions`/`replies`/`reposts`/`zaps`. range: `today`/`7d`/`30d`/`1y`/`all` |
+| `/users/upandcoming` | Emerging users (NIP-51 kind-30000 people list) |
+| `/profiles/followers` | Follower profiles for a pubkey (pass pubkey via `authors` filter in REQ) |
+| `/profiles/{note_type}/{metric}` | Ranked notes for a profile. note_type: `root`/`replies`. metric: `likes`/`reposts`/`zaps`/`replies` |
+| `/hashtags/{variant}` | Hashtag feeds. variant: `trending` (top 100) or `all` (count > 5) |
+
+## Scheduler Relay (Port 8002)
+
+Accepts future-dated events and publishes them at their `created_at` time.
+
+- Requires NIP-42 authentication on connect
+- Events must be 60 seconds to 90 days in the future
+- Max 100 pending events per pubkey
+- Publishes to author's NIP-65 write relays (or top 20 relays)
+- Supports NIP-09 deletion of pending events
+
+## Indexer Relay (Port 8003)
+
+Restricted read-only relay for efficient metadata discovery.
+
+- Only serves kinds 0, 3, 10002
+- `authors` filter required (1–500 hex pubkeys)
+- 30 requests/min per IP
+- Max 500 results per request
+
+## Crawler Modes
+
+The crawler backfills historical events. Controlled by `ENABLE_CRAWLER` and `CRAWL_MODE`.
+
+### Hybrid (default, `CRAWL_MODE=hybrid`)
+
+Combines three strategies:
+
+1. **Negentropy** — Set-reconciliation against relays to efficiently find missing events. Runs every `NEGENTROPY_SYNC_INTERVAL_SECS` (default 300s).
+2. **NIP-65 relay routing** — Fetches each author from their own write relays (`CRAWLER_USE_RELAY_LISTS=true`).
+3. **Legacy time-range** — Fallback per-author fetch with configurable batch size and delay.
+
+### Negentropy-only (`CRAWL_MODE=negentropy_only`)
+
+Simple per-author negentropy sync against pinned relays. Configure via `NEGENTROPY_PINNED_RELAYS`.
+
+### Author Prioritization
+
+Authors are tiered by follower count for crawl scheduling:
+
+| Tier | Followers | Priority |
+|------|-----------|----------|
+| 1 | 1,000+ | Highest |
+| 2 | 100+ | Standard |
+| 3 | 10+ | Lower |
+| 4 | < 10 | Lowest |
+
+Progress tracked in `crawl_state` table with `FOR UPDATE SKIP LOCKED` for concurrency.
+
+## Event Processing
+
+Events are routed by kind on ingestion:
+
+| Kind | Behavior |
+|------|----------|
+| 0 (metadata) | Stored if author passes WoT check or already has events |
+| 1 (note) | WoT-gated. Stores event, inserts refs, increments reply_count on target |
+| 3 (contact list) | Always processed. Upserts social graph only (not stored as event) |
+| 6/16 (repost) | Counter-only. Increments repost_count, event not stored |
+| 7 (reaction) | Counter-only. Increments reaction_count, event not stored |
+| 9735 (zap) | Always stored. Extracts bolt11 amount, increments zap counters |
+| 10002 (relay list) | Always processed. Upsert only |
+
+### Web of Trust (WoT)
+
+A pubkey passes if followed by ≥ `WOT_THRESHOLD` (default 21) pubkeys that themselves have ≥ `MIN_FOLLOWER_THRESHOLD` (default 5) followers. Refreshes every 15 min.
 
 ## Environment Variables
 
+### Core
+
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `DATABASE_URL` | `postgres://dev:dev@localhost:5432/nostr_api` | PostgreSQL connection string |
-| `REDIS_URL` | `redis://127.0.0.1:6379` | Redis connection string |
-| `LISTEN_ADDR` | `0.0.0.0:8000` | API server bind address |
+| `DATABASE_URL` | `postgres://dev:dev@localhost:5432/nostr_api` | PostgreSQL connection |
+| `REDIS_URL` | `redis://127.0.0.1:6379` | Redis connection |
+| `LISTEN_ADDR` | `0.0.0.0:8000` | REST API bind address |
+| `WS_LISTEN_ADDR` | `0.0.0.0:8001` | Search/feed relay bind address |
+| `SCHEDULER_WS_LISTEN_ADDR` | `0.0.0.0:8002` | Scheduler relay bind address |
+| `INDEXER_WS_LISTEN_ADDR` | `0.0.0.0:8003` | Indexer relay bind address |
+| `RUST_LOG` | `nostr_api=info` | Log level |
+| `RATELIMIT_WHITELIST` | — | Comma-separated IPs to bypass rate limiting |
+
+### Relays & Ingestion
+
+| Variable | Default | Description |
+|----------|---------|-------------|
 | `RELAY_URLS` | 5 popular relays | Comma-separated relay WebSocket URLs |
-| `RELAY_INDEXERS` | damus/primal/coracle/nos | Indexer relays queried for kind-10002 relay lists |
-| `ENABLE_RELAY_DISCOVERY` | `true` | Toggle dynamic relay discovery on startup |
+| `RELAY_INDEXERS` | damus/primal/coracle/nos | Relays queried for NIP-65 relay lists |
+| `ENABLE_RELAY_DISCOVERY` | `true` | Dynamic relay discovery on startup |
 | `RELAY_DISCOVERY_TARGET` | `25` | Number of relays to keep from discovery |
-| `ENABLE_SOCIAL_GRAPH_BOOTSTRAP` | `true` | Query follow lists at boot and hydrate the social graph |
 | `INGESTION_SINCE` | current time | Only ingest events after this unix timestamp |
-| `ENABLE_CRAWLER` | `false` | Enable intelligent historical note crawler |
-| `CRAWLER_BATCH_SIZE` | `10` | Number of authors to crawl per batch |
-| `CRAWLER_EVENTS_PER_AUTHOR` | `200` | Max events to fetch per author |
-| `CRAWLER_REQUEST_DELAY_MS` | `500` | Delay between crawler relay requests |
-| `RUST_LOG` | `nostr_api=info` | Log level filter |
+| `ENABLE_SOCIAL_GRAPH_BOOTSTRAP` | `true` | Query follow lists at boot |
 
-### Relay Discovery
+### Crawler
 
-When `ENABLE_RELAY_DISCOVERY` is true, the ingester queries each `RELAY_INDEXERS` endpoint for kind-10002 relay lists (NIP-65), counts how often every relay appears, and keeps the top `RELAY_DISCOVERY_TARGET` entries. Those relays are merged with `RELAY_URLS` to ensure we always fall back to the configured baseline.
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ENABLE_CRAWLER` | `true` | Enable historical backfill |
+| `CRAWL_MODE` | `hybrid` | `hybrid` or `negentropy_only` |
+| `NEGENTROPY_ENABLED` | `true` | Enable negentropy sync in hybrid mode |
+| `NEGENTROPY_SYNC_INTERVAL_SECS` | `300` | Negentropy sync interval |
+| `NEGENTROPY_MAX_RELAYS` | `20` | Max relays per negentropy cycle |
+| `NEGENTROPY_RELAY_URLS` | — | Primary negentropy relays (comma-separated) |
+| `NEGENTROPY_PINNED_RELAYS` | 7 well-known relays | Pinned relays for negentropy_only mode |
+| `CRAWLER_USE_RELAY_LISTS` | `true` | Route crawls via NIP-65 write relays |
+| `CRAWLER_BATCH_SIZE` | `10` | Authors per batch |
+| `CRAWLER_EVENTS_PER_AUTHOR` | `500` | Max events per author |
+| `CRAWLER_REQUEST_DELAY_MS` | `500` | Delay between relay requests |
+| `CRAWLER_POLL_INTERVAL_SECS` | `30` | Polling interval |
+| `CRAWLER_MAX_CONCURRENCY` | `3` | Concurrent crawler tasks |
+| `CRAWLER_MAX_RELAY_POOL_SIZE` | `50` | Max concurrent relay connections |
 
-### Social Graph Bootstrap
+### WoT & Filtering
 
-With `ENABLE_SOCIAL_GRAPH_BOOTSTRAP` enabled, startup runs a best-effort crawl across the discovered relays for kind-3 contact lists, normalizes the `p` tags into `follows` rows, and keeps the graph in sync by replaying newer lists through the same path when new events arrive.
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `WOT_THRESHOLD` | `21` | Min qualified followers to pass WoT |
+| `MIN_FOLLOWER_THRESHOLD` | `5` | Min followers a follower must have |
+| `WOT_REFRESH_SECS` | `900` | WoT cache refresh interval |
 
-### Intelligent Crawler
+### Features
 
-When `ENABLE_CRAWLER` is true, the system backfills historical notes for known authors. Authors are prioritized by follower count into tiers:
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ENABLE_SCHEDULER` | `false` | Enable scheduler relay |
+| `ENABLE_INDEXER` | `true` | Enable indexer relay |
+| `ENABLE_FEEDS` | `true` | Enable hashtag feed generation |
+| `ONDEMAND_FETCH_ENABLED` | `true` | Fetch missing events from relays on API miss |
 
-| Tier | Followers | Recrawl Interval |
-|------|-----------|-----------------|
-| 1 | 1,000+ | More frequent |
-| 2 | 100+ | Standard |
-| 3 | 10+ | Less frequent |
-| 4 | < 10 | Least frequent |
+## Database
 
-The crawler fetches new notes since the last crawl, performs historical backfill, and (for Tier 1-2) fetches engagement data (reactions/reposts/zaps). Progress is tracked in the `crawl_state` table with `FOR UPDATE SKIP LOCKED` for concurrency safety.
+Migrations in `migrations/` run automatically on startup. Key tables:
 
-## Database Schema
-
-Migrations are in `migrations/` and run automatically on startup:
-
-- **events** — one row per Nostr event, deduplicated by event ID. Includes JSONB `tags` column with GIN index and a generated `content_tsv` column for full-text search.
-- **event_tags** — normalized tag extraction for fast lookups (e.g., find all events mentioning a pubkey).
-- **event_refs** — directional links between events by relationship type (reply, reaction, repost, zap, mention, root).
-- **follows / follow_lists** — social graph edges derived from kind-3 contact list events.
-- **crawl_state** — per-author crawler progress tracking.
-- **profile_search** — materialized view with pre-computed profile metadata, follower counts, and engagement scores for fast search.
-
-## Contributing
-
-Contributions are welcome! Please open an issue or submit a pull request.
+- **events** — one row per event. JSONB `tags` with GIN index, generated `content_tsv` for FTS.
+- **event_refs** — directional edges by type (reply/reaction/repost/zap/mention/root)
+- **follows / follow_lists** — social graph from kind-3 events
+- **crawl_state** — per-author crawler progress with priority tiers
+- **relay_lists** — NIP-65 relay URLs per author
+- **zap_metadata** — parsed zap receipts (sender, receiver, amount, timestamp)
+- **scheduled_events** — future-dated events pending publication
+- **daily_analytics** — aggregated daily stats
+- **profile_search** — materialized view for fast profile lookups
 
 ## License
 
