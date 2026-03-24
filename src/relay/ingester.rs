@@ -229,6 +229,14 @@ impl RelayIngester {
                             let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
                             cache.on_event_ingested(&ingested.event.pubkey, ingested.event.kind).await;
 
+                            // For zap receipts, extract the sat amount and record in live metrics
+                            if ingested.event.kind == 9735 {
+                                let zap_sats = Self::extract_zap_amount(&ingested.event);
+                                if zap_sats > 0 {
+                                    cache.record_live_zap(zap_sats).await;
+                                }
+                            }
+
                             // Queue author pubkey for metadata resolution
                             // (skip for counter-only kinds 6/7/16 since we don't store them)
                             if !matches!(ingested.event.kind, 6 | 7 | 16) {
@@ -270,5 +278,80 @@ impl RelayIngester {
                 }
             }
         }
+    }
+
+    /// Extract zap amount in sats from a kind-9735 event.
+    ///
+    /// Mirrors the amount extraction logic in `EventRepository::extract_zap_metadata`:
+    /// 1. Parse the embedded "description" tag (kind-9734 zap request) for an "amount" tag (msats)
+    /// 2. Fall back to parsing the "bolt11" tag if the description amount is missing/zero
+    ///
+    /// Returns sats (msats / 1000), or 0 if the amount cannot be determined.
+    fn extract_zap_amount(event: &NostrEvent) -> i64 {
+        let mut amount_msats: i64 = 0;
+
+        // Try the description tag first (embedded kind-9734 zap request)
+        if let Some(desc_tag) = event.tags.iter().find(|t| t.len() >= 2 && t[0] == "description") {
+            if let Ok(zap_request) = serde_json::from_str::<serde_json::Value>(&desc_tag[1]) {
+                if let Some(tags) = zap_request.get("tags").and_then(|t| t.as_array()) {
+                    for tag in tags {
+                        let Some(arr) = tag.as_array() else { continue };
+                        if arr.len() >= 2 && arr[0].as_str() == Some("amount") {
+                            if let Some(raw) = arr[1].as_str() {
+                                if let Ok(parsed) = raw.parse::<i64>() {
+                                    amount_msats = parsed;
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Fall back to bolt11 tag
+        if amount_msats == 0 {
+            if let Some(bolt11_tag) = event.tags.iter().find(|t| t.len() >= 2 && t[0] == "bolt11") {
+                if let Some(bolt11) = bolt11_tag.get(1) {
+                    amount_msats = Self::parse_bolt11_amount_msats(bolt11);
+                }
+            }
+        }
+
+        amount_msats / 1000 // convert msats to sats
+    }
+
+    /// Parse bolt11 invoice amount to millisatoshis.
+    fn parse_bolt11_amount_msats(bolt11: &str) -> i64 {
+        use regex::Regex;
+
+        let Ok(re) = Regex::new(r"lnbc(\d+)([munp])1") else {
+            return 0;
+        };
+        let Some(captures) = re.captures(bolt11) else {
+            return 0;
+        };
+
+        let Some(amount_str) = captures.get(1).map(|m| m.as_str()) else {
+            return 0;
+        };
+        let Ok(amount) = amount_str.parse::<u64>() else {
+            return 0;
+        };
+
+        let Some(multiplier) = captures.get(2).map(|m| m.as_str()) else {
+            return 0;
+        };
+
+        let btc_amount = match multiplier {
+            "m" => amount as f64 * 1e-3,  // milli
+            "u" => amount as f64 * 1e-6,  // micro
+            "n" => amount as f64 * 1e-9,  // nano
+            "p" => amount as f64 * 1e-12, // pico
+            _ => return 0,
+        };
+
+        // Convert BTC to msats (1 BTC = 100_000_000_000 msats)
+        (btc_amount * 100_000_000_000.0) as i64
     }
 }

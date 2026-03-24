@@ -6,6 +6,7 @@ mod db;
 mod error;
 mod follower_cache;
 mod indexer;
+mod live_metrics;
 mod nip19;
 mod ratelimit;
 mod relay;
@@ -160,7 +161,10 @@ async fn main() {
         .expect("failed to connect to redis");
     tracing::info!("redis connected");
 
-    let stats_cache = cache::StatsCache::new(redis_client, repo.clone());
+    let live_tracker = Arc::new(live_metrics::LiveMetricsTracker::new(redis_client.clone()));
+
+    let mut stats_cache = cache::StatsCache::new(redis_client, repo.clone());
+    stats_cache.set_live_tracker(live_tracker.clone());
 
     // Shutdown signal
     let (shutdown_tx, _) = broadcast::channel::<()>(1);
@@ -581,6 +585,7 @@ async fn main() {
         crawl_queue,
         fetcher,
         profile_search_cache,
+        live_tracker: Some(live_tracker),
     };
 
     // WebSocket relay (NIP-50 search endpoint)
