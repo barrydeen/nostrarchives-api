@@ -8,6 +8,8 @@ pub enum AppError {
     Redis(redis::RedisError),
     BadRequest(String),
     NotFound(String),
+    Unauthorized(String),
+    Forbidden(String),
     Internal(String),
 }
 
@@ -18,6 +20,8 @@ impl fmt::Display for AppError {
             AppError::Redis(e) => write!(f, "redis error: {e}"),
             AppError::BadRequest(msg) => write!(f, "bad request: {msg}"),
             AppError::NotFound(msg) => write!(f, "not found: {msg}"),
+            AppError::Unauthorized(msg) => write!(f, "unauthorized: {msg}"),
+            AppError::Forbidden(msg) => write!(f, "forbidden: {msg}"),
             AppError::Internal(msg) => write!(f, "internal error: {msg}"),
         }
     }
@@ -28,7 +32,9 @@ impl std::error::Error for AppError {}
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         match &self {
-            AppError::NotFound(_) => tracing::debug!("{self}"),
+            AppError::NotFound(_) | AppError::Unauthorized(_) | AppError::Forbidden(_) => {
+                tracing::debug!("{self}")
+            }
             _ => tracing::error!("{self}"),
         }
         let (status, message) = match &self {
@@ -36,6 +42,8 @@ impl IntoResponse for AppError {
             AppError::Redis(_) => (StatusCode::INTERNAL_SERVER_ERROR, "cache error"),
             AppError::BadRequest(_) => (StatusCode::BAD_REQUEST, "bad request"),
             AppError::NotFound(_) => (StatusCode::NOT_FOUND, "not found"),
+            AppError::Unauthorized(_) => (StatusCode::UNAUTHORIZED, "unauthorized"),
+            AppError::Forbidden(_) => (StatusCode::FORBIDDEN, "forbidden"),
             AppError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal error"),
         };
         (status, message).into_response()

@@ -1152,6 +1152,7 @@ name = "nostr-api"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64",
  "bech32",
  "chrono",
  "dotenvy",

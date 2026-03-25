@@ -1,4 +1,6 @@
 mod api;
+mod auth;
+mod block_cache;
 mod cache;
 mod config;
 mod crawler;
@@ -110,7 +112,13 @@ async fn main() {
         tracing::warn!(error = %e, "Failed to initialize WoT cache, continuing anyway");
     }
 
-    let repo = db::repository::EventRepository::new(pool.clone(), follower_cache, wot_cache);
+    // Block cache: in-memory moderation lists
+    let block_cache = block_cache::BlockCache::new(pool.clone());
+    if let Err(e) = block_cache.initialize().await {
+        tracing::warn!(error = %e, "Failed to initialize block cache, continuing anyway");
+    }
+
+    let repo = db::repository::EventRepository::new(pool.clone(), follower_cache, wot_cache, block_cache.clone());
 
     // Backfill zero-amount zaps with bolt11 parsing (one-time startup task)
     match repo.backfill_zero_amount_zaps().await {
@@ -586,6 +594,8 @@ async fn main() {
         fetcher,
         profile_search_cache,
         live_tracker: Some(live_tracker),
+        block_cache,
+        admin_pubkey: cfg.admin_pubkey.clone(),
     };
 
     // WebSocket relay (NIP-50 search endpoint)

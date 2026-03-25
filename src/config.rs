@@ -44,6 +44,8 @@ pub struct Config {
     pub crawl_mode: String,
     /// Pinned relays for negentropy_only mode (tested at boot for negentropy+author support).
     pub negentropy_pinned_relays: Vec<String>,
+    /// 64-char hex pubkey of the admin user (enables admin endpoints when set).
+    pub admin_pubkey: Option<String>,
     /// Enable hashtag feeds background refresh + WS endpoints.
     pub feeds_enabled: bool,
     /// 32-byte hex secret key for signing kind-30015 feed events.
@@ -251,6 +253,10 @@ impl Config {
             .filter(|s| !s.is_empty())
             .collect();
 
+        let admin_pubkey = env::var("ADMIN_PUBKEY")
+            .ok()
+            .filter(|s| s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit()));
+
         let feeds_enabled = env::var("ENABLE_FEEDS")
             .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
             .unwrap_or(true);
@@ -313,6 +319,7 @@ impl Config {
             indexer_ws_listen_addr,
             crawl_mode,
             negentropy_pinned_relays,
+            admin_pubkey,
             feeds_enabled,
             feeds_signing_secret,
         }

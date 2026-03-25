@@ -312,4 +312,33 @@ impl StatsCache {
             ingestion_rate_per_min: 0.0,
         })
     }
+
+    /// Delete all Redis keys matching a prefix pattern.
+    /// Used to invalidate cached data after admin moderation actions.
+    pub async fn invalidate_pattern(&self, pattern: &str) {
+        let Ok(mut conn) = self.redis.get_multiplexed_async_connection().await else {
+            return;
+        };
+        let full_pattern = key(&format!("{pattern}*"));
+        let keys: Vec<String> = match redis::cmd("KEYS")
+            .arg(&full_pattern)
+            .query_async(&mut conn)
+            .await
+        {
+            Ok(k) => k,
+            Err(e) => {
+                tracing::warn!(error = %e, pattern, "Failed to scan keys for invalidation");
+                return;
+            }
+        };
+        if keys.is_empty() {
+            return;
+        }
+        let count = keys.len();
+        let _: Result<(), _> = redis::cmd("DEL")
+            .arg(&keys)
+            .query_async(&mut conn)
+            .await;
+        tracing::info!(pattern, count, "Invalidated cached keys");
+    }
 }
