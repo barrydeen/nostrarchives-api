@@ -164,7 +164,7 @@ impl BlockCache {
                 .await?;
 
             // Delete from search_index
-            sqlx::query("DELETE FROM search_index WHERE id = ANY($1)")
+            sqlx::query("DELETE FROM search_index WHERE event_id = ANY($1)")
                 .bind(&ids)
                 .execute(&mut *tx)
                 .await?;
