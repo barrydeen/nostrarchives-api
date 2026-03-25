@@ -1614,7 +1614,11 @@ pub async fn admin_block_pubkey(
     // Delete all their data
     let events_deleted = state.block_cache.delete_pubkey_data(&pubkey).await?;
 
-    // Invalidate trending caches
+    // Invalidate caches for this pubkey and trending data
+    state.cache.invalidate_pattern(&format!("profile:notes:{pubkey}")).await;
+    state.cache.invalidate_pattern(&format!("profile:replies:{pubkey}")).await;
+    state.cache.invalidate_pattern(&format!("profile:zap_stats:{pubkey}")).await;
+    state.cache.invalidate_pattern(&format!("profiles:metadata:{pubkey}")).await;
     state.cache.invalidate_pattern("home:trending").await;
 
     Ok(Json(json!({
