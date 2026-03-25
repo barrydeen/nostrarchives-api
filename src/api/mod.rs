@@ -8,6 +8,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use tower_http::cors::CorsLayer;
 
+use crate::auth::ReplayGuard;
+use crate::block_cache::BlockCache;
 use crate::cache::StatsCache;
 use crate::crawler::queue::CrawlQueue;
 use crate::db::repository::EventRepository;
@@ -25,6 +27,9 @@ pub struct AppState {
     pub fetcher: Arc<RelayFetcher>,
     pub profile_search_cache: ProfileSearchCache,
     pub live_tracker: Option<Arc<LiveMetricsTracker>>,
+    pub block_cache: BlockCache,
+    pub admin_pubkey: Option<String>,
+    pub replay_guard: ReplayGuard,
 }
 
 async fn cache_control_middleware(
@@ -124,11 +129,37 @@ pub fn router(state: AppState) -> Router {
     let ws_routes = Router::new()
         .route("/v1/ws/live-metrics", get(ws_live_metrics));
 
+    // Admin routes — auth enforced per-handler via AdminAuth extractor
+    // Stricter rate limit: 10 req/min per IP to prevent brute-force sig verification DoS
+    let admin_limiter = RateLimiter::new(10, Duration::from_secs(60));
+    let admin_routes = Router::new()
+        .route("/v1/admin/check-auth", get(handlers::admin_check_auth))
+        .route(
+            "/v1/admin/block-pubkey",
+            post(handlers::admin_block_pubkey).delete(handlers::admin_unblock_pubkey),
+        )
+        .route("/v1/admin/blocked-pubkeys", get(handlers::admin_list_blocked_pubkeys))
+        .route(
+            "/v1/admin/block-hashtag",
+            post(handlers::admin_block_hashtag).delete(handlers::admin_unblock_hashtag),
+        )
+        .route("/v1/admin/blocked-hashtags", get(handlers::admin_list_blocked_hashtags))
+        .route(
+            "/v1/admin/block-search-term",
+            post(handlers::admin_block_search_term).delete(handlers::admin_unblock_search_term),
+        )
+        .route("/v1/admin/blocked-search-terms", get(handlers::admin_list_blocked_search_terms))
+        .route_layer(middleware::from_fn_with_state(
+            admin_limiter,
+            rate_limit_middleware,
+        ));
+
     // Health check is NOT rate-limited (monitoring/uptime checks)
     Router::new()
         .route("/health", get(handlers::health))
         .merge(ws_routes)
         .merge(api_routes)
+        .merge(admin_routes)
         .layer(CorsLayer::permissive())
         .with_state(state)
 }

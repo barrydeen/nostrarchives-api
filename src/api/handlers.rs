@@ -12,6 +12,7 @@ use sha2::{Sha256, Digest};
 use tracing::warn;
 
 use super::AppState;
+use crate::auth::AdminAuth;
 use crate::db::models::{EventQuery, NoteSearchResult, ProfileSearchResult};
 use crate::error::AppError;
 use crate::nip19;
@@ -818,6 +819,16 @@ pub async fn search(
         ));
     }
 
+    // Check if this search term is blocked
+    if state.block_cache.is_search_term_blocked(&query).await {
+        return Ok(Json(SearchResponse {
+            query,
+            resolved: None,
+            profiles: Some(vec![]),
+            notes: Some(vec![]),
+        }));
+    }
+
     let limit = q.limit.unwrap_or(20).clamp(1, 100);
     let offset = q.offset.unwrap_or(0).max(0);
 
@@ -887,6 +898,15 @@ pub async fn search_suggest(
         return Err(AppError::BadRequest(
             "query must be at least 2 characters".into(),
         ));
+    }
+
+    // Check if this search term is blocked
+    if state.block_cache.is_search_term_blocked(&query).await {
+        return Ok(Json(SuggestResponse {
+            query,
+            resolved: None,
+            suggestions: vec![],
+        }));
     }
 
     let limit = q.limit.unwrap_or(5).clamp(1, 10);
@@ -990,6 +1010,17 @@ pub async fn advanced_note_search(
     State(state): State<AppState>,
     Query(q): Query<AdvancedNoteSearchQuery>,
 ) -> Result<Json<Value>, AppError> {
+    // Check if the search query is blocked
+    if let Some(ref query) = q.q {
+        if state.block_cache.is_search_term_blocked(query).await {
+            return Ok(Json(serde_json::json!({
+                "notes": [],
+                "total": 0,
+                "profiles": {}
+            })));
+        }
+    }
+
     let limit = q.limit.unwrap_or(20).clamp(1, 100);
     let offset = q.offset.unwrap_or(0).max(0);
 
@@ -1386,6 +1417,15 @@ pub async fn get_hashtag_notes(
         return Err(AppError::BadRequest("invalid hashtag".into()));
     }
 
+    // Check if this hashtag is a blocked search term
+    if state.block_cache.is_search_term_blocked(&tag).await {
+        return Ok(Json(serde_json::json!({
+            "hashtag": tag,
+            "notes": [],
+            "profiles": {}
+        })));
+    }
+
     let limit = clamp_listing_limit(q.limit);
     let offset = clamp_offset(q.offset);
 
@@ -1539,4 +1579,175 @@ fn decode_npub(npub: &str) -> Result<String, AppError> {
     }
 
     Ok(hex::encode(bytes))
+}
+
+// ── Admin endpoints ──
+
+/// Verify admin authentication: `GET /v1/admin/check-auth`
+pub async fn admin_check_auth(_auth: AdminAuth) -> Json<Value> {
+    Json(json!({ "admin": true }))
+}
+
+#[derive(Deserialize)]
+pub struct BlockPubkeyRequest {
+    pub pubkey: String,
+    pub reason: Option<String>,
+}
+
+/// Block a pubkey and delete all their data: `POST /v1/admin/block-pubkey`
+pub async fn admin_block_pubkey(
+    _auth: AdminAuth,
+    State(state): State<AppState>,
+    Json(body): Json<BlockPubkeyRequest>,
+) -> Result<Json<Value>, AppError> {
+    let pubkey = body.pubkey.trim().to_lowercase();
+    if pubkey.len() != 64 || !pubkey.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(AppError::BadRequest("invalid pubkey (expected 64-char hex)".into()));
+    }
+
+    // Block the pubkey
+    state
+        .block_cache
+        .block_pubkey(&pubkey, body.reason.as_deref(), &_auth.pubkey)
+        .await?;
+
+    // Delete all their data
+    let events_deleted = state.block_cache.delete_pubkey_data(&pubkey).await?;
+
+    // Invalidate trending caches
+    state.cache.invalidate_pattern("home:trending").await;
+
+    Ok(Json(json!({
+        "blocked": true,
+        "pubkey": pubkey,
+        "events_deleted": events_deleted,
+    })))
+}
+
+#[derive(Deserialize)]
+pub struct UnblockPubkeyRequest {
+    pub pubkey: String,
+}
+
+/// Unblock a pubkey: `DELETE /v1/admin/block-pubkey`
+pub async fn admin_unblock_pubkey(
+    _auth: AdminAuth,
+    State(state): State<AppState>,
+    Json(body): Json<UnblockPubkeyRequest>,
+) -> Result<Json<Value>, AppError> {
+    let found = state.block_cache.unblock_pubkey(&body.pubkey).await?;
+    Ok(Json(json!({ "unblocked": found })))
+}
+
+/// List all blocked pubkeys: `GET /v1/admin/blocked-pubkeys`
+pub async fn admin_list_blocked_pubkeys(
+    _auth: AdminAuth,
+    State(state): State<AppState>,
+) -> Result<Json<Value>, AppError> {
+    let list = state.block_cache.list_blocked_pubkeys().await?;
+    Ok(Json(json!({ "blocked_pubkeys": list })))
+}
+
+#[derive(Deserialize)]
+pub struct BlockHashtagRequest {
+    pub hashtag: String,
+    pub reason: Option<String>,
+}
+
+/// Block a hashtag from trending: `POST /v1/admin/block-hashtag`
+pub async fn admin_block_hashtag(
+    _auth: AdminAuth,
+    State(state): State<AppState>,
+    Json(body): Json<BlockHashtagRequest>,
+) -> Result<Json<Value>, AppError> {
+    let hashtag = body.hashtag.trim().to_lowercase();
+    if hashtag.is_empty() {
+        return Err(AppError::BadRequest("hashtag cannot be empty".into()));
+    }
+
+    state
+        .block_cache
+        .block_hashtag(&hashtag, body.reason.as_deref(), &_auth.pubkey)
+        .await?;
+
+    // Invalidate trending hashtags cache
+    state.cache.invalidate_pattern("home:trending_hashtags").await;
+
+    Ok(Json(json!({ "blocked": true, "hashtag": hashtag })))
+}
+
+#[derive(Deserialize)]
+pub struct UnblockHashtagRequest {
+    pub hashtag: String,
+}
+
+/// Unblock a hashtag: `DELETE /v1/admin/block-hashtag`
+pub async fn admin_unblock_hashtag(
+    _auth: AdminAuth,
+    State(state): State<AppState>,
+    Json(body): Json<UnblockHashtagRequest>,
+) -> Result<Json<Value>, AppError> {
+    let found = state.block_cache.unblock_hashtag(&body.hashtag).await?;
+
+    state.cache.invalidate_pattern("home:trending_hashtags").await;
+
+    Ok(Json(json!({ "unblocked": found })))
+}
+
+/// List all blocked hashtags: `GET /v1/admin/blocked-hashtags`
+pub async fn admin_list_blocked_hashtags(
+    _auth: AdminAuth,
+    State(state): State<AppState>,
+) -> Result<Json<Value>, AppError> {
+    let list = state.block_cache.list_blocked_hashtags().await?;
+    Ok(Json(json!({ "blocked_hashtags": list })))
+}
+
+#[derive(Deserialize)]
+pub struct BlockSearchTermRequest {
+    pub term: String,
+    pub reason: Option<String>,
+}
+
+/// Block a search term: `POST /v1/admin/block-search-term`
+pub async fn admin_block_search_term(
+    _auth: AdminAuth,
+    State(state): State<AppState>,
+    Json(body): Json<BlockSearchTermRequest>,
+) -> Result<Json<Value>, AppError> {
+    let term = body.term.trim().to_lowercase();
+    if term.is_empty() {
+        return Err(AppError::BadRequest("term cannot be empty".into()));
+    }
+
+    state
+        .block_cache
+        .block_search_term(&term, body.reason.as_deref(), &_auth.pubkey)
+        .await?;
+
+    Ok(Json(json!({ "blocked": true, "term": term })))
+}
+
+#[derive(Deserialize)]
+pub struct UnblockSearchTermRequest {
+    pub term: String,
+}
+
+/// Unblock a search term: `DELETE /v1/admin/block-search-term`
+pub async fn admin_unblock_search_term(
+    _auth: AdminAuth,
+    State(state): State<AppState>,
+    Json(body): Json<UnblockSearchTermRequest>,
+) -> Result<Json<Value>, AppError> {
+    let found = state.block_cache.unblock_search_term(&body.term).await?;
+    Ok(Json(json!({ "unblocked": found })))
+}
+
+/// List all blocked search terms: `GET /v1/admin/blocked-search-terms`
+pub async fn admin_list_blocked_search_terms(
+    _auth: AdminAuth,
+    State(state): State<AppState>,
+) -> Result<Json<Value>, AppError> {
+    let list = state.block_cache.list_blocked_search_terms().await?;
+    Ok(Json(json!({ "blocked_search_terms": list })))
 }

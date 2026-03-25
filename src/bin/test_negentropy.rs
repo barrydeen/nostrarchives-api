@@ -220,7 +220,9 @@ async fn cmd_sync(pool: &sqlx::PgPool, relay_url: &str, dry_run: bool) {
     // Create a dummy follower cache for testing
     let follower_cache = nostr_api::follower_cache::FollowerCache::new(pool.clone(), 5, 3600);
     let wot_cache = nostr_api::wot_cache::WotCache::new(pool.clone(), 21, 900);
-    let repo = nostr_api::db::repository::EventRepository::new(pool.clone(), follower_cache, wot_cache);
+    let block_cache = nostr_api::block_cache::BlockCache::new(pool.clone());
+    block_cache.initialize().await.expect("failed to initialize block cache");
+    let repo = nostr_api::db::repository::EventRepository::new(pool.clone(), follower_cache, wot_cache, block_cache);
     let cache = nostr_api::cache::StatsCache::new(redis_client, repo.clone());
     let syncer = NegentropySyncer::new(repo, cache, pool.clone());
 
@@ -300,7 +302,9 @@ async fn cmd_windowed_sync(
     // Create a dummy follower cache for testing
     let follower_cache = nostr_api::follower_cache::FollowerCache::new(pool.clone(), 5, 3600);
     let wot_cache = nostr_api::wot_cache::WotCache::new(pool.clone(), 21, 900);
-    let repo = nostr_api::db::repository::EventRepository::new(pool.clone(), follower_cache, wot_cache);
+    let block_cache = nostr_api::block_cache::BlockCache::new(pool.clone());
+    block_cache.initialize().await.expect("failed to initialize block cache");
+    let repo = nostr_api::db::repository::EventRepository::new(pool.clone(), follower_cache, wot_cache, block_cache);
     let cache = nostr_api::cache::StatsCache::new(redis_client, repo.clone());
     let syncer = NegentropySyncer::new(repo, cache, pool.clone());
 

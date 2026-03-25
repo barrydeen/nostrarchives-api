@@ -7,6 +7,7 @@ use super::models::{
     NewUser, NostrEvent, StoredEvent,
     TrendingNote, TrendingUser,
 };
+use crate::block_cache::BlockCache;
 use crate::error::AppError;
 use crate::follower_cache::FollowerCache;
 use crate::wot_cache::WotCache;
@@ -16,6 +17,7 @@ pub struct EventRepository {
     pool: PgPool,
     pub follower_cache: FollowerCache,
     pub wot_cache: WotCache,
+    pub block_cache: BlockCache,
 }
 
 #[derive(Debug, Clone)]
@@ -57,8 +59,8 @@ fn range_cache_ttl(range: &str) -> u64 {
 }
 
 impl EventRepository {
-    pub fn new(pool: PgPool, follower_cache: FollowerCache, wot_cache: WotCache) -> Self {
-        Self { pool, follower_cache, wot_cache }
+    pub fn new(pool: PgPool, follower_cache: FollowerCache, wot_cache: WotCache, block_cache: BlockCache) -> Self {
+        Self { pool, follower_cache, wot_cache, block_cache }
     }
 
     /// Return a clone of the underlying connection pool.
@@ -81,6 +83,11 @@ impl EventRepository {
         event: &NostrEvent,
         relay_url: &str,
     ) -> Result<bool, AppError> {
+        // Reject events from blocked pubkeys
+        if self.block_cache.is_pubkey_blocked(&event.pubkey).await {
+            return Ok(false);
+        }
+
         match event.kind {
             // Kind 6/7/16: counter-only, never stored as full events
             6 | 16 => {
@@ -2633,6 +2640,9 @@ impl EventRepository {
     ) -> Result<Vec<super::models::TrendingHashtag>, AppError> {
         let since = chrono::Utc::now().timestamp() - 86400;
 
+        // Overfetch to compensate for blocked hashtags being filtered out
+        let fetch_limit = limit + 50;
+
         let rows = sqlx::query_as::<_, (String, i64)>(
             r#"
             SELECT nh.hashtag,
@@ -2642,17 +2652,21 @@ impl EventRepository {
             GROUP BY nh.hashtag
             HAVING COUNT(DISTINCT nh.event_id) >= 3
             ORDER BY cnt DESC
-            LIMIT $2 OFFSET $3
+            LIMIT $2
             "#,
         )
         .bind(since)
-        .bind(limit)
-        .bind(offset)
+        .bind(fetch_limit)
         .fetch_all(&self.pool)
         .await?;
 
+        let blocked: HashSet<String> = self.block_cache.blocked_hashtags_snapshot().await;
+
         Ok(rows
             .into_iter()
+            .filter(|(hashtag, _)| !blocked.contains(&hashtag.to_lowercase()))
+            .skip(offset as usize)
+            .take(limit as usize)
             .map(|(hashtag, count)| super::models::TrendingHashtag { hashtag, count })
             .collect())
     }

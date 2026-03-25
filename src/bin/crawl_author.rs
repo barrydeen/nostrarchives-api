@@ -301,10 +301,13 @@ async fn cmd_crawl(pool: &sqlx::PgPool, pubkey: &str, extra_relays: Vec<String>)
     let redis_client = redis::Client::open(redis_url.as_str()).expect("invalid redis url");
     let follower_cache = nostr_api::follower_cache::FollowerCache::new(pool.clone(), 5, 3600);
     let wot_cache = nostr_api::wot_cache::WotCache::new(pool.clone(), 21, 900);
+    let block_cache = nostr_api::block_cache::BlockCache::new(pool.clone());
+    block_cache.initialize().await.expect("failed to initialize block cache");
     let repo = nostr_api::db::repository::EventRepository::new(
         pool.clone(),
         follower_cache,
         wot_cache,
+        block_cache,
     );
     let cache = nostr_api::cache::StatsCache::new(redis_client, repo.clone());
     let syncer =
@@ -416,10 +419,13 @@ async fn cmd_engagement(pool: &sqlx::PgPool, pubkey: &str, extra_relays: Vec<Str
     let redis_client = redis::Client::open(redis_url.as_str()).expect("invalid redis url");
     let follower_cache = nostr_api::follower_cache::FollowerCache::new(pool.clone(), 5, 3600);
     let wot_cache = nostr_api::wot_cache::WotCache::new(pool.clone(), 21, 900);
+    let block_cache = nostr_api::block_cache::BlockCache::new(pool.clone());
+    block_cache.initialize().await.expect("failed to initialize block cache");
     let repo = nostr_api::db::repository::EventRepository::new(
         pool.clone(),
         follower_cache,
         wot_cache,
+        block_cache,
     );
     let cache = nostr_api::cache::StatsCache::new(redis_client, repo.clone());
 
