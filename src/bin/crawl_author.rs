@@ -302,6 +302,7 @@ async fn cmd_crawl(pool: &sqlx::PgPool, pubkey: &str, extra_relays: Vec<String>)
     let follower_cache = nostr_api::follower_cache::FollowerCache::new(pool.clone(), 5, 3600);
     let wot_cache = nostr_api::wot_cache::WotCache::new(pool.clone(), 21, 900);
     let block_cache = nostr_api::block_cache::BlockCache::new(pool.clone());
+    block_cache.initialize().await.expect("failed to initialize block cache");
     let repo = nostr_api::db::repository::EventRepository::new(
         pool.clone(),
         follower_cache,
@@ -419,6 +420,7 @@ async fn cmd_engagement(pool: &sqlx::PgPool, pubkey: &str, extra_relays: Vec<Str
     let follower_cache = nostr_api::follower_cache::FollowerCache::new(pool.clone(), 5, 3600);
     let wot_cache = nostr_api::wot_cache::WotCache::new(pool.clone(), 21, 900);
     let block_cache = nostr_api::block_cache::BlockCache::new(pool.clone());
+    block_cache.initialize().await.expect("failed to initialize block cache");
     let repo = nostr_api::db::repository::EventRepository::new(
         pool.clone(),
         follower_cache,

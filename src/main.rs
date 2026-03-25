@@ -596,6 +596,7 @@ async fn main() {
         live_tracker: Some(live_tracker),
         block_cache,
         admin_pubkey: cfg.admin_pubkey.clone(),
+        replay_guard: auth::ReplayGuard::new(),
     };
 
     // WebSocket relay (NIP-50 search endpoint)

@@ -3,10 +3,46 @@ use axum::http::request::Parts;
 use base64::Engine;
 use secp256k1::{Message, XOnlyPublicKey, SECP256K1};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::str::FromStr;
+use std::sync::Arc;
+use std::time::Instant;
+use tokio::sync::Mutex;
 
 use crate::api::AppState;
 use crate::error::AppError;
+
+/// Tracks seen NIP-98 event IDs to prevent replay attacks within the validity window.
+#[derive(Clone)]
+pub struct ReplayGuard {
+    seen: Arc<Mutex<HashMap<String, Instant>>>,
+}
+
+impl ReplayGuard {
+    pub fn new() -> Self {
+        Self {
+            seen: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Returns true if this event ID has NOT been seen before (i.e., it's fresh).
+    /// Evicts entries older than 90 seconds (generous buffer over the 60s window).
+    async fn check_and_record(&self, event_id: &str) -> bool {
+        let mut seen = self.seen.lock().await;
+        let now = Instant::now();
+
+        // Evict stale entries
+        seen.retain(|_, ts| now.duration_since(*ts) < std::time::Duration::from_secs(90));
+
+        // Check for replay
+        if seen.contains_key(event_id) {
+            return false;
+        }
+
+        seen.insert(event_id.to_string(), now);
+        true
+    }
+}
 
 /// NIP-98 kind-27235 event for HTTP authentication.
 #[derive(Debug, serde::Deserialize)]
@@ -36,6 +72,7 @@ impl FromRequestParts<AppState> for AdminAuth {
         state: &AppState,
     ) -> impl std::future::Future<Output = Result<Self, Self::Rejection>> + Send {
         let admin_pubkey = state.admin_pubkey.clone();
+        let replay_guard = state.replay_guard.clone();
         let auth_header = parts
             .headers
             .get("authorization")
@@ -43,7 +80,11 @@ impl FromRequestParts<AppState> for AdminAuth {
             .map(|s| s.to_string());
 
         // Reconstruct the request URL from parts
-        let scheme = "https";
+        let scheme = parts
+            .headers
+            .get("x-forwarded-proto")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("https");
         let host = parts
             .headers
             .get("host")
@@ -111,6 +152,11 @@ impl FromRequestParts<AppState> for AdminAuth {
 
             // Verify signature
             verify_event_signature(&event)?;
+
+            // Replay protection: reject already-seen event IDs
+            if !replay_guard.check_and_record(&event.id).await {
+                return Err(AppError::Unauthorized("replayed auth event".into()));
+            }
 
             // Check admin pubkey
             if event.pubkey != admin_pubkey {
