@@ -166,6 +166,22 @@ async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
             "035_simplify_profile_search",
             include_str!("../../migrations/035_simplify_profile_search.sql"),
         ),
+        (
+            "036_follows_source_event_id_index",
+            include_str!("../../migrations/036_follows_source_event_id_index.sql"),
+        ),
+        (
+            "037_blocked_pubkeys",
+            include_str!("../../migrations/037_blocked_pubkeys.sql"),
+        ),
+        (
+            "038_blocked_hashtags",
+            include_str!("../../migrations/038_blocked_hashtags.sql"),
+        ),
+        (
+            "039_blocked_search_terms",
+            include_str!("../../migrations/039_blocked_search_terms.sql"),
+        ),
     ];
 
     for (name, sql) in migrations {
