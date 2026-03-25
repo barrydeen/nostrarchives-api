@@ -193,12 +193,6 @@ impl BlockCache {
             .execute(&mut *tx)
             .await?;
 
-        // Delete relay lists
-        sqlx::query("DELETE FROM relay_lists WHERE pubkey = $1")
-            .bind(pubkey)
-            .execute(&mut *tx)
-            .await?;
-
         tx.commit().await?;
 
         tracing::info!(pubkey, events_deleted = event_count, "Pubkey data purged");
