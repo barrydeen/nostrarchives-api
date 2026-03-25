@@ -162,7 +162,7 @@ impl CrawlQueue {
                 SELECT pubkey
                 FROM crawl_state
                 WHERE next_crawl_at <= NOW()
-                ORDER BY priority_tier ASC, follower_count DESC, next_crawl_at ASC
+                ORDER BY priority_tier DESC, follower_count ASC, next_crawl_at ASC
                 LIMIT $1
                 FOR UPDATE SKIP LOCKED
             )
