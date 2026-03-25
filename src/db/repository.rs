@@ -170,22 +170,9 @@ impl EventRepository {
         Ok(inserted)
     }
 
-    /// Check if a pubkey passes quality filtering.
-    ///
-    /// Uses a layered approach:
-    /// 1. If WoT cache is populated (steady state): use two-level WoT check
-    /// 2. If WoT cache is empty/bootstrapping: fall back to follower cache (v1 behavior)
-    ///
-    /// This prevents the cold-start problem where an empty WoT cache rejects
-    /// every kind-1 note on a fresh database.
+    /// Check if a pubkey passes quality filtering via two-level WoT check.
     async fn passes_quality_check(&self, pubkey: &str) -> Result<bool, AppError> {
-        // Try WoT first (strict, two-level check)
-        if self.wot_cache.passes_wot(pubkey).await? {
-            return Ok(true);
-        }
-
-        // Fall back to follower cache (permissive, allows unknown pubkeys)
-        self.follower_cache.meets_threshold(pubkey).await
+        self.wot_cache.passes_wot(pubkey).await
     }
 
     /// Process a repost (kind 6/16) as a counter increment only.
