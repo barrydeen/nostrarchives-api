@@ -151,7 +151,7 @@ impl BlockCache {
         if !ids.is_empty() {
             // Delete event_refs where this pubkey's events are source or target
             sqlx::query(
-                "DELETE FROM event_refs WHERE source_id = ANY($1) OR target_id = ANY($1)",
+                "DELETE FROM event_refs WHERE source_event_id = ANY($1) OR target_event_id = ANY($1)",
             )
             .bind(&ids)
             .execute(&mut *tx)
