@@ -2378,16 +2378,24 @@ impl EventRepository {
         if authors.is_empty() {
             let rows = sqlx::query_as::<_, StoredEvent>(
                 r#"
-                WITH ranked AS (
+                WITH candidates AS (
                     SELECT
                         s.event_id,
                         s.created_at,
-                        s.reaction_count, s.reply_count, s.repost_count, s.zap_count,
-                        ts_rank(s.content_tsv, query) AS text_rank
-                    FROM search_index s, plainto_tsquery('english', $1) query
-                    WHERE s.content_tsv @@ query
-                    ORDER BY ts_rank(s.content_tsv, query) DESC
-                    LIMIT 200
+                        s.content_tsv,
+                        s.reaction_count, s.reply_count, s.repost_count, s.zap_count
+                    FROM search_index s
+                    WHERE s.content_tsv @@ plainto_tsquery('english', $1)
+                    ORDER BY s.created_at DESC
+                    LIMIT 500
+                ),
+                ranked AS (
+                    SELECT
+                        c.event_id,
+                        c.created_at,
+                        c.reaction_count, c.reply_count, c.repost_count, c.zap_count,
+                        ts_rank(c.content_tsv, plainto_tsquery('english', $1)) AS text_rank
+                    FROM candidates c
                 )
                 SELECT
                     e.id, e.pubkey, e.created_at, e.kind, e.content, e.sig,
@@ -2420,17 +2428,25 @@ impl EventRepository {
         } else {
             let rows = sqlx::query_as::<_, StoredEvent>(
                 r#"
-                WITH ranked AS (
+                WITH candidates AS (
                     SELECT
                         s.event_id,
                         s.created_at,
-                        s.reaction_count, s.reply_count, s.repost_count, s.zap_count,
-                        ts_rank(s.content_tsv, query) AS text_rank
-                    FROM search_index s, plainto_tsquery('english', $1) query
-                    WHERE s.content_tsv @@ query
+                        s.content_tsv,
+                        s.reaction_count, s.reply_count, s.repost_count, s.zap_count
+                    FROM search_index s
+                    WHERE s.content_tsv @@ plainto_tsquery('english', $1)
                       AND s.pubkey = ANY($3)
-                    ORDER BY ts_rank(s.content_tsv, query) DESC
-                    LIMIT 200
+                    ORDER BY s.created_at DESC
+                    LIMIT 500
+                ),
+                ranked AS (
+                    SELECT
+                        c.event_id,
+                        c.created_at,
+                        c.reaction_count, c.reply_count, c.repost_count, c.zap_count,
+                        ts_rank(c.content_tsv, plainto_tsquery('english', $1)) AS text_rank
+                    FROM candidates c
                 )
                 SELECT
                     e.id, e.pubkey, e.created_at, e.kind, e.content, e.sig,
