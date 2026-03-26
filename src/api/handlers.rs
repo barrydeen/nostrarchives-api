@@ -1605,26 +1605,19 @@ pub async fn admin_block_pubkey(
         return Err(AppError::BadRequest("invalid pubkey (expected 64-char hex)".into()));
     }
 
-    // Block the pubkey
+    // Block the pubkey (immediate — rejects future ingestion)
     state
         .block_cache
         .block_pubkey(&pubkey, body.reason.as_deref(), &_auth.pubkey)
         .await?;
 
-    // Delete all their data
-    let events_deleted = state.block_cache.delete_pubkey_data(&pubkey).await?;
-
-    // Invalidate caches for this pubkey and trending data
-    state.cache.invalidate_pattern(&format!("profile:notes:{pubkey}")).await;
-    state.cache.invalidate_pattern(&format!("profile:replies:{pubkey}")).await;
-    state.cache.invalidate_pattern(&format!("profile:zap_stats:{pubkey}")).await;
-    state.cache.invalidate_pattern(&format!("profiles:metadata:{pubkey}")).await;
-    state.cache.invalidate_pattern("home:trending").await;
+    // Queue background deletion of all their data
+    state.block_cache.queue_purge(&pubkey).await;
 
     Ok(Json(json!({
         "blocked": true,
         "pubkey": pubkey,
-        "events_deleted": events_deleted,
+        "purge": "queued",
     })))
 }
 
@@ -1650,6 +1643,18 @@ pub async fn admin_list_blocked_pubkeys(
 ) -> Result<Json<Value>, AppError> {
     let list = state.block_cache.list_blocked_pubkeys().await?;
     Ok(Json(json!({ "blocked_pubkeys": list })))
+}
+
+/// Get purge status for a pubkey: `GET /v1/admin/purge-status/:pubkey`
+pub async fn admin_purge_status(
+    _auth: AdminAuth,
+    State(state): State<AppState>,
+    axum::extract::Path(pubkey): axum::extract::Path<String>,
+) -> Result<Json<Value>, AppError> {
+    match state.block_cache.purge_status(&pubkey).await {
+        Some(status) => Ok(Json(json!(status))),
+        None => Ok(Json(json!({ "state": "none" }))),
+    }
 }
 
 #[derive(Deserialize)]

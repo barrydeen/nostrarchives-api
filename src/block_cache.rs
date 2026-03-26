@@ -1,8 +1,9 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, RwLock};
 use sqlx::PgPool;
 
+use crate::cache::StatsCache;
 use crate::error::AppError;
 
 /// Blocked entry returned by list methods.
@@ -14,24 +15,59 @@ pub struct BlockedEntry {
     pub blocked_by: String,
 }
 
+/// Status of a background purge job.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PurgeStatus {
+    pub pubkey: String,
+    pub state: PurgeState,
+    pub events_deleted: i64,
+    pub started_at: chrono::DateTime<chrono::Utc>,
+    pub finished_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum PurgeState {
+    Queued,
+    Running,
+    Completed,
+    Failed,
+}
+
 /// In-memory cache for moderation block lists, loaded from DB on startup.
 /// Mutations update both the in-memory set and the database.
+/// Data deletion runs in a background worker via a purge queue.
 #[derive(Clone)]
 pub struct BlockCache {
     blocked_pubkeys: Arc<RwLock<HashSet<String>>>,
     blocked_hashtags: Arc<RwLock<HashSet<String>>>,
     blocked_search_terms: Arc<RwLock<HashSet<String>>>,
     pool: PgPool,
+    purge_tx: mpsc::UnboundedSender<String>,
+    purge_statuses: Arc<RwLock<HashMap<String, PurgeStatus>>>,
 }
 
 impl BlockCache {
     pub fn new(pool: PgPool) -> Self {
-        Self {
+        let (purge_tx, purge_rx) = mpsc::unbounded_channel();
+        let purge_statuses = Arc::new(RwLock::new(HashMap::new()));
+
+        let cache = Self {
             blocked_pubkeys: Arc::new(RwLock::new(HashSet::new())),
             blocked_hashtags: Arc::new(RwLock::new(HashSet::new())),
             blocked_search_terms: Arc::new(RwLock::new(HashSet::new())),
             pool,
-        }
+            purge_tx,
+            purge_statuses,
+        };
+
+        // Stash rx for later — worker is spawned after StatsCache is available
+        // We leak the rx into a static so spawn_purge_worker can pick it up.
+        // Actually, we'll store it differently — see spawn_purge_worker.
+        PURGE_RX.lock().unwrap().replace(purge_rx);
+
+        cache
     }
 
     /// Load all block lists from the database into memory.
@@ -75,6 +111,24 @@ impl BlockCache {
         Ok(())
     }
 
+    /// Spawn the background purge worker. Must be called once after StatsCache is available.
+    pub fn spawn_purge_worker(&self, cache: StatsCache) {
+        let purge_rx = PURGE_RX
+            .lock()
+            .unwrap()
+            .take()
+            .expect("spawn_purge_worker called twice or before new()");
+
+        let pool = self.pool.clone();
+        let statuses = self.purge_statuses.clone();
+
+        tokio::spawn(async move {
+            purge_worker(purge_rx, pool, cache, statuses).await;
+        });
+
+        tracing::info!("purge worker started");
+    }
+
     // ── Pubkey operations ──
 
     pub async fn is_pubkey_blocked(&self, pubkey: &str) -> bool {
@@ -101,6 +155,25 @@ impl BlockCache {
         self.blocked_pubkeys.write().await.insert(pubkey.to_string());
         tracing::info!(pubkey, "Pubkey blocked");
         Ok(())
+    }
+
+    /// Queue background deletion of all data for a blocked pubkey.
+    pub async fn queue_purge(&self, pubkey: &str) {
+        let status = PurgeStatus {
+            pubkey: pubkey.to_string(),
+            state: PurgeState::Queued,
+            events_deleted: 0,
+            started_at: chrono::Utc::now(),
+            finished_at: None,
+            error: None,
+        };
+        self.purge_statuses.write().await.insert(pubkey.to_string(), status);
+        let _ = self.purge_tx.send(pubkey.to_string());
+    }
+
+    /// Get the purge status for a pubkey, if any.
+    pub async fn purge_status(&self, pubkey: &str) -> Option<PurgeStatus> {
+        self.purge_statuses.read().await.get(pubkey).cloned()
     }
 
     pub async fn unblock_pubkey(&self, pubkey: &str) -> Result<bool, AppError> {
@@ -130,73 +203,6 @@ impl BlockCache {
                 blocked_by,
             })
             .collect())
-    }
-
-    /// Delete all data for a blocked pubkey from the database.
-    /// Returns count of deleted events.
-    pub async fn delete_pubkey_data(&self, pubkey: &str) -> Result<i64, AppError> {
-        let mut tx = self.pool.begin().await?;
-
-        // Get event IDs for this pubkey first (needed for cascading deletes)
-        let event_ids: Vec<(String,)> = sqlx::query_as(
-            "SELECT id FROM events WHERE pubkey = $1",
-        )
-        .bind(pubkey)
-        .fetch_all(&mut *tx)
-        .await?;
-
-        let ids: Vec<String> = event_ids.into_iter().map(|(id,)| id).collect();
-        let event_count = ids.len() as i64;
-
-        if !ids.is_empty() {
-            // Delete event_refs where this pubkey's events are source or target
-            sqlx::query(
-                "DELETE FROM event_refs WHERE source_event_id = ANY($1) OR target_event_id = ANY($1)",
-            )
-            .bind(&ids)
-            .execute(&mut *tx)
-            .await?;
-
-            // Delete from note_hashtags
-            sqlx::query("DELETE FROM note_hashtags WHERE event_id = ANY($1)")
-                .bind(&ids)
-                .execute(&mut *tx)
-                .await?;
-
-            // Delete from search_index
-            sqlx::query("DELETE FROM search_index WHERE event_id = ANY($1)")
-                .bind(&ids)
-                .execute(&mut *tx)
-                .await?;
-
-            // Delete the events themselves
-            sqlx::query("DELETE FROM events WHERE pubkey = $1")
-                .bind(pubkey)
-                .execute(&mut *tx)
-                .await?;
-        }
-
-        // Delete social graph data
-        sqlx::query("DELETE FROM follows WHERE follower_pubkey = $1 OR followed_pubkey = $1")
-            .bind(pubkey)
-            .execute(&mut *tx)
-            .await?;
-
-        sqlx::query("DELETE FROM follow_lists WHERE pubkey = $1")
-            .bind(pubkey)
-            .execute(&mut *tx)
-            .await?;
-
-        // Delete crawler state
-        sqlx::query("DELETE FROM crawl_state WHERE pubkey = $1")
-            .bind(pubkey)
-            .execute(&mut *tx)
-            .await?;
-
-        tx.commit().await?;
-
-        tracing::info!(pubkey, events_deleted = event_count, "Pubkey data purged");
-        Ok(event_count)
     }
 
     // ── Hashtag operations ──
@@ -323,4 +329,147 @@ impl BlockCache {
             })
             .collect())
     }
+}
+
+// Global slot to pass the receiver from new() to spawn_purge_worker().
+// This is necessary because BlockCache is Clone (needed for AppState) but
+// mpsc::UnboundedReceiver is not Clone.
+static PURGE_RX: std::sync::Mutex<Option<mpsc::UnboundedReceiver<String>>> =
+    std::sync::Mutex::new(None);
+
+/// Background worker that processes purge jobs sequentially.
+async fn purge_worker(
+    mut rx: mpsc::UnboundedReceiver<String>,
+    pool: PgPool,
+    cache: StatsCache,
+    statuses: Arc<RwLock<HashMap<String, PurgeStatus>>>,
+) {
+    const BATCH_SIZE: i64 = 5000;
+
+    while let Some(pubkey) = rx.recv().await {
+        // Mark as running
+        {
+            let mut map = statuses.write().await;
+            if let Some(status) = map.get_mut(&pubkey) {
+                status.state = PurgeState::Running;
+            }
+        }
+
+        tracing::info!(pubkey = pubkey.as_str(), "Purge job started");
+
+        let result = purge_pubkey_data(&pool, &pubkey, BATCH_SIZE, &statuses).await;
+
+        match result {
+            Ok(total) => {
+                // Invalidate caches
+                cache.invalidate_pattern(&format!("profile:notes:{pubkey}")).await;
+                cache.invalidate_pattern(&format!("profile:replies:{pubkey}")).await;
+                cache.invalidate_pattern(&format!("profile:zap_stats:{pubkey}")).await;
+                cache.invalidate_pattern(&format!("profiles:metadata:{pubkey}")).await;
+                cache.invalidate_pattern("home:trending").await;
+
+                let mut map = statuses.write().await;
+                if let Some(status) = map.get_mut(&pubkey) {
+                    status.state = PurgeState::Completed;
+                    status.events_deleted = total;
+                    status.finished_at = Some(chrono::Utc::now());
+                }
+
+                tracing::info!(pubkey = pubkey.as_str(), events_deleted = total, "Purge job completed");
+            }
+            Err(e) => {
+                let mut map = statuses.write().await;
+                if let Some(status) = map.get_mut(&pubkey) {
+                    status.state = PurgeState::Failed;
+                    status.error = Some(e.to_string());
+                    status.finished_at = Some(chrono::Utc::now());
+                }
+
+                tracing::error!(pubkey = pubkey.as_str(), error = %e, "Purge job failed");
+            }
+        }
+    }
+}
+
+/// Delete all data for a pubkey in batches. Updates status with progress.
+async fn purge_pubkey_data(
+    pool: &PgPool,
+    pubkey: &str,
+    batch_size: i64,
+    statuses: &Arc<RwLock<HashMap<String, PurgeStatus>>>,
+) -> Result<i64, AppError> {
+    let mut total_deleted: i64 = 0;
+
+    loop {
+        let batch: Vec<(String,)> = sqlx::query_as(
+            "SELECT id FROM events WHERE pubkey = $1 LIMIT $2",
+        )
+        .bind(pubkey)
+        .bind(batch_size)
+        .fetch_all(pool)
+        .await?;
+
+        if batch.is_empty() {
+            break;
+        }
+
+        let ids: Vec<String> = batch.into_iter().map(|(id,)| id).collect();
+        let batch_count = ids.len() as i64;
+
+        let mut tx = pool.begin().await?;
+
+        sqlx::query(
+            "DELETE FROM event_refs WHERE source_event_id = ANY($1) OR target_event_id = ANY($1)",
+        )
+        .bind(&ids)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query("DELETE FROM note_hashtags WHERE event_id = ANY($1)")
+            .bind(&ids)
+            .execute(&mut *tx)
+            .await?;
+
+        sqlx::query("DELETE FROM search_index WHERE event_id = ANY($1)")
+            .bind(&ids)
+            .execute(&mut *tx)
+            .await?;
+
+        sqlx::query("DELETE FROM events WHERE id = ANY($1)")
+            .bind(&ids)
+            .execute(&mut *tx)
+            .await?;
+
+        tx.commit().await?;
+
+        total_deleted += batch_count;
+
+        // Update progress in status map
+        {
+            let mut map = statuses.write().await;
+            if let Some(status) = map.get_mut(pubkey) {
+                status.events_deleted = total_deleted;
+            }
+        }
+
+        tracing::info!(pubkey, batch = batch_count, total = total_deleted, "Purge batch completed");
+    }
+
+    // Delete social graph and crawler data
+    sqlx::query("DELETE FROM follows WHERE follower_pubkey = $1 OR followed_pubkey = $1")
+        .bind(pubkey)
+        .execute(pool)
+        .await?;
+
+    sqlx::query("DELETE FROM follow_lists WHERE pubkey = $1")
+        .bind(pubkey)
+        .execute(pool)
+        .await?;
+
+    sqlx::query("DELETE FROM crawl_state WHERE pubkey = $1")
+        .bind(pubkey)
+        .execute(pool)
+        .await?;
+
+    Ok(total_deleted)
 }

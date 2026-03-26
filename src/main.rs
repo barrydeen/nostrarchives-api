@@ -174,6 +174,9 @@ async fn main() {
     let mut stats_cache = cache::StatsCache::new(redis_client, repo.clone());
     stats_cache.set_live_tracker(live_tracker.clone());
 
+    // Start the background purge worker (processes blocked pubkey data deletion)
+    block_cache.spawn_purge_worker(stats_cache.clone());
+
     // Shutdown signal
     let (shutdown_tx, _) = broadcast::channel::<()>(1);
 

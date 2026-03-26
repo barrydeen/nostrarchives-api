@@ -139,6 +139,7 @@ pub fn router(state: AppState) -> Router {
             post(handlers::admin_block_pubkey).delete(handlers::admin_unblock_pubkey),
         )
         .route("/v1/admin/blocked-pubkeys", get(handlers::admin_list_blocked_pubkeys))
+        .route("/v1/admin/purge-status/{pubkey}", get(handlers::admin_purge_status))
         .route(
             "/v1/admin/block-hashtag",
             post(handlers::admin_block_hashtag).delete(handlers::admin_unblock_hashtag),
