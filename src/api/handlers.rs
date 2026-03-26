@@ -59,12 +59,7 @@ pub async fn get_events(
     State(state): State<AppState>,
     Query(q): Query<EventQuery>,
 ) -> Result<Json<Value>, AppError> {
-    let (events, total) = tokio::try_join!(
-        state.repo.query_events(&q),
-        state
-            .repo
-            .count_events_filtered(q.pubkey.as_deref(), q.kind, q.since, q.until,),
-    )?;
+    let events = state.repo.query_events(&q).await?;
 
     // Batch-fetch engagement stats for all returned events
     let event_ids: Vec<String> = events.iter().map(|e| e.id.clone()).collect();
@@ -88,7 +83,6 @@ pub async fn get_events(
     Ok(Json(json!({
         "events": enriched,
         "count": enriched.len(),
-        "total": total,
     })))
 }
 
