@@ -716,6 +716,12 @@ pub struct ProfileMetadataEntry {
     pub name: Option<String>,
     pub preferred_name: Option<String>,
     pub picture: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub about: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nip05: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lud16: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -744,6 +750,9 @@ fn build_profile_entry(pubkey: &str, metadata: Option<&Value>) -> ProfileMetadat
         metadata.and_then(|value| get_string(value, &["display_name", "displayName"]));
     let name = metadata.and_then(|value| get_string(value, &["name", "username"]));
     let picture = metadata.and_then(|value| get_string(value, &["picture", "image"]));
+    let about = metadata.and_then(|value| get_string(value, &["about"]));
+    let nip05 = metadata.and_then(|value| get_string(value, &["nip05"]));
+    let lud16 = metadata.and_then(|value| get_string(value, &["lud16"]));
 
     let preferred_name = display_name.clone().or_else(|| name.clone());
 
@@ -753,6 +762,9 @@ fn build_profile_entry(pubkey: &str, metadata: Option<&Value>) -> ProfileMetadat
         name,
         preferred_name,
         picture,
+        about,
+        nip05,
+        lud16,
     }
 }
 
