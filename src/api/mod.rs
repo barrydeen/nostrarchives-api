@@ -59,6 +59,18 @@ async fn ws_live_metrics(
     })
 }
 
+/// WebSocket upgrade handler for online users streaming.
+async fn ws_online_users(
+    ws: axum::extract::WebSocketUpgrade,
+    axum::extract::State(state): axum::extract::State<AppState>,
+) -> impl axum::response::IntoResponse {
+    ws.on_upgrade(move |socket| async move {
+        if let Some(tracker) = state.live_tracker {
+            crate::live_metrics::handle_online_users_ws(socket, tracker).await;
+        }
+    })
+}
+
 /// Build the axum router with all routes.
 pub fn router(state: AppState) -> Router {
     // 120 requests per minute per IP
@@ -127,7 +139,8 @@ pub fn router(state: AppState) -> Router {
 
     // WebSocket routes are NOT rate-limited
     let ws_routes = Router::new()
-        .route("/v1/ws/live-metrics", get(ws_live_metrics));
+        .route("/v1/ws/live-metrics", get(ws_live_metrics))
+        .route("/v1/ws/online-users", get(ws_online_users));
 
     // Admin routes — auth enforced per-handler via AdminAuth extractor
     // Stricter rate limit: 10 req/min per IP to prevent brute-force sig verification DoS
