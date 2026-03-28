@@ -171,6 +171,17 @@ async fn main() {
 
     let live_tracker = Arc::new(live_metrics::LiveMetricsTracker::new(redis_client.clone()));
 
+    // Background: clean up stale active users from Redis sorted set every 60s
+    {
+        let cleanup_tracker = live_tracker.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                cleanup_tracker.cleanup_active_users().await;
+            }
+        });
+    }
+
     let mut stats_cache = cache::StatsCache::new(redis_client, repo.clone());
     stats_cache.set_live_tracker(live_tracker.clone());
 
