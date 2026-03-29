@@ -232,6 +232,20 @@ impl CrawlQueue {
         Ok(())
     }
 
+    /// Mark zaps as crawled for a batch of authors.
+    pub async fn mark_zaps_crawled(&self, pubkeys: &[String]) -> Result<(), AppError> {
+        if pubkeys.is_empty() {
+            return Ok(());
+        }
+        sqlx::query(
+            "UPDATE crawl_state SET zaps_crawled_at = NOW(), updated_at = NOW() WHERE pubkey = ANY($1)",
+        )
+        .bind(pubkeys)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     /// Get queue stats for monitoring.
     pub async fn stats(&self) -> Result<QueueStats, AppError> {
         let row = sqlx::query_as::<_, QueueStatsRow>(

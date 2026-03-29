@@ -182,6 +182,10 @@ async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
             "039_blocked_search_terms",
             include_str!("../../migrations/039_blocked_search_terms.sql"),
         ),
+        (
+            "040_crawl_state_zaps_crawled_at",
+            include_str!("../../migrations/040_crawl_state_zaps_crawled_at.sql"),
+        ),
     ];
 
     for (name, sql) in migrations {

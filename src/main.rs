@@ -213,12 +213,14 @@ async fn main() {
 
         match cfg.crawl_mode.as_str() {
             "negentropy_only" => {
+                let relay_router = crawler::relay_router::RelayRouter::new(repo.pool());
                 let mut neg_crawler = crawler::negentropy_only::NegentropyOnlyCrawler::new(
                     repo.clone(),
                     stats_cache.clone(),
                     repo.pool(),
                     queue.clone(),
                     cfg.negentropy_pinned_relays.clone(),
+                    relay_router,
                 );
                 let neg_shutdown = shutdown_tx.clone();
                 tokio::spawn(async move {
