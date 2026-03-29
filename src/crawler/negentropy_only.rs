@@ -1,19 +1,27 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use futures_util::{SinkExt, StreamExt};
+use serde_json::Value;
 use sqlx::PgPool;
 use tokio::sync::broadcast;
-use tokio::time::{sleep, Duration};
+use tokio::time::{sleep, timeout, Duration};
+use tokio_tungstenite::tungstenite::Message;
+use uuid::Uuid;
 
 use crate::cache::StatsCache;
+use crate::db::models::NostrEvent;
 use crate::db::repository::EventRepository;
 
 use super::negentropy::NegentropySyncer;
 use super::queue::CrawlQueue;
 use super::relay_caps;
+use super::relay_router::RelayRouter;
 
 /// Simple negentropy-only crawler: iterates through every author in crawl_state
 /// and does a negentropy sync of their kind-1 notes against a pinned set of relays.
+/// After the note pass, runs a zap crawl pass that fetches kind-9735 zap receipts
+/// for all authors across the top relays discovered from NIP-65 data.
 pub struct NegentropyOnlyCrawler {
     repo: EventRepository,
     cache: StatsCache,
@@ -21,6 +29,7 @@ pub struct NegentropyOnlyCrawler {
     queue: CrawlQueue,
     pinned_relays: Vec<String>,
     confirmed_relays: Vec<String>,
+    relay_router: RelayRouter,
 }
 
 impl NegentropyOnlyCrawler {
@@ -30,6 +39,7 @@ impl NegentropyOnlyCrawler {
         pool: PgPool,
         queue: CrawlQueue,
         pinned_relays: Vec<String>,
+        relay_router: RelayRouter,
     ) -> Self {
         Self {
             repo,
@@ -38,6 +48,7 @@ impl NegentropyOnlyCrawler {
             queue,
             pinned_relays,
             confirmed_relays: Vec::new(),
+            relay_router,
         }
     }
 
@@ -164,7 +175,7 @@ impl NegentropyOnlyCrawler {
                         total_discovered = grand_total_discovered,
                         total_inserted = grand_total_inserted,
                         elapsed_secs = crawl_start.elapsed().as_secs(),
-                        "negentropy_only: full pass complete"
+                        "negentropy_only: note pass complete"
                     );
                     break;
                 }
@@ -291,14 +302,253 @@ impl NegentropyOnlyCrawler {
             }
         }
 
-        // Final summary
+        // Final summary for note pass
         tracing::info!(
             authors_processed = authors_processed,
             total_authors = total_authors,
             total_discovered = grand_total_discovered,
             total_inserted = grand_total_inserted,
             elapsed_secs = crawl_start.elapsed().as_secs(),
-            "negentropy_only: crawl finished"
+            "negentropy_only: note pass finished"
         );
+
+        // Phase 2: Zap crawl pass
+        if shutdown_rx.try_recv().is_ok() {
+            return;
+        }
+        Self::run_zap_pass(&this, &mut shutdown_rx).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Zap crawl pass
+    // -----------------------------------------------------------------------
+
+    /// Discover top relays from NIP-65 data and fetch zap receipts for all authors.
+    /// Uses traditional REQ with `#p` tag filter (not negentropy) so it works on
+    /// all relays. Authors are batched in groups of 50 per relay connection.
+    async fn run_zap_pass(
+        this: &Arc<Self>,
+        shutdown_rx: &mut broadcast::Receiver<()>,
+    ) {
+        // Discover top relays from NIP-65 data
+        let zap_relays = match this.relay_router.get_top_relays(50).await {
+            Ok(relays) => {
+                let urls: Vec<String> = relays.into_iter().map(|(url, _)| url).collect();
+                tracing::info!(
+                    relay_count = urls.len(),
+                    "zap_pass: discovered top relays from NIP-65"
+                );
+                urls
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "zap_pass: failed to discover relays, using pinned");
+                this.pinned_relays.clone()
+            }
+        };
+
+        if zap_relays.is_empty() {
+            tracing::warn!("zap_pass: no relays available, skipping");
+            return;
+        }
+
+        // Count authors needing zap crawl (never crawled or older than 7 days)
+        let total_to_crawl: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM crawl_state \
+             WHERE zaps_crawled_at IS NULL \
+                OR zaps_crawled_at < NOW() - INTERVAL '7 days'",
+        )
+        .fetch_one(&this.pool)
+        .await
+        .unwrap_or(0);
+
+        if total_to_crawl == 0 {
+            tracing::info!("zap_pass: all authors have recent zap data, skipping");
+            return;
+        }
+
+        tracing::info!(
+            authors = total_to_crawl,
+            relays = zap_relays.len(),
+            "zap_pass: starting zap crawl"
+        );
+
+        let zap_start = Instant::now();
+        let mut authors_done: i64 = 0;
+        let mut grand_zaps_inserted: u64 = 0;
+        let mut offset: i64 = 0;
+        let batch_size: i64 = 50;
+
+        loop {
+            if shutdown_rx.try_recv().is_ok() {
+                tracing::info!("zap_pass: shutdown signal received");
+                break;
+            }
+
+            // Fetch next batch of authors needing zap crawl
+            let batch: Vec<String> = sqlx::query_scalar(
+                "SELECT pubkey FROM crawl_state \
+                 WHERE zaps_crawled_at IS NULL \
+                    OR zaps_crawled_at < NOW() - INTERVAL '7 days' \
+                 ORDER BY priority_tier ASC, follower_count DESC \
+                 OFFSET $1 LIMIT $2",
+            )
+            .bind(offset)
+            .bind(batch_size)
+            .fetch_all(&this.pool)
+            .await
+            .unwrap_or_default();
+
+            if batch.is_empty() {
+                break;
+            }
+
+            let batch_start = Instant::now();
+            let mut batch_inserted: u64 = 0;
+
+            // Query each relay for zaps targeting this batch of authors
+            for relay_url in &zap_relays {
+                match Self::fetch_zaps_from_relay(
+                    &this.repo,
+                    &this.cache,
+                    relay_url,
+                    &batch,
+                )
+                .await
+                {
+                    Ok(inserted) => {
+                        batch_inserted += inserted;
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            relay = %relay_url,
+                            error = %e,
+                            "zap_pass: relay fetch failed"
+                        );
+                    }
+                }
+
+                // Brief delay between relays
+                sleep(Duration::from_millis(100)).await;
+            }
+
+            // Mark batch as zap-crawled
+            let _ = this.queue.mark_zaps_crawled(&batch).await;
+
+            authors_done += batch.len() as i64;
+            grand_zaps_inserted += batch_inserted;
+            offset += batch_size;
+
+            tracing::info!(
+                authors_done = authors_done,
+                total = total_to_crawl,
+                batch_inserted = batch_inserted,
+                total_inserted = grand_zaps_inserted,
+                duration_ms = batch_start.elapsed().as_millis() as u64,
+                "zap_pass: batch complete"
+            );
+        }
+
+        tracing::info!(
+            authors_done = authors_done,
+            total_to_crawl = total_to_crawl,
+            zaps_inserted = grand_zaps_inserted,
+            elapsed_secs = zap_start.elapsed().as_secs(),
+            "zap_pass: finished"
+        );
+    }
+
+    /// Fetch kind-9735 zap receipts from a relay for a batch of authors using `#p` tag filter.
+    async fn fetch_zaps_from_relay(
+        repo: &EventRepository,
+        cache: &StatsCache,
+        relay_url: &str,
+        pubkeys: &[String],
+    ) -> Result<u64, String> {
+        if pubkeys.is_empty() {
+            return Ok(0);
+        }
+
+        let connect_timeout = Duration::from_secs(10);
+        let msg_timeout = Duration::from_secs(30);
+
+        let (ws_stream, _) = timeout(connect_timeout, tokio_tungstenite::connect_async(relay_url))
+            .await
+            .map_err(|_| format!("connect timeout: {relay_url}"))?
+            .map_err(|e| format!("connect failed to {relay_url}: {e}"))?;
+
+        let (mut write, mut read) = ws_stream.split();
+        let mut total_inserted = 0u64;
+
+        // Send a single REQ with all pubkeys (up to 50)
+        let filter = serde_json::json!({
+            "kinds": [9735],
+            "#p": pubkeys,
+            "limit": 5000,
+        });
+
+        let sub_id = format!("zaps-{}", Uuid::new_v4().simple());
+        let req = serde_json::json!(["REQ", &sub_id, filter]);
+
+        write
+            .send(Message::Text(req.to_string().into()))
+            .await
+            .map_err(|e| format!("send REQ failed: {e}"))?;
+
+        loop {
+            match timeout(msg_timeout, read.next()).await {
+                Ok(Some(Ok(Message::Text(text)))) => {
+                    let parsed: Value = match serde_json::from_str(&text) {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    };
+                    let arr = match parsed.as_array() {
+                        Some(a) if a.len() >= 2 => a,
+                        _ => continue,
+                    };
+                    match arr[0].as_str() {
+                        Some("EVENT") if arr.len() >= 3 => {
+                            if let Ok(event) =
+                                serde_json::from_value::<NostrEvent>(arr[2].clone())
+                            {
+                                if event.kind == 9735 {
+                                    match repo.insert_event(&event, relay_url).await {
+                                        Ok(true) => {
+                                            total_inserted += 1;
+                                            cache
+                                                .on_event_ingested(&event.pubkey, event.kind)
+                                                .await;
+                                        }
+                                        Ok(false) => {}
+                                        Err(e) => {
+                                            tracing::debug!(
+                                                error = %e,
+                                                "zap_pass: insert failed"
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Some("EOSE") => break,
+                        Some("CLOSED") | Some("NOTICE") => break,
+                        _ => {}
+                    }
+                }
+                Ok(Some(Ok(Message::Ping(data)))) => {
+                    let _ = write.send(Message::Pong(data)).await;
+                }
+                Ok(Some(Ok(Message::Close(_)))) | Ok(None) => break,
+                Ok(Some(Err(e))) => return Err(format!("ws error: {e}")),
+                Err(_) => break,
+                _ => {}
+            }
+        }
+
+        let close_msg = serde_json::json!(["CLOSE", &sub_id]);
+        let _ = write
+            .send(Message::Text(close_msg.to_string().into()))
+            .await;
+
+        Ok(total_inserted)
     }
 }
