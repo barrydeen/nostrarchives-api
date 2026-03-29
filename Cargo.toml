@@ -37,3 +37,7 @@ path = "src/bin/test_negentropy.rs"
 [[bin]]
 name = "purge_non_wot"
 path = "src/bin/purge_non_wot.rs"
+
+[[bin]]
+name = "crawl_zaps"
+path = "src/bin/crawl_zaps.rs"
