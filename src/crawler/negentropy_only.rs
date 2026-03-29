@@ -121,11 +121,15 @@ impl NegentropyOnlyCrawler {
             }
         }
 
-        // Count total authors
-        let total_authors: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM crawl_state")
-            .fetch_one(&self.pool)
-            .await
-            .unwrap_or(0);
+        // Count authors needing note crawl
+        let total_authors: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM crawl_state \
+             WHERE last_crawled_at IS NULL \
+                OR last_crawled_at < NOW() - INTERVAL '7 days'",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .unwrap_or(0);
 
         tracing::info!(
             authors = total_authors,
@@ -146,8 +150,6 @@ impl NegentropyOnlyCrawler {
         let mut grand_total_inserted: usize = 0;
         let crawl_start = Instant::now();
 
-        let mut offset: i64 = 0;
-
         loop {
             // Check for shutdown
             if shutdown_rx.try_recv().is_ok() {
@@ -155,14 +157,17 @@ impl NegentropyOnlyCrawler {
                 break;
             }
 
-            // Fetch next author
+            // Fetch next author: prefer never-crawled, then oldest last_crawled_at.
+            // This resumes naturally after restarts — already-crawled authors are skipped.
             let author: Option<(String, i64, i16)> = sqlx::query_as(
                 "SELECT pubkey, follower_count, priority_tier \
                  FROM crawl_state \
-                 ORDER BY priority_tier ASC, follower_count DESC \
-                 OFFSET $1 LIMIT 1",
+                 WHERE last_crawled_at IS NULL \
+                    OR last_crawled_at < NOW() - INTERVAL '7 days' \
+                 ORDER BY last_crawled_at ASC NULLS FIRST, \
+                          priority_tier ASC, follower_count DESC \
+                 LIMIT 1",
             )
-            .bind(offset)
             .fetch_optional(&this.pool)
             .await
             .unwrap_or(None);
@@ -181,7 +186,6 @@ impl NegentropyOnlyCrawler {
                 }
             };
 
-            offset += 1;
             authors_processed += 1;
 
             let short_pk = if pubkey.len() >= 12 {
