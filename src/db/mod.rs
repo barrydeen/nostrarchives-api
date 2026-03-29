@@ -186,6 +186,10 @@ async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
             "040_crawl_state_zaps_crawled_at",
             include_str!("../../migrations/040_crawl_state_zaps_crawled_at.sql"),
         ),
+        (
+            "041_client_top_users_view",
+            include_str!("../../migrations/041_client_top_users_view.sql"),
+        ),
     ];
 
     for (name, sql) in migrations {
