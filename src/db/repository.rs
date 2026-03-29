@@ -2628,6 +2628,11 @@ impl EventRepository {
             .await?;
         tracing::info!("refreshed mv_zapper_leaderboards");
 
+        sqlx::query("REFRESH MATERIALIZED VIEW CONCURRENTLY mv_client_top_users")
+            .execute(&self.pool)
+            .await?;
+        tracing::info!("refreshed mv_client_top_users");
+
         Ok(())
     }
 
@@ -2702,6 +2707,39 @@ impl EventRepository {
                 client_name,
                 note_count,
                 user_count,
+            })
+            .collect())
+    }
+
+    /// Top users for a specific client, from `mv_client_top_users`.
+    pub async fn client_users(
+        &self,
+        client_name: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<super::models::ClientUserEntry>, AppError> {
+        let rows = sqlx::query_as::<_, (String, i64, i64, i64)>(
+            r#"
+            SELECT pubkey, note_count, first_seen, last_seen
+            FROM mv_client_top_users
+            WHERE client_name = $1
+            ORDER BY note_count DESC
+            LIMIT $2 OFFSET $3
+            "#,
+        )
+        .bind(client_name.to_lowercase())
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|(pubkey, note_count, first_seen, last_seen)| super::models::ClientUserEntry {
+                pubkey,
+                note_count,
+                first_seen,
+                last_seen,
             })
             .collect())
     }

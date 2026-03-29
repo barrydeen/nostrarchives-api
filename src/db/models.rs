@@ -195,6 +195,14 @@ pub struct RelayLeaderboardEntry {
     pub user_count: i64,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ClientUserEntry {
+    pub pubkey: String,
+    pub note_count: i64,
+    pub first_seen: i64,
+    pub last_seen: i64,
+}
+
 /// A zap entry for profile zap activity tabs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProfileZapEntry {
