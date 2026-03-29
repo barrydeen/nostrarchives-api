@@ -432,7 +432,7 @@ impl NegentropySyncer {
     // -----------------------------------------------------------------------
 
     /// Default time window size for chunked sync (24 hours in seconds).
-    const DEFAULT_WINDOW_SECS: i64 = 86400;
+    pub const DEFAULT_WINDOW_SECS: i64 = 86400;
 
     /// v2: Only sync kinds we actually store. Reactions/reposts (6/7/16) are
     /// handled as counter increments via targeted #e queries, not negentropy bulk sync.
@@ -572,19 +572,19 @@ impl NegentropySyncer {
 
     /// Earliest plausible Nostr timestamp (Jan 1 2020). Anything before this
     /// means we've walked past all possible Nostr data.
-    const NOSTR_EPOCH: i64 = 1_577_836_800;
+    pub const NOSTR_EPOCH: i64 = 1_577_836_800;
 
     /// Maximum window size for exponential growth (180 days).
     const MAX_WINDOW_SECS: i64 = 180 * 86400;
 
-    /// Internal: walk backward from a cursor in time windows for specific kinds.
+    /// Walk backward from a cursor in time windows for specific kinds.
     /// Uses exponential window growth: when a window finds 0 new events, double
     /// the window size (people go days/months without posting). When events are
     /// found, reset to the base window. Terminates only when cursor < NOSTR_EPOCH.
     ///
-    /// Returns (SyncStats, final_window_secs) so callers can persist the window
-    /// size for resumption across cycles.
-    async fn run_sync_windowed_from(
+    /// Returns (SyncStats, final_window_secs, final_cursor) so callers can persist
+    /// the window size for resumption across cycles.
+    pub async fn run_sync_windowed_from(
         &self,
         relay_url: &str,
         kinds: &[i64],
@@ -861,7 +861,7 @@ impl NegentropySyncer {
     // Sync state persistence
     // -----------------------------------------------------------------------
 
-    async fn get_sync_state(
+    pub async fn get_sync_state(
         &self,
         relay_url: &str,
         kind: i64,
@@ -886,7 +886,7 @@ impl NegentropySyncer {
         }))
     }
 
-    async fn update_sync_state<F>(
+    pub async fn update_sync_state<F>(
         &self,
         relay_url: &str,
         kind: i64,
@@ -938,14 +938,14 @@ struct EventIdRow {
 }
 
 #[derive(Debug, Clone)]
-struct SyncState {
-    oldest_synced_at: i64,
-    newest_synced_at: i64,
-    fully_backfilled: bool,
-    total_discovered: i64,
-    total_inserted: i64,
-    consecutive_empty_windows: i32,
-    current_window_secs: i64,
+pub struct SyncState {
+    pub oldest_synced_at: i64,
+    pub newest_synced_at: i64,
+    pub fully_backfilled: bool,
+    pub total_discovered: i64,
+    pub total_inserted: i64,
+    pub consecutive_empty_windows: i32,
+    pub current_window_secs: i64,
 }
 
 #[derive(sqlx::FromRow)]
