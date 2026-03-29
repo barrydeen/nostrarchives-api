@@ -1500,6 +1500,46 @@ pub async fn get_client_leaderboard(
     Ok(Json(response))
 }
 
+/// Users for a specific client: `GET /v1/clients/:client_name/users?limit=50&offset=0`
+///
+/// Returns top users of a Nostr client ranked by note count, with profile metadata.
+/// Redis-cached for 10 minutes.
+pub async fn get_client_users(
+    State(state): State<AppState>,
+    Path(client_name): Path<String>,
+    Query(q): Query<ListingQuery>,
+) -> Result<Json<Value>, AppError> {
+    let limit = clamp_listing_limit(q.limit);
+    let offset = clamp_offset(q.offset);
+    let name = client_name.to_lowercase();
+
+    let cache_key = format!("clients:users:{name}:{limit}:{offset}");
+    if let Some(cached) = state.cache.get_json(&cache_key).await {
+        if let Ok(val) = serde_json::from_str::<Value>(&cached) {
+            return Ok(Json(val));
+        }
+    }
+
+    let users = state.repo.client_users(&name, limit, offset).await?;
+
+    // Bulk-fetch profile metadata for all pubkeys
+    let pubkeys: Vec<String> = users.iter().map(|u| u.pubkey.clone()).collect();
+    let profile_rows = state.repo.latest_profile_metadata(&pubkeys).await?;
+    let profiles = build_profiles_map(profile_rows);
+
+    let response = json!({
+        "client_name": name,
+        "users": users,
+        "profiles": profiles,
+    });
+
+    if let Ok(json_str) = serde_json::to_string(&response) {
+        state.cache.set_json(&cache_key, &json_str, 600).await;
+    }
+
+    Ok(Json(response))
+}
+
 pub async fn get_relay_leaderboard(
     State(state): State<AppState>,
     Query(q): Query<ListingQuery>,

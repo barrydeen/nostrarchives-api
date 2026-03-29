@@ -117,6 +117,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/stats/daily", get(handlers::get_daily_stats))
 
         .route("/v1/clients/leaderboard", get(handlers::get_client_leaderboard))
+        .route("/v1/clients/{client_name}/users", get(handlers::get_client_users))
         .route("/v1/relays/leaderboard", get(handlers::get_relay_leaderboard))
         .route("/v1/analytics/daily", get(handlers::get_analytics_daily))
         .route("/v1/analytics/top-posters", get(handlers::get_top_posters))

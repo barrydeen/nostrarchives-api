@@ -328,6 +328,7 @@ async fn main() {
                         "analytics:most_liked",
                         "analytics:most_shared",
                         "clients:leaderboard",
+                        "clients:users",
                         "relays:leaderboard",
                     ] {
                         analytics_mv_cache.delete_by_prefix(prefix).await;
