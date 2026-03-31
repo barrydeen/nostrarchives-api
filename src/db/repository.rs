@@ -1211,7 +1211,18 @@ impl EventRepository {
             .fetch_all(&self.pool),
             self.get_interactions(event_id),
             self.get_referencing_events_multi(event_id, &["reply", "root"], limit),
-            self.get_referencing_events(event_id, "zap", limit),
+            // Zaps: join through zap_metadata (event_refs not populated for zaps)
+            sqlx::query_as::<_, StoredEvent>(
+                "SELECT e.id, e.pubkey, e.created_at, e.kind, e.content, e.sig, e.tags, e.raw, e.relay_url, e.received_at
+                 FROM events e
+                 INNER JOIN zap_metadata zm ON zm.event_id = e.id
+                 WHERE zm.zapped_event_id = $1
+                 ORDER BY e.created_at DESC
+                 LIMIT $2",
+            )
+            .bind(event_id)
+            .bind(limit)
+            .fetch_all(&self.pool),
         );
 
         let refs = refs_result?;
