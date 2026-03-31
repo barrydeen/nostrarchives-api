@@ -121,11 +121,12 @@ impl NegentropyOnlyCrawler {
             }
         }
 
-        // Count authors needing note crawl
+        // Count authors needing note crawl (skip T4 — they can't pass WoT ingestion)
         let total_authors: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM crawl_state \
-             WHERE last_crawled_at IS NULL \
-                OR last_crawled_at < NOW() - INTERVAL '7 days'",
+             WHERE priority_tier <= 3 \
+               AND (last_crawled_at IS NULL \
+                OR last_crawled_at < NOW() - INTERVAL '7 days')",
         )
         .fetch_one(&self.pool)
         .await
@@ -162,8 +163,9 @@ impl NegentropyOnlyCrawler {
             let author: Option<(String, i64, i16)> = sqlx::query_as(
                 "SELECT pubkey, follower_count, priority_tier \
                  FROM crawl_state \
-                 WHERE last_crawled_at IS NULL \
-                    OR last_crawled_at < NOW() - INTERVAL '7 days' \
+                 WHERE priority_tier <= 3 \
+                   AND (last_crawled_at IS NULL \
+                    OR last_crawled_at < NOW() - INTERVAL '7 days') \
                  ORDER BY last_crawled_at ASC NULLS FIRST, \
                           priority_tier ASC, follower_count DESC \
                  LIMIT 1",
@@ -355,7 +357,7 @@ impl NegentropyOnlyCrawler {
             return;
         }
 
-        // Count authors needing zap crawl (never crawled or older than 7 days)
+        // Count authors needing zap crawl (all tiers — zaps are always stored)
         let total_to_crawl: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM crawl_state \
              WHERE zaps_crawled_at IS NULL \
@@ -388,7 +390,7 @@ impl NegentropyOnlyCrawler {
                 break;
             }
 
-            // Fetch next batch of authors needing zap crawl
+            // Fetch next batch of authors needing zap crawl (all tiers — zaps always stored)
             let batch: Vec<String> = sqlx::query_scalar(
                 "SELECT pubkey FROM crawl_state \
                  WHERE zaps_crawled_at IS NULL \
