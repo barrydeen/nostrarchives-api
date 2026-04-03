@@ -201,7 +201,22 @@ async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
 
         if !applied {
             tracing::info!("applying migration: {name}");
-            sqlx::raw_sql(sql).execute(pool).await?;
+
+            if sql.starts_with("-- no-transaction") {
+                // CONCURRENTLY operations cannot run inside a transaction block.
+                // Execute each statement individually on a dedicated connection.
+                let mut conn = pool.acquire().await?;
+                for stmt in sql.split(';') {
+                    let stmt = stmt.trim();
+                    if stmt.is_empty() || stmt.starts_with("--") {
+                        continue;
+                    }
+                    sqlx::raw_sql(stmt).execute(&mut *conn).await?;
+                }
+            } else {
+                sqlx::raw_sql(sql).execute(pool).await?;
+            }
+
             sqlx::query("INSERT INTO _migrations (name) VALUES ($1)")
                 .bind(name)
                 .execute(pool)
