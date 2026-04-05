@@ -2110,7 +2110,9 @@ impl EventRepository {
             ),
             reply_events AS (
                 SELECT e.id, e.pubkey, e.created_at, e.kind, e.content,
-                       e.sig, e.tags, e.relay_url, e.received_at
+                       e.sig, e.tags, e.relay_url, e.received_at,
+                       e.reaction_count AS reactions, e.repost_count AS reposts,
+                       e.reply_count AS replies, (e.zap_amount_msats / 1000) AS zap_sats
                 FROM events e
                 INNER JOIN event_refs r ON r.source_event_id = e.id
                 WHERE r.target_event_id = $1 AND r.ref_type IN ('reply', 'root')
