@@ -190,6 +190,10 @@ async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
             "041_client_top_users_view",
             include_str!("../../migrations/041_client_top_users_view.sql"),
         ),
+        (
+            "042_client_leaderboard_timeframes",
+            include_str!("../../migrations/042_client_leaderboard_timeframes.sql"),
+        ),
     ];
 
     for (name, sql) in migrations {

@@ -1472,29 +1472,41 @@ pub async fn get_hashtag_notes(
     Ok(Json(response))
 }
 
-/// Client leaderboard: `GET /v1/clients/leaderboard?limit=50&offset=0`
+/// Client leaderboard: `GET /v1/clients/leaderboard?range=7d&limit=50&offset=0`
 ///
 /// Returns Nostr clients ranked by note count, with distinct user counts.
-/// Redis-cached for 10 minutes.
+/// Supports time-range filtering: "today", "7d", "30d", "all" (default).
+/// Redis-cached with range-dependent TTL.
 pub async fn get_client_leaderboard(
     State(state): State<AppState>,
-    Query(q): Query<ListingQuery>,
+    Query(q): Query<AnalyticsLeaderboardQuery>,
 ) -> Result<Json<Value>, AppError> {
+    let range = q.range.as_deref().unwrap_or("all");
     let limit = clamp_listing_limit(q.limit);
     let offset = clamp_offset(q.offset);
 
-    let cache_key = format!("clients:leaderboard:{limit}:{offset}");
+    let cache_key = format!("clients:leaderboard:{range}:{limit}:{offset}");
     if let Some(cached) = state.cache.get_json(&cache_key).await {
         if let Ok(val) = serde_json::from_str::<Value>(&cached) {
             return Ok(Json(val));
         }
     }
 
-    let clients = state.repo.client_leaderboard(limit, offset).await?;
-    let response = json!({ "clients": clients });
+    let clients = state.repo.client_leaderboard(range, limit, offset).await?;
+    let response = json!({
+        "range": range,
+        "clients": clients,
+    });
 
     if let Ok(json_str) = serde_json::to_string(&response) {
-        state.cache.set_json(&cache_key, &json_str, 600).await;
+        let ttl = match range {
+            "today" => 300,   // 5 min
+            "7d" => 1800,     // 30 min
+            "30d" => 3600,    // 1 hour
+            "all" => 86400,   // 1 day
+            _ => 1800,
+        };
+        state.cache.set_json(&cache_key, &json_str, ttl).await;
     }
 
     Ok(Json(response))

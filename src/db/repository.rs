@@ -2696,23 +2696,37 @@ impl EventRepository {
     /// like "Coracle" / "coracle". Only counts notes from qualified users
     /// (at least 1 follower in `profile_search`) to filter out bot spam.
     /// Returns results ordered by note_count DESC.
+    /// Supports time-range filtering: "today", "7d", "30d", "all".
     pub async fn client_leaderboard(
         &self,
+        range: &str,
         limit: i64,
         offset: i64,
     ) -> Result<Vec<super::models::ClientEntry>, AppError> {
-        let rows = sqlx::query_as::<_, (String, i64, i64)>(
+        let (note_col, user_col) = match range {
+            "today" => ("note_count_today", "user_count_today"),
+            "7d"    => ("note_count_7d",    "user_count_7d"),
+            "30d"   => ("note_count_30d",   "user_count_30d"),
+            _       => ("note_count_all",   "user_count_all"),
+        };
+
+        let sql = format!(
             r#"
-            SELECT client_name, note_count, user_count
+            SELECT client_name, {note_col} AS note_count, {user_col} AS user_count
             FROM mv_client_leaderboard
-            ORDER BY note_count DESC
+            WHERE {note_col} > 0
+            ORDER BY {note_col} DESC
             LIMIT $1 OFFSET $2
             "#,
-        )
-        .bind(limit)
-        .bind(offset)
-        .fetch_all(&self.pool)
-        .await?;
+            note_col = note_col,
+            user_col = user_col,
+        );
+
+        let rows = sqlx::query_as::<_, (String, i64, i64)>(&sql)
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&self.pool)
+            .await?;
 
         Ok(rows
             .into_iter()
