@@ -12,6 +12,28 @@ use crate::error::AppError;
 use crate::follower_cache::FollowerCache;
 use crate::wot_cache::WotCache;
 
+/// A kind:1 note whose entire content is a bare JSON object/array is treated as
+/// a machine/app payload (game moves, bot data channels), not human content.
+/// Such notes are excluded from trending/engagement rankings and do not
+/// contribute engagement to other notes, but remain stored and searchable.
+///
+/// Near-zero false positives: the content must trim to a string starting with
+/// `{` or `[` AND parse as valid JSON resolving to an object/array. Prose that
+/// merely contains JSON, and markdown like `[text](url)`, fail to parse.
+pub(crate) fn is_machine_note(kind: i64, content: &str) -> bool {
+    if kind != 1 {
+        return false;
+    }
+    let t = content.trim();
+    if !(t.starts_with('{') || t.starts_with('[')) {
+        return false;
+    }
+    matches!(
+        serde_json::from_str::<serde_json::Value>(t),
+        Ok(serde_json::Value::Object(_)) | Ok(serde_json::Value::Array(_))
+    )
+}
+
 #[derive(Clone)]
 pub struct EventRepository {
     pool: PgPool,
@@ -144,8 +166,8 @@ impl EventRepository {
         let tags_json = serde_json::to_value(&event.tags).unwrap_or_default();
 
         let result = sqlx::query(
-            "INSERT INTO events (id, pubkey, created_at, kind, content, sig, tags, raw, relay_url)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            "INSERT INTO events (id, pubkey, created_at, kind, content, sig, tags, raw, relay_url, is_machine_note)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
              ON CONFLICT (id) DO NOTHING",
         )
         .bind(&event.id)
@@ -157,6 +179,7 @@ impl EventRepository {
         .bind(&tags_json)
         .bind(&raw)
         .bind(relay_url)
+        .bind(is_machine_note(event.kind, &event.content))
         .execute(&self.pool)
         .await?;
 
@@ -600,12 +623,17 @@ impl EventRepository {
                 .execute(&self.pool)
                 .await?;
 
-            // v2: increment reply_count on the target event
+            // v2: increment reply_count on the target event. Bare-JSON machine
+            // replies (e.g. game moves) are recorded as refs but do not
+            // contribute to the target's engagement count, so they can't game
+            // trending.
             if let Some(ref target_id) = reply_target_id {
-                sqlx::query("UPDATE events SET reply_count = reply_count + 1 WHERE id = $1")
-                    .bind(target_id)
-                    .execute(&self.pool)
-                    .await?;
+                if !is_machine_note(event.kind, &event.content) {
+                    sqlx::query("UPDATE events SET reply_count = reply_count + 1 WHERE id = $1")
+                        .bind(target_id)
+                        .execute(&self.pool)
+                        .await?;
+                }
             }
         }
 
@@ -1357,6 +1385,7 @@ impl EventRepository {
                 WHERE e.kind = 1
                   AND e.created_at >= $1
                   AND {order_col} > 0
+                  AND NOT e.is_machine_note
                 ORDER BY {order_col} DESC, e.created_at DESC
                 LIMIT $2 OFFSET $3
                 "#
@@ -1382,6 +1411,7 @@ impl EventRepository {
                 FROM events e
                 WHERE e.kind = 1
                   AND {order_col} > 0
+                  AND NOT e.is_machine_note
                 ORDER BY {order_col} DESC, e.created_at DESC
                 LIMIT $1 OFFSET $2
                 "#
@@ -1481,6 +1511,7 @@ impl EventRepository {
                 WHERE kind = 1
                   AND created_at >= $1
                   AND (reaction_count + repost_count + reply_count + zap_count) > 0
+                  AND NOT is_machine_note
                 ORDER BY (
                     zap_amount_msats / 1000
                     + repost_count * 1000
@@ -3196,6 +3227,7 @@ impl EventRepository {
               AND e.pubkey = $1
               {reply_filter}
               AND {order_col} > 0
+              AND NOT e.is_machine_note
             ORDER BY {order_col} DESC, e.created_at DESC
             LIMIT $2 OFFSET $3
             "#
@@ -3385,4 +3417,41 @@ enum BindValue {
 
 fn is_hex_pubkey(value: &str) -> bool {
     value.len() == 64 && value.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_machine_note;
+
+    #[test]
+    fn flags_bare_json_payloads() {
+        // The live chess-over-nostr abuse: challenge + move payloads.
+        assert!(is_machine_note(1, r#"{"type":"challenge","timeControl":"casual"}"#));
+        assert!(is_machine_note(1, r#"{"type":"move","gameId":"abc"}"#));
+        assert!(is_machine_note(1, "[1, 2, 3]"));
+        // Leading/trailing whitespace is trimmed before the check.
+        assert!(is_machine_note(1, "  \n {\"a\":1}\n "));
+    }
+
+    #[test]
+    fn leaves_human_content_alone() {
+        assert!(!is_machine_note(1, "gm, great game last night!"));
+        // Prose that merely contains JSON does not start with { or [.
+        assert!(!is_machine_note(1, "here is some json: {\"a\":1}"));
+        // Markdown links start with [ but fail to parse as JSON.
+        assert!(!is_machine_note(1, "[text](https://example.com)"));
+        // A brace lead that isn't valid JSON stays human.
+        assert!(!is_machine_note(1, "{not really json"));
+        assert!(!is_machine_note(1, ""));
+        // A bare JSON string/number is not an object/array — left untouched.
+        assert!(!is_machine_note(1, "\"just a quoted string\""));
+        assert!(!is_machine_note(1, "42"));
+    }
+
+    #[test]
+    fn only_applies_to_kind_1() {
+        // Other kinds (e.g. zap receipts) are legitimately JSON and unaffected.
+        assert!(!is_machine_note(0, r#"{"name":"alice"}"#));
+        assert!(!is_machine_note(9735, r#"{"type":"move"}"#));
+    }
 }
