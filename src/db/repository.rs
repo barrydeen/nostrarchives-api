@@ -34,9 +34,22 @@ pub(crate) fn is_machine_note(kind: i64, content: &str) -> bool {
     )
 }
 
+/// True if the event declares itself as relayed from another network.
+///
+/// NIP-48 `proxy` tags are self-declared by the bridge that republished the
+/// content (`["proxy", "<url>", "activitypub"|"rss"|"web"|…]`), so this is a
+/// deterministic property of the event, not an inference. That makes it far
+/// more reliable than any classifier for the question "is this native Nostr
+/// content posted by a person here".
+pub(crate) fn is_proxied_event(tags: &[Vec<String>]) -> bool {
+    tags.iter().any(|t| t.first().map(|n| n == "proxy").unwrap_or(false))
+}
+
 #[derive(Clone)]
 pub struct EventRepository {
     pool: PgPool,
+    /// Drop events carrying a NIP-48 proxy tag (bridged from another network).
+    pub reject_proxied: bool,
     pub follower_cache: FollowerCache,
     pub wot_cache: WotCache,
     pub block_cache: BlockCache,
@@ -82,7 +95,12 @@ fn range_cache_ttl(range: &str) -> u64 {
 
 impl EventRepository {
     pub fn new(pool: PgPool, follower_cache: FollowerCache, wot_cache: WotCache, block_cache: BlockCache) -> Self {
-        Self { pool, follower_cache, wot_cache, block_cache }
+        // Read here rather than threading through Config: the CLI binaries
+        // construct a repository directly and must apply the same policy.
+        let reject_proxied = std::env::var("REJECT_PROXIED_EVENTS")
+            .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(true);
+        Self { pool, reject_proxied, follower_cache, wot_cache, block_cache }
     }
 
     /// Return a clone of the underlying connection pool.
@@ -107,6 +125,14 @@ impl EventRepository {
     ) -> Result<bool, AppError> {
         // Reject events from blocked pubkeys
         if self.block_cache.is_pubkey_blocked(&event.pubkey).await {
+            return Ok(false);
+        }
+
+        // Reject bridged/relayed content. nostrarchives hosts native Nostr
+        // content from people, and NIP-48 proxy tags mark republished posts
+        // from ActivityPub/RSS/etc. This is a self-declared marker, so unlike
+        // the spam classifier it has no false positives.
+        if self.reject_proxied && is_proxied_event(&event.tags) {
             return Ok(false);
         }
 
@@ -519,6 +545,13 @@ impl EventRepository {
             .await?;
 
         for (followed, relay_hint) in &followees {
+            // Skip edges pointing at a blocked author. Their own events are
+            // purged, but every follower's contact list would otherwise keep
+            // re-creating these rows — restoring the bot's follower_count in
+            // profile_search and re-seeding it into crawl_state.
+            if self.block_cache.is_pubkey_blocked(followed).await {
+                continue;
+            }
             sqlx::query(
                 "INSERT INTO follows (follower_pubkey, followed_pubkey, source_event_id, relay_hint, created_at)
                  VALUES ($1, $2, $3, $4, $5)
@@ -3446,6 +3479,23 @@ mod tests {
         // A bare JSON string/number is not an object/array — left untouched.
         assert!(!is_machine_note(1, "\"just a quoted string\""));
         assert!(!is_machine_note(1, "42"));
+    }
+
+    #[test]
+    fn detects_nip48_proxy_tags() {
+        let ap = vec![
+            vec!["proxy".into(), "https://mastodon.social/users/x".into(), "activitypub".into()],
+            vec!["p".into(), "abc".into()],
+        ];
+        assert!(super::is_proxied_event(&ap));
+
+        let rss = vec![vec!["proxy".into(), "https://example.com/feed".into(), "rss".into()]];
+        assert!(super::is_proxied_event(&rss));
+
+        // Native content, including a note that merely mentions the word.
+        assert!(!super::is_proxied_event(&[vec!["e".into(), "abc".into()]]));
+        assert!(!super::is_proxied_event(&[]));
+        assert!(!super::is_proxied_event(&[vec!["t".into(), "proxy".into()]]));
     }
 
     #[test]
