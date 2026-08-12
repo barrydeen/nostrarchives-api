@@ -1,0 +1,11 @@
+# Pinned hard on purpose. scikit-learn's tokenization and char_wb padding have
+# changed across minor versions before; a mismatch there is silent and produces
+# a subtly wrong ban list. verify_parity.py is what catches it — but pinning
+# means it should never have to.
+lightgbm==4.7.0
+scikit-learn==1.7.2
+scipy==1.15.3
+numpy==2.2.6
+regex==2026.7.19
+psycopg[binary]==3.3.4
+huggingface_hub==1.27.0

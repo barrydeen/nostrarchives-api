@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+*.pyc
+
+# Review pages and purge archives contain real pubkeys and note content.
+flagged.html
+*.jsonl
