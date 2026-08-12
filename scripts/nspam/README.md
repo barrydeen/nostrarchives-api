@@ -110,6 +110,11 @@ weak signal.
 Still not covered: bots operating purely through kinds 0/3/6/7/10002, which
 bypass the WoT gate entirely and post no kind-1 content to score.
 
+## Deploying to production
+
+See [DEPLOY.md](DEPLOY.md) for the full runbook: migration timing, the
+block-then-delete ordering, throughput tuning, post-purge maintenance and undo.
+
 ## Setup
 
 ```bash
