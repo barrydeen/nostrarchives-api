@@ -37,5 +37,6 @@ $func$ LANGUAGE plpgsql;
 UPDATE events
 SET is_machine_note = true
 WHERE kind = 1
+  AND NOT is_machine_note
   AND left(btrim(content, E' \t\n\r\f\v'), 1) IN ('{', '[')
   AND pg_temp.is_machine_content(content);

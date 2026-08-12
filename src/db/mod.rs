@@ -18,6 +18,34 @@ pub async fn init_pool(database_url: &str) -> Result<PgPool, sqlx::Error> {
     Ok(pool)
 }
 
+/// Strip `--` line comments from SQL, leaving the statements intact.
+///
+/// A `--` inside a single-quoted literal is left alone, so quoted text
+/// containing a double dash survives.
+fn strip_sql_comments(sql: &str) -> String {
+    let mut out = String::with_capacity(sql.len());
+    for line in sql.lines() {
+        let bytes = line.as_bytes();
+        let mut in_quote = false;
+        let mut cut = line.len();
+        let mut i = 0;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'\'' => in_quote = !in_quote,
+                b'-' if !in_quote && i + 1 < bytes.len() && bytes[i + 1] == b'-' => {
+                    cut = i;
+                    break;
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        out.push_str(&line[..cut]);
+        out.push('\n');
+    }
+    out
+}
+
 /// Run SQL migration files in order.
 async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
     sqlx::query(
@@ -97,6 +125,10 @@ async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
         (
             "017_update_profile_search",
             include_str!("../../migrations/017_update_profile_search.sql"),
+        ),
+        (
+            "018_backfill_zap_amounts",
+            include_str!("../../migrations/018_backfill_zap_amounts.sql"),
         ),
         (
             "019_analytics_materialized_views",
@@ -194,6 +226,18 @@ async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
             "042_client_leaderboard_timeframes",
             include_str!("../../migrations/042_client_leaderboard_timeframes.sql"),
         ),
+        (
+            "043_machine_note_flag",
+            include_str!("../../migrations/043_machine_note_flag.sql"),
+        ),
+        (
+            "044_author_spam_scores",
+            include_str!("../../migrations/044_author_spam_scores.sql"),
+        ),
+        (
+            "045_purge_perf_indexes",
+            include_str!("../../migrations/045_purge_perf_indexes.sql"),
+        ),
     ];
 
     for (name, sql) in migrations {
@@ -209,10 +253,18 @@ async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
             if sql.starts_with("-- no-transaction") {
                 // CONCURRENTLY operations cannot run inside a transaction block.
                 // Execute each statement individually on a dedicated connection.
+                //
+                // Comments must be stripped BEFORE splitting on ';'. Splitting
+                // first has two failure modes, both silent or confusing:
+                //   * a ';' inside a comment splits mid-comment, and the tail of
+                //     the prose gets sent to the server as a statement;
+                //   * a statement preceded by a comment starts with "--", so the
+                //     old `starts_with("--")` skip dropped the statement too —
+                //     the migration would report success having created nothing.
                 let mut conn = pool.acquire().await?;
-                for stmt in sql.split(';') {
+                for stmt in strip_sql_comments(sql).split(';') {
                     let stmt = stmt.trim();
-                    if stmt.is_empty() || stmt.starts_with("--") {
+                    if stmt.is_empty() {
                         continue;
                     }
                     sqlx::raw_sql(stmt).execute(&mut *conn).await?;
@@ -229,4 +281,72 @@ async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::strip_sql_comments;
+
+    /// The `-- no-transaction` path splits on ';'. Both of these bit migration
+    /// 045 on a real startup before the comment-stripping was added.
+    #[test]
+    fn comment_stripping_protects_statement_splitting() {
+        // A ';' inside a comment must not split a statement.
+        let sql = "-- no-transaction\n\
+                   -- fixed this for follows; follow_lists was missed\n\
+                   CREATE INDEX CONCURRENTLY idx_a ON follow_lists (event_id);\n";
+        let stmts: Vec<_> = strip_sql_comments(sql)
+            .split(';')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        assert_eq!(stmts.len(), 1, "comment semicolon split the statement: {stmts:?}");
+        assert!(stmts[0].starts_with("CREATE INDEX CONCURRENTLY idx_a"));
+
+        // A statement preceded by a comment must survive, not be skipped.
+        assert!(!stmts[0].starts_with("--"));
+
+        // A '--' inside a quoted literal is not a comment.
+        let quoted = "SELECT 'a--b' AS x; -- trailing\n";
+        let kept: Vec<_> = strip_sql_comments(quoted)
+            .split(';')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        assert_eq!(kept, vec!["SELECT 'a--b' AS x".to_string()]);
+    }
+
+    /// Every .sql file in migrations/ must be registered in `run_migrations`.
+    ///
+    /// This is not hypothetical: 018 and 043 both shipped to main unregistered,
+    /// and because `insert_event` binds `events.is_machine_note`, a database
+    /// that never got 043 applied by hand fails every single insert.
+    #[test]
+    fn all_migration_files_are_registered() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/migrations");
+        let registered = include_str!("mod.rs");
+
+        let mut missing = Vec::new();
+        for entry in std::fs::read_dir(dir).expect("read migrations dir") {
+            let path = entry.expect("dir entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("sql") {
+                continue;
+            }
+            let name = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .expect("migration file name")
+                .to_string();
+            // Look for the include_str! line naming this file.
+            if !registered.contains(&format!("migrations/{name}.sql")) {
+                missing.push(name);
+            }
+        }
+
+        missing.sort();
+        assert!(
+            missing.is_empty(),
+            "migration files present on disk but not registered in run_migrations: {missing:?}"
+        );
+    }
 }

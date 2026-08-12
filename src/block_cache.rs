@@ -361,12 +361,10 @@ async fn purge_worker(
 
         match result {
             Ok(total) => {
-                // Invalidate caches
-                cache.invalidate_pattern(&format!("profile:notes:{pubkey}")).await;
-                cache.invalidate_pattern(&format!("profile:replies:{pubkey}")).await;
-                cache.invalidate_pattern(&format!("profile:zap_stats:{pubkey}")).await;
-                cache.invalidate_pattern(&format!("profiles:metadata:{pubkey}")).await;
-                cache.invalidate_pattern("home:trending").await;
+                // Note the old per-pubkey `profiles:metadata:{pubkey}` call could
+                // never match: that key is `profiles:metadata:{hash}` of the
+                // requested pubkey *set* (handlers.rs), so it has to go by prefix.
+                invalidate_purge_caches(&cache).await;
 
                 let mut map = statuses.write().await;
                 if let Some(status) = map.get_mut(&pubkey) {
@@ -398,6 +396,36 @@ async fn purge_pubkey_data(
     batch_size: i64,
     statuses: &Arc<RwLock<HashMap<String, PurgeStatus>>>,
 ) -> Result<i64, AppError> {
+    purge_pubkey_data_with(pool, pubkey, batch_size, &mut |total| {
+        let statuses = statuses.clone();
+        let pubkey = pubkey.to_string();
+        tokio::spawn(async move {
+            let mut map = statuses.write().await;
+            if let Some(status) = map.get_mut(&pubkey) {
+                status.events_deleted = total;
+            }
+        });
+    })
+    .await
+}
+
+/// Delete all data for a pubkey in batches, reporting progress through a
+/// callback.
+///
+/// This is the single deletion path: the admin block endpoint and the bulk ban
+/// tool both go through it, so the two can't drift apart and leave one of them
+/// missing a table.
+///
+/// The caller MUST have inserted the pubkey into `blocked_pubkeys` first.
+/// Deleting without blocking is self-reversing: negentropy builds its local ID
+/// set from `events`, so deleted ids come back as `need_ids` on the next sync,
+/// and the `missing_events` drainer re-fetches them directly.
+pub async fn purge_pubkey_data_with(
+    pool: &PgPool,
+    pubkey: &str,
+    batch_size: i64,
+    progress: &mut (dyn FnMut(i64) + Send),
+) -> Result<i64, AppError> {
     let mut total_deleted: i64 = 0;
 
     loop {
@@ -418,6 +446,43 @@ async fn purge_pubkey_data(
 
         let mut tx = pool.begin().await?;
 
+        // Stage the reply_count decrements before event_refs is deleted — the
+        // refs are the only record of which parent each reply pointed at.
+        // DISTINCT ON with this ORDER BY reproduces insert_refs' target choice
+        // (prefer the `reply` ref, else the first `root` ref), and the
+        // is_machine_note join reproduces the exclusion at repository.rs:631.
+        sqlx::query(
+            "CREATE TEMP TABLE IF NOT EXISTS reply_decrements (
+                 target_event_id TEXT PRIMARY KEY,
+                 n INTEGER NOT NULL
+             )",
+        )
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            "WITH chosen AS (
+                 SELECT DISTINCT ON (r.source_event_id)
+                        r.source_event_id, r.target_event_id
+                 FROM event_refs r
+                 JOIN events s ON s.id = r.source_event_id
+                 WHERE r.source_event_id = ANY($1)
+                   AND r.ref_type IN ('reply', 'root')
+                   AND NOT s.is_machine_note
+                 ORDER BY r.source_event_id, (r.ref_type = 'reply') DESC
+             )
+             INSERT INTO reply_decrements (target_event_id, n)
+             SELECT target_event_id, COUNT(*)
+             FROM chosen
+             WHERE target_event_id <> ALL($1)
+             GROUP BY target_event_id
+             ON CONFLICT (target_event_id)
+                 DO UPDATE SET n = reply_decrements.n + EXCLUDED.n",
+        )
+        .bind(&ids)
+        .execute(&mut *tx)
+        .await?;
+
         sqlx::query(
             "DELETE FROM event_refs WHERE source_event_id = ANY($1) OR target_event_id = ANY($1)",
         )
@@ -435,22 +500,49 @@ async fn purge_pubkey_data(
             .execute(&mut *tx)
             .await?;
 
+        // Without this the missing-events drainer actively re-downloads every
+        // note we just deleted (src/main.rs queue drain).
+        sqlx::query("DELETE FROM missing_events WHERE event_id = ANY($1)")
+            .bind(&ids)
+            .execute(&mut *tx)
+            .await?;
+
+        sqlx::query("DELETE FROM seen_events WHERE event_id = ANY($1) OR target_id = ANY($1)")
+            .bind(&ids)
+            .execute(&mut *tx)
+            .await?;
+
+        sqlx::query(
+            "DELETE FROM zap_metadata WHERE event_id = ANY($1) OR zapped_event_id = ANY($1)",
+        )
+        .bind(&ids)
+        .execute(&mut *tx)
+        .await?;
+
         sqlx::query("DELETE FROM events WHERE id = ANY($1)")
             .bind(&ids)
+            .execute(&mut *tx)
+            .await?;
+
+        // Apply the staged decrements to parents that survived this batch.
+        // GREATEST guards against pre-existing counter drift.
+        sqlx::query(
+            "UPDATE events e
+             SET reply_count = GREATEST(0, e.reply_count - d.n)
+             FROM reply_decrements d
+             WHERE e.id = d.target_event_id",
+        )
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query("DELETE FROM reply_decrements")
             .execute(&mut *tx)
             .await?;
 
         tx.commit().await?;
 
         total_deleted += batch_count;
-
-        // Update progress in status map
-        {
-            let mut map = statuses.write().await;
-            if let Some(status) = map.get_mut(pubkey) {
-                status.events_deleted = total_deleted;
-            }
-        }
+        progress(total_deleted);
 
         tracing::info!(pubkey, batch = batch_count, total = total_deleted, "Purge batch completed");
     }
@@ -471,5 +563,55 @@ async fn purge_pubkey_data(
         .execute(pool)
         .await?;
 
+    // Zaps the pubkey sent or received: kind 9735 receipts are authored by the
+    // zapper service, not the bot, so deleting events by author never reaches
+    // these rows.
+    sqlx::query("DELETE FROM zap_metadata WHERE sender_pubkey = $1 OR recipient_pubkey = $1")
+        .bind(pubkey)
+        .execute(pool)
+        .await?;
+
+    sqlx::query("DELETE FROM scheduled_events WHERE pubkey = $1")
+        .bind(pubkey)
+        .execute(pool)
+        .await?;
+
+    sqlx::query("DELETE FROM wot_scores WHERE pubkey = $1")
+        .bind(pubkey)
+        .execute(pool)
+        .await?;
+
     Ok(total_deleted)
+}
+
+/// Redis key prefixes holding data that can contain a purged author's content.
+///
+/// The per-pubkey keys are not enough: trending, hashtag, analytics, client and
+/// ws feeds are all keyed by query parameters rather than by author.
+pub const PURGE_CACHE_PREFIXES: &[&str] = &[
+    "profile:notes",
+    "profile:replies",
+    "profile:zaps_sent",
+    "profile:zaps_recv",
+    "profile:zap_stats",
+    "profiles:metadata",
+    "home",
+    "trending",
+    "hashtag",
+    "analytics",
+    "clients",
+    "relays",
+    "ws",
+    "search:suggest",
+    "feeds",
+];
+
+/// Flush every cache prefix that can hold purged content.
+///
+/// Uses `delete_by_prefix` (SCAN-based) rather than `invalidate_pattern`, which
+/// uses KEYS and blocks the whole Redis instance.
+pub async fn invalidate_purge_caches(cache: &StatsCache) {
+    for prefix in PURGE_CACHE_PREFIXES {
+        cache.delete_by_prefix(prefix).await;
+    }
 }

@@ -91,6 +91,13 @@ impl CrawlQueue {
             WHERE NOT EXISTS (
                 SELECT 1 FROM crawl_state cs WHERE cs.pubkey = fc.pubkey
             )
+            -- Blocked authors must not be re-seeded. Their own kind-3 events are
+            -- gone, but rows where they are the `followed_pubkey` belong to other
+            -- users' contact lists and survive the purge — without this guard the
+            -- purge's `DELETE FROM crawl_state` is undone on the next sync.
+            AND NOT EXISTS (
+                SELECT 1 FROM blocked_pubkeys bp WHERE bp.pubkey = fc.pubkey
+            )
             "#,
         )
         .execute(&self.pool)

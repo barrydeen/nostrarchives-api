@@ -1,6 +1,10 @@
 services:
   postgres:
     image: postgres:16-alpine
+    # Docker defaults /dev/shm to 64MB, which is too small for parallel workers
+    # on tables this size — REFRESH MATERIALIZED VIEW and VACUUM both fail with
+    # "could not resize shared memory segment ... No space left on device".
+    shm_size: 1gb
     ports:
       - "5432:5432"
     environment:
