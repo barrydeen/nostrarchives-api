@@ -240,6 +240,48 @@ For bridged accounts there is no scoring step; the dry run lists them directly:
 cargo run --release --bin ban_bots -- --bridged --max-fraction 1.0
 ```
 
+## Throughput — purges are sequential
+
+`ban_bots` awaits each author's purge before starting the next, and the
+in-service `purge_worker` is a single consumer doing the same. One high-volume
+account holds up everything behind it.
+
+Measured per 5,000-event batch:
+
+| table | per batch |
+|---|---|
+| events | 693 ms |
+| search_index | 199 ms |
+| seen_events | 116 ms |
+| event_refs | 93 ms |
+| note_hashtags | 67 ms |
+| zap_metadata | 59 ms |
+| missing_events | 39 ms |
+| **total** | **~1.27 s** |
+
+That is ~4,000 events/sec, dominated by the `events` table's ~25 indexes. A bot
+with 15,000 notes is three batches, about 4 seconds. Serialization is not the
+constraint at this scale.
+
+`--sleep` is, for wide sweeps. Purging all 50,962 bridged accounts is ~57s of
+actual work, but at the default 100 ms between authors it spends 85 minutes
+sleeping:
+
+| `--sleep` | total |
+|---|---|
+| 100 (default) | ~86 min |
+| 20 | ~18 min |
+| 0 | ~1 min |
+
+The pause exists to keep the live service responsive, so lower it deliberately
+rather than by default — but for a large sweep of small accounts it is the only
+number that matters.
+
+Note `note_hashtags` has no index on `event_id` (migration 034 omits it on
+purpose). It is not a problem here: the purge binds the id list as a query
+parameter, which Postgres hashes, so the scan costs 67 ms rather than the
+multiple seconds an inlined `ANY(ARRAY(SELECT …))` would.
+
 ## Undo
 
 `ban_bots` writes every deleted event to JSONL before deleting. Restoring is a
