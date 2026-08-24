@@ -186,11 +186,27 @@ impl BlockCache {
         Ok(result.rows_affected() > 0)
     }
 
-    pub async fn list_blocked_pubkeys(&self) -> Result<Vec<BlockedEntry>, AppError> {
+    /// Total number of blocked pubkeys.
+    pub async fn count_blocked_pubkeys(&self) -> Result<i64, AppError> {
+        let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM blocked_pubkeys")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(count)
+    }
+
+    /// Most recently blocked pubkeys, newest first.
+    pub async fn list_blocked_pubkeys(
+        &self,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<BlockedEntry>, AppError> {
         let rows: Vec<(String, Option<String>, chrono::DateTime<chrono::Utc>, String)> =
             sqlx::query_as(
-                "SELECT pubkey, reason, blocked_at, blocked_by FROM blocked_pubkeys ORDER BY blocked_at DESC",
+                "SELECT pubkey, reason, blocked_at, blocked_by FROM blocked_pubkeys \
+                 ORDER BY blocked_at DESC LIMIT $1 OFFSET $2",
             )
+            .bind(limit)
+            .bind(offset)
             .fetch_all(&self.pool)
             .await?;
 

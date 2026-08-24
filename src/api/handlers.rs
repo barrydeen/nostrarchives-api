@@ -1694,13 +1694,27 @@ pub async fn admin_unblock_pubkey(
     Ok(Json(json!({ "unblocked": found })))
 }
 
-/// List all blocked pubkeys: `GET /v1/admin/blocked-pubkeys`
+/// List the most recently blocked pubkeys: `GET /v1/admin/blocked-pubkeys`
+///
+/// The block list runs to hundreds of thousands of rows, so this is paginated
+/// with a small default. Pass `?limit=&offset=` to page further back.
 pub async fn admin_list_blocked_pubkeys(
     _auth: AdminAuth,
     State(state): State<AppState>,
+    Query(params): Query<ListingQuery>,
 ) -> Result<Json<Value>, AppError> {
-    let list = state.block_cache.list_blocked_pubkeys().await?;
-    Ok(Json(json!({ "blocked_pubkeys": list })))
+    let limit = params.limit.unwrap_or(10).clamp(1, 500);
+    let offset = params.offset.unwrap_or(0).max(0);
+
+    let total = state.block_cache.count_blocked_pubkeys().await?;
+    let list = state.block_cache.list_blocked_pubkeys(limit, offset).await?;
+
+    Ok(Json(json!({
+        "blocked_pubkeys": list,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    })))
 }
 
 /// Get purge status for a pubkey: `GET /v1/admin/purge-status/:pubkey`
